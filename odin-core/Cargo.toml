@@ -1,0 +1,46 @@
+[package]
+name = "odin-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "ODIN (Open Data Interchange Notation) parser, serializer, validator, and transform engine"
+readme = "../README.md"
+keywords = ["odin", "data-interchange", "parser", "serializer", "transform"]
+categories = ["parser-implementations", "encoding", "data-structures"]
+
+[features]
+default = []
+crypto = ["dep:sha2", "dep:md-5", "dep:sha1", "dep:crc32fast"]
+regex = ["dep:regex"]
+
+[dependencies]
+# Number formatting
+ryu = "1.0"
+itoa = "1.0"
+
+# JSON parsing/serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+# XML parsing/serialization
+quick-xml = "0.37"
+
+# Crypto (optional, for hash verbs in transforms)
+sha2 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
+crc32fast = { version = "1.4", optional = true }
+
+# Regex (optional, for pattern matching verbs)
+regex = { version = "1.10", optional = true }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"

@@ -1,0 +1,12 @@
+[workspace]
+members = ["odin-core", "golden-tests"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.3"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/odin-foundation/odin"
+homepage = "https://odin.foundation"
+description = "ODIN (Open Data Interchange Notation) SDK"

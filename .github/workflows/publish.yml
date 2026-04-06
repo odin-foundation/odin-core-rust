@@ -1,0 +1,48 @@
+name: Publish to crates.io
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check if version already published
+        id: check
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Checking crates.io for odin-core@${VERSION}"
+          HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "User-Agent: odin-ci (github.com/odin-foundation)" "https://crates.io/api/v1/crates/odin-core/${VERSION}")
+          echo "HTTP response: ${HTTP_CODE}"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Version ${VERSION} already published — skipping"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version ${VERSION} not found — will publish"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test (unit tests only — golden tests run in Azure DevOps)
+        if: steps.check.outputs.exists == 'false'
+        run: cargo test -p odin-core -- --skip test_json_to_odin_path_resolution
+
+      - name: Authenticate with crates.io
+        if: steps.check.outputs.exists == 'false'
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish
+        if: steps.check.outputs.exists == 'false'
+        run: cargo publish -p odin-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

@@ -1,0 +1,5 @@
+target/
+test-output/
+*.pdb
+.DS_Store
+Thumbs.db
