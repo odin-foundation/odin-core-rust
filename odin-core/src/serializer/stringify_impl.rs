@@ -1372,4 +1372,142 @@ mod tests {
         let out = stringify(&doc, None);
         assert!(out.contains("#%0.15"));
     }
+
+    // ── Tabular ragged sub-arrays (regression guard) ────────────────────────
+    // The flat stringify path here cannot pad ragged sub-arrays — it has no
+    // tabular emission. These tests guard against that changing.
+
+    #[test]
+    fn ragged_string_subarrays_do_not_emit_padded_tabular_header() {
+        let doc = OdinDocumentBuilder::new()
+            .set("records[0].name", OdinValues::string("Alice"))
+            .set("records[0].tags[0]", OdinValues::string("red"))
+            .set("records[0].tags[1]", OdinValues::string("green"))
+            .set("records[0].tags[2]", OdinValues::string("blue"))
+            .set("records[1].name", OdinValues::string("Bob"))
+            .set("records[1].tags[0]", OdinValues::string("yellow"))
+            .build()
+            .unwrap();
+        let out = stringify(&doc, None);
+        // Must NOT contain a tabular column header listing the indexed
+        // tag positions for the records[] array.
+        assert!(!out.contains("{records[] :"));
+        // Each row's tags should be present individually, not padded.
+        assert!(out.contains("records[0].tags[2]"));
+        assert!(out.contains("records[1].tags[0]"));
+        assert!(!out.contains("records[1].tags[1]"));
+    }
+
+    #[test]
+    fn ragged_numeric_subarrays_do_not_emit_padded_tabular_header() {
+        let doc = OdinDocumentBuilder::new()
+            .set("points[0].label", OdinValues::string("A"))
+            .set("points[0].coords[0]", OdinValues::integer(1))
+            .set("points[0].coords[1]", OdinValues::integer(2))
+            .set("points[1].label", OdinValues::string("B"))
+            .set("points[1].coords[0]", OdinValues::integer(3))
+            .set("points[1].coords[1]", OdinValues::integer(4))
+            .set("points[1].coords[2]", OdinValues::integer(5))
+            .set("points[1].coords[3]", OdinValues::integer(6))
+            .build()
+            .unwrap();
+        let out = stringify(&doc, None);
+        assert!(!out.contains("{points[] :"));
+        assert!(out.contains("points[1].coords[3]"));
+        assert!(!out.contains("points[0].coords[2]"));
+    }
+
+    #[test]
+    fn ragged_subarrays_round_trip_without_data_loss() {
+        let doc = OdinDocumentBuilder::new()
+            .set("entries[0].slug", OdinValues::string("a/one"))
+            .set("entries[0].title", OdinValues::string("One"))
+            .set("entries[0].types[0]", OdinValues::string("alpha"))
+            .set("entries[0].types[1]", OdinValues::string("beta"))
+            .set("entries[0].fields[0]", OdinValues::string("id"))
+            .set("entries[0].fields[1]", OdinValues::string("name"))
+            .set("entries[0].fields[2]", OdinValues::string("desc"))
+            .set("entries[1].slug", OdinValues::string("b/two"))
+            .set("entries[1].title", OdinValues::string("Two"))
+            .set("entries[1].types[0]", OdinValues::string("gamma"))
+            .set("entries[1].fields[0]", OdinValues::string("id"))
+            .build()
+            .unwrap();
+        let text = stringify(&doc, None);
+        let reparsed = crate::parser::parse(&text, None).expect("reparse");
+        // Every original assignment must survive the round-trip.
+        for (path, _) in &doc.assignments {
+            assert!(
+                reparsed.assignments.iter().any(|(p, _)| p == path),
+                "lost assignment after round-trip: {path}"
+            );
+        }
+        assert_eq!(doc.assignments.len(), reparsed.assignments.len());
+    }
+
+    #[test]
+    fn dense_scalar_records_serialize_without_loss() {
+        // Pure scalar columns, every row populated. The TypeScript SDK
+        // emits this as tabular; the Rust SDK emits flat assignments.
+        // Either way, every assignment must be present in the output.
+        let doc = OdinDocumentBuilder::new()
+            .set("rows[0].name", OdinValues::string("Alice"))
+            .set("rows[0].age", OdinValues::integer(30))
+            .set("rows[1].name", OdinValues::string("Bob"))
+            .set("rows[1].age", OdinValues::integer(25))
+            .build()
+            .unwrap();
+        let out = stringify(&doc, None);
+        assert!(out.contains("rows[0].name"));
+        assert!(out.contains("rows[0].age"));
+        assert!(out.contains("rows[1].name"));
+        assert!(out.contains("rows[1].age"));
+    }
+
+    #[test]
+    fn uniform_width_subarrays_serialize_without_loss() {
+        let doc = OdinDocumentBuilder::new()
+            .set("points[0].label", OdinValues::string("A"))
+            .set("points[0].coords[0]", OdinValues::integer(1))
+            .set("points[0].coords[1]", OdinValues::integer(2))
+            .set("points[1].label", OdinValues::string("B"))
+            .set("points[1].coords[0]", OdinValues::integer(3))
+            .set("points[1].coords[1]", OdinValues::integer(4))
+            .build()
+            .unwrap();
+        let out = stringify(&doc, None);
+        assert!(out.contains("points[0].coords[1]"));
+        assert!(out.contains("points[1].coords[1]"));
+    }
+
+    #[test]
+    fn search_index_fixture_does_not_emit_widest_column_header() {
+        // Build a search-index-style fixture: 20 records with very
+        // different sub-array widths (1 .. 39 tags). Without the rule,
+        // a tabular emitter would pad every row to the widest record's
+        // column count. The output must never contain such a header.
+        let mut builder = OdinDocumentBuilder::new();
+        for r in 0..20 {
+            builder = builder
+                .set(&format!("entries[{r}].slug"), OdinValues::string(&format!("record/{r}")))
+                .set(&format!("entries[{r}].title"), OdinValues::string(&format!("Record {r}")));
+            let tag_count = 1 + r * 2;
+            for t in 0..tag_count {
+                builder = builder.set(
+                    &format!("entries[{r}].tags[{t}]"),
+                    OdinValues::string(&format!("tag-{r}-{t}")),
+                );
+            }
+        }
+        let doc = builder.build().unwrap();
+        let out = stringify(&doc, None);
+
+        // Must not contain a tabular column header for entries[].
+        assert!(!out.contains("{entries[] :"));
+        // Sanity: the widest row is fully present.
+        assert!(out.contains("entries[19].tags[38]"));
+        // Sanity: the narrowest row only has its single tag.
+        assert!(out.contains("entries[0].tags[0]"));
+        assert!(!out.contains("entries[0].tags[1]"));
+    }
 }

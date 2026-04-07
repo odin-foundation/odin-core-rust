@@ -1665,7 +1665,7 @@ fn write_odin_section_with_mods(
         // This matches the TS formatter behavior where arrays appear before objects.
         for (child_key, child_val) in entries {
             if let DynValue::Array(items) = child_val {
-                write_odin_array_subsection(output, child_key, items);
+                write_odin_array_subsection_with_parent(output, child_key, items, Some(key));
             }
         }
         // Each child is a direct child of this absolute section
@@ -1736,7 +1736,7 @@ fn write_odin_subsection_with_mods_inner(
     // Phase 2: Array subsections first, then object subsections (matches TS behavior)
     for (child_key, child_val) in fields {
         if let DynValue::Array(items) = child_val {
-            write_odin_array_subsection(output, child_key, items);
+            write_odin_array_subsection_with_parent(output, child_key, items, Some(full_path));
         }
     }
     // Each child is evaluated against this section's scope
@@ -1799,7 +1799,7 @@ fn write_odin_section(output: &mut String, name: &str, fields: &[(String, DynVal
     // Phase 2: Array subsections first, then object subsections (matches TS behavior)
     for (key, val) in fields {
         if let DynValue::Array(items) = val {
-            write_odin_array_subsection(output, key, items);
+            write_odin_array_subsection_with_parent(output, key, items, Some(scope_path));
         }
     }
     // Each child is a direct child of this absolute section, so each gets evaluated
@@ -1857,7 +1857,7 @@ fn write_odin_subsection_inner(output: &mut String, full_path: &str, name: &str,
     // Phase 2: Array subsections first, then object subsections (matches TS behavior)
     for (key, val) in fields {
         if let DynValue::Array(items) = val {
-            write_odin_array_subsection(output, key, items);
+            write_odin_array_subsection_with_parent(output, key, items, Some(full_path));
         }
     }
     // Each child is evaluated against this section's scope
@@ -1874,6 +1874,7 @@ fn write_odin_subsection_inner(output: &mut String, full_path: &str, name: &str,
 
 /// Collect column names from all items of a tabular array.
 /// Supports nested objects: `{name: {first, last}}` becomes `["name.first", "name.last"]`.
+/// Supports uniform-length sub-arrays: `{coords: [1,2]}` becomes `["coords[0]", "coords[1]"]`.
 /// Columns are collected from all items to handle cases where later items have extra fields.
 fn collect_tabular_columns_from_items(items: &[DynValue]) -> Vec<String> {
     let mut columns: Vec<String> = Vec::new();
@@ -1890,6 +1891,14 @@ fn collect_tabular_columns_from_items(items: &[DynValue]) -> Vec<String> {
                             }
                         }
                     }
+                    DynValue::Array(arr) => {
+                        for i in 0..arr.len() {
+                            let col = format!("{key}[{i}]");
+                            if seen.insert(col.clone()) {
+                                columns.push(col);
+                            }
+                        }
+                    }
                     _ => {
                         if seen.insert(key.clone()) {
                             columns.push(key.clone());
@@ -1900,6 +1909,65 @@ fn collect_tabular_columns_from_items(items: &[DynValue]) -> Vec<String> {
         }
     }
     columns
+}
+
+/// Check whether an array of records can be emitted as tabular without loss.
+/// Allows scalars, objects-of-scalars (dotted columns), and arrays-of-scalars
+/// when the length is uniform across records. Anything else falls through to
+/// the record-block form.
+fn array_is_tabular_eligible(items: &[DynValue]) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let mut sub_array_lens: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for item in items {
+        let fields = match item {
+            DynValue::Object(f) => f,
+            _ => return false,
+        };
+        for (k, v) in fields {
+            match v {
+                DynValue::Object(sub) => {
+                    for (_, sv) in sub {
+                        if matches!(sv, DynValue::Object(_) | DynValue::Array(_)) {
+                            return false;
+                        }
+                    }
+                }
+                DynValue::Array(arr) => {
+                    for it in arr {
+                        if matches!(it, DynValue::Object(_) | DynValue::Array(_)) {
+                            return false;
+                        }
+                    }
+                    match sub_array_lens.get(k) {
+                        Some(&n) if n != arr.len() => return false,
+                        None => {
+                            sub_array_lens.insert(k.clone(), arr.len());
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Every record must have each sub-array key with matching length (ragged check).
+    for item in items {
+        let fields = match item {
+            DynValue::Object(f) => f,
+            _ => return false,
+        };
+        for (k, expected_len) in &sub_array_lens {
+            let found = fields.iter().find(|(fk, _)| fk == k);
+            match found {
+                Some((_, DynValue::Array(arr))) if arr.len() == *expected_len => {}
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Format column names using ODIN relative notation.
@@ -1933,7 +2001,22 @@ fn format_columns_with_relative(columns: &[String]) -> String {
 fn write_tabular_row(output: &mut String, columns: &[String], fields: &[(String, DynValue)]) {
     let mut vals = Vec::new();
     for col in columns {
-        let val = if let Some(dot) = col.find('.') {
+        // Indexed sub-array column: `name[N]`
+        let indexed = col.ends_with(']').then(|| col.rfind('[')).flatten().and_then(|open| {
+            if open == 0 { return None; }
+            let idx_str = &col[open + 1..col.len() - 1];
+            let idx: usize = idx_str.parse().ok()?;
+            let parent = &col[..open];
+            Some((parent, idx))
+        });
+        let val = if let Some((parent, idx)) = indexed {
+            fields.iter()
+                .find(|(k, _)| k == parent)
+                .and_then(|(_, v)| match v {
+                    DynValue::Array(arr) => arr.get(idx),
+                    _ => None,
+                })
+        } else if let Some(dot) = col.find('.') {
             let parent = &col[..dot];
             let child = &col[dot + 1..];
             fields.iter()
@@ -1959,13 +2042,17 @@ fn write_tabular_row(output: &mut String, columns: &[String], fields: &[(String,
 /// Write an array section at the top level.
 fn write_odin_array_section(output: &mut String, key: &str, items: &[DynValue]) {
     if let Some(DynValue::Object(_)) = items.first() {
-        let col_names = collect_tabular_columns_from_items(items);
-        let formatted_cols = format_columns_with_relative(&col_names);
-        let _ = writeln!(output, "{{{key}[] : {formatted_cols}}}");
-        for item in items {
-            if let DynValue::Object(fields) = item {
-                write_tabular_row(output, &col_names, fields);
+        if array_is_tabular_eligible(items) {
+            let col_names = collect_tabular_columns_from_items(items);
+            let formatted_cols = format_columns_with_relative(&col_names);
+            let _ = writeln!(output, "{{{key}[] : {formatted_cols}}}");
+            for item in items {
+                if let DynValue::Object(fields) = item {
+                    write_tabular_row(output, &col_names, fields);
+                }
             }
+        } else {
+            write_odin_record_blocks(output, key, items);
         }
     } else {
         // Simple value array (or empty)
@@ -1977,22 +2064,100 @@ fn write_odin_array_section(output: &mut String, key: &str, items: &[DynValue]) 
     }
 }
 
-/// Write an array as a sub-section.
+/// Write an array as a sub-section. Tabular forms use a relative `{.key[]}`
+/// header; record-block fallback uses absolute headers anchored at `parent_path`.
 fn write_odin_array_subsection(output: &mut String, key: &str, items: &[DynValue]) {
+    write_odin_array_subsection_with_parent(output, key, items, None);
+}
+
+fn write_odin_array_subsection_with_parent(
+    output: &mut String,
+    key: &str,
+    items: &[DynValue],
+    parent_path: Option<&str>,
+) {
     if let Some(DynValue::Object(_)) = items.first() {
-        let col_names = collect_tabular_columns_from_items(items);
-        let formatted_cols = format_columns_with_relative(&col_names);
-        let _ = writeln!(output, "{{.{key}[] : {formatted_cols}}}");
-        for item in items {
-            if let DynValue::Object(fields) = item {
-                write_tabular_row(output, &col_names, fields);
+        if array_is_tabular_eligible(items) {
+            let col_names = collect_tabular_columns_from_items(items);
+            let formatted_cols = format_columns_with_relative(&col_names);
+            let _ = writeln!(output, "{{.{key}[] : {formatted_cols}}}");
+            for item in items {
+                if let DynValue::Object(fields) = item {
+                    write_tabular_row(output, &col_names, fields);
+                }
             }
+        } else {
+            // Record-block fallback. Use absolute path for the record headers
+            // so that any nested `{.x}` inside resolves to this record.
+            let absolute_key = match parent_path {
+                Some(p) if !p.is_empty() => format!("{p}.{key}"),
+                _ => key.to_string(),
+            };
+            write_odin_record_blocks(output, &absolute_key, items);
         }
     } else {
         let _ = writeln!(output, "{{.{key}[] : ~}}");
         for item in items {
             write_odin_value(output, item);
             output.push('\n');
+        }
+    }
+}
+
+/// Emit an array of records as `{absolute_key[N]}` blocks — the fallback when
+/// tabular would pad ragged sub-arrays or drop nested data. `absolute_key` must
+/// be fully qualified so nested `{.x}` blocks resolve against the record.
+fn write_odin_record_blocks(output: &mut String, absolute_key: &str, items: &[DynValue]) {
+    for (i, item) in items.iter().enumerate() {
+        let record_path = format!("{absolute_key}[{i}]");
+        let _ = writeln!(output, "{{{record_path}}}");
+
+        let DynValue::Object(fields) = item else {
+            // Non-object entry in a record-block context: preserve as a value
+            // assignment so no data is lost.
+            write_odin_assignment(output, "value", item);
+            continue;
+        };
+
+        // Phase 1: scalar fields and pure leaf chains
+        for (child_key, child_val) in fields {
+            match child_val {
+                DynValue::Object(_) if is_pure_leaf_chain(child_val) => {
+                    collect_leaf_paths_inner(output, child_key, child_val);
+                }
+                DynValue::Object(_) | DynValue::Array(_) => {}
+                _ => write_odin_assignment(output, child_key, child_val),
+            }
+        }
+
+        // Phase 2: nested arrays as sub-blocks. Pass the record path as the
+        // parent so any further record-block fallback uses absolute headers.
+        for (child_key, child_val) in fields {
+            if let DynValue::Array(arr) = child_val {
+                write_odin_array_subsection_with_parent(
+                    output,
+                    child_key,
+                    arr,
+                    Some(&record_path),
+                );
+            }
+        }
+
+        // Phase 3: nested non-leaf-chain objects as `{.child}` subsections.
+        for (child_key, child_val) in fields {
+            if let DynValue::Object(sub_fields) = child_val {
+                if !is_pure_leaf_chain(child_val) {
+                    let full_path = format!("{record_path}.{child_key}");
+                    write_odin_subsection_inner(
+                        output,
+                        &full_path,
+                        child_key,
+                        sub_fields,
+                        &record_path,
+                        false,
+                    );
+                }
+            }
         }
     }
 }
@@ -3348,5 +3513,251 @@ mod extended_tests {
     fn timestamp_normalization_already_millis() {
         let result = normalize_timestamp("2024-12-15T10:30:00.500Z");
         assert_eq!(result, "2024-12-15T10:30:00.500Z");
+    }
+
+    // ---------------------------------------------------------------------
+    // Round-trip tests for tabular emission and the ragged-sub-array fix.
+    //
+    // These exercise the FULL pipeline: build a DynValue, format it as ODIN
+    // text via the transform formatter, parse the text back via the Rust
+    // SDK's actual parser, and verify the resulting JSON matches what JSON
+    // would have produced from the original DynValue. Any data loss in the
+    // formatter (e.g. nested arrays being silently dropped to `~`) shows up
+    // here as a failed structural comparison.
+    // ---------------------------------------------------------------------
+
+    /// Round-trip a DynValue through the ODIN formatter, the actual parser,
+    /// and back. Verifies that every scalar leaf in the input appears in the
+    /// parsed document under the same flat ODIN path with the same value.
+    /// Any data loss in the formatter (e.g. nested arrays silently dropped to
+    /// `~`) shows up as a missing leaf.
+    fn assert_round_trip(val: &DynValue) -> String {
+        let text = format_odin(val, false);
+        let doc = crate::Odin::parse(&text).unwrap_or_else(|e| {
+            panic!("parse failed for round-trip:\n----\n{text}\n----\nerror: {e:?}")
+        });
+        let mut leaves: Vec<(String, String)> = Vec::new();
+        collect_dyn_leaves(&mut leaves, String::new(), val);
+        for (path, expected) in &leaves {
+            let parsed = doc.get(path);
+            let actual = parsed.map(|v| odin_value_from_parsed(v));
+            assert!(
+                actual.as_deref() == Some(expected.as_str()),
+                "round-trip lost leaf `{path}` (expected {expected}, got {actual:?})\nformatted ODIN:\n{text}"
+            );
+        }
+        text
+    }
+
+    fn collect_dyn_leaves(
+        out: &mut Vec<(String, String)>,
+        prefix: String,
+        v: &DynValue,
+    ) {
+        match v {
+            DynValue::Object(fields) => {
+                for (k, child) in fields {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_dyn_leaves(out, path, child);
+                }
+            }
+            DynValue::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    let path = format!("{prefix}[{i}]");
+                    collect_dyn_leaves(out, path, child);
+                }
+            }
+            _ => out.push((prefix, odin_value_string(v))),
+        }
+    }
+
+    /// Render a parsed `OdinValue` in the same canonical text form that
+    /// `odin_value_string` produces for a `DynValue`, so the two can be
+    /// compared directly.
+    fn odin_value_from_parsed(v: &crate::types::values::OdinValue) -> String {
+        use crate::types::values::OdinValue;
+        match v {
+            OdinValue::Null { .. } => "~".to_string(),
+            OdinValue::Boolean { value, .. } => {
+                if *value { "?true".to_string() } else { "?false".to_string() }
+            }
+            OdinValue::String { value, .. } => {
+                let mut s = String::with_capacity(value.len() + 2);
+                s.push('"');
+                write_escaped_odin_string(&mut s, value);
+                s.push('"');
+                s
+            }
+            OdinValue::Integer { value, .. } => format!("##{value}"),
+            OdinValue::Number { value, .. } => {
+                if value.fract() == 0.0 && value.abs() < 1e15 {
+                    format!("#{}", *value as i64)
+                } else {
+                    format!("#{}", format_float_raw(*value))
+                }
+            }
+            other => format!("{other}"),
+        }
+    }
+
+    fn obj(fields: Vec<(&str, DynValue)>) -> DynValue {
+        DynValue::Object(fields.into_iter().map(|(k, v)| (k.into(), v)).collect())
+    }
+    fn s(v: &str) -> DynValue { DynValue::String(v.into()) }
+    fn i(n: i64) -> DynValue { DynValue::Integer(n) }
+    fn arr(items: Vec<DynValue>) -> DynValue { DynValue::Array(items) }
+
+    #[test]
+    fn round_trip_pure_tabular_records() {
+        // Pure scalar columns — tabular form is the right choice.
+        let val = obj(vec![(
+            "rows",
+            arr(vec![
+                obj(vec![("name", s("Alice")), ("age", i(30))]),
+                obj(vec![("name", s("Bob")), ("age", i(25))]),
+            ]),
+        )]);
+        let text = format_odin(&val, false);
+        // Sanity: tabular header present.
+        assert!(text.contains("{rows[]"), "expected tabular header, got:\n{text}");
+        assert!(!text.contains("{rows[0]}"), "should not fall through to record blocks");
+        assert_round_trip(&val);
+    }
+
+    #[test]
+    fn round_trip_uniform_subarray_records() {
+        // Both records have exactly two coords — tabular with indexed columns wins.
+        let val = obj(vec![(
+            "points",
+            arr(vec![
+                obj(vec![("label", s("A")), ("coords", arr(vec![i(1), i(2)]))]),
+                obj(vec![("label", s("B")), ("coords", arr(vec![i(3), i(4)]))]),
+            ]),
+        )]);
+        let text = format_odin(&val, false);
+        assert!(
+            text.contains("coords[0]") && text.contains("coords[1]"),
+            "expected indexed columns, got:\n{text}"
+        );
+        assert!(!text.contains("{points[0]}"), "should stay tabular, got:\n{text}");
+        assert_round_trip(&val);
+    }
+
+    #[test]
+    fn round_trip_ragged_subarray_records_no_data_loss() {
+        // Ragged sub-arrays must fall through to per-record blocks.
+        let val = obj(vec![(
+            "entries",
+            arr(vec![
+                obj(vec![
+                    ("slug", s("a/one")),
+                    ("title", s("One")),
+                    ("types", arr(vec![s("alpha"), s("beta")])),
+                    ("fields", arr(vec![s("id"), s("name"), s("desc")])),
+                ]),
+                obj(vec![
+                    ("slug", s("b/two")),
+                    ("title", s("Two")),
+                    ("types", arr(vec![s("gamma")])),
+                    ("fields", arr(vec![s("id")])),
+                ]),
+            ]),
+        )]);
+        let text = format_odin(&val, false);
+        // Must NOT use a tabular header (it would lose ragged data).
+        assert!(
+            !text.contains("entries[] :"),
+            "ragged sub-arrays must not use tabular form, got:\n{text}"
+        );
+        // Must use per-record headers.
+        assert!(text.contains("{entries[0]}"), "missing record header, got:\n{text}");
+        assert!(text.contains("{entries[1]}"), "missing record header, got:\n{text}");
+        // Must use primitive sub-blocks for the nested arrays.
+        assert!(text.contains("[] : ~}"), "missing primitive sub-blocks, got:\n{text}");
+
+        assert_round_trip(&val);
+        let _ = text;
+    }
+
+    #[test]
+    fn round_trip_pure_primitive_array() {
+        // Array of primitives — must use {key[] : ~} form.
+        let val = obj(vec![(
+            "tags",
+            arr(vec![s("alpha"), s("beta"), s("gamma")]),
+        )]);
+        let text = format_odin(&val, false);
+        assert!(text.contains("{tags[] : ~}"), "got:\n{text}");
+        assert_round_trip(&val);
+    }
+
+    #[test]
+    fn round_trip_records_with_nested_object_inside_array() {
+        // Multi-level nested objects — pre-fix formatter dropped data here.
+        let val = obj(vec![(
+            "items",
+            arr(vec![
+                obj(vec![
+                    ("id", i(1)),
+                    (
+                        "address",
+                        obj(vec![
+                            ("city", s("Boston")),
+                            ("geo", obj(vec![("lat", i(42)), ("lng", i(-71))])),
+                        ]),
+                    ),
+                ]),
+                obj(vec![
+                    ("id", i(2)),
+                    (
+                        "address",
+                        obj(vec![
+                            ("city", s("Seattle")),
+                            ("geo", obj(vec![("lat", i(47)), ("lng", i(-122))])),
+                        ]),
+                    ),
+                ]),
+            ]),
+        )]);
+        let text = format_odin(&val, false);
+        assert_round_trip(&val);
+        let _ = text;
+    }
+
+    #[test]
+    fn round_trip_records_inside_section_with_ragged_subarrays() {
+        // Records nested inside a parent section — the fallback must use
+        // ABSOLUTE record headers so any `{.x}` inside resolves correctly.
+        let val = obj(vec![(
+            "customer",
+            obj(vec![
+                ("name", s("Acme")),
+                (
+                    "orders",
+                    arr(vec![
+                        obj(vec![
+                            ("id", i(1)),
+                            ("items", arr(vec![s("a"), s("b"), s("c")])),
+                        ]),
+                        obj(vec![
+                            ("id", i(2)),
+                            ("items", arr(vec![s("x")])),
+                        ]),
+                    ]),
+                ),
+            ]),
+        )]);
+        let text = format_odin(&val, false);
+        // Should fall through to record-block form (ragged items).
+        assert!(
+            text.contains("{customer.orders[0]}") || text.contains("{.orders[0]}"),
+            "expected record blocks for ragged sub-arrays inside a section, got:\n{text}"
+        );
+        assert_round_trip(&val);
+        let _ = text;
     }
 }

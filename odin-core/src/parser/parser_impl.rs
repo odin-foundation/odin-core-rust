@@ -153,17 +153,23 @@ impl<'a> Parser<'a> {
                         in_metadata = false;
                         self.current_header = Some(header_value.strip_prefix('@').unwrap_or(&header_value).to_string());
                     } else if header_value.contains("[] :") || header_value.contains("[] :") {
-                        // Tabular section: {name[] : col1, col2, ...}
-                        // Parse as array of records from subsequent CSV-like rows
+                        // Tabular section `{name[] : col, ...}`. A leading `.` makes
+                        // it relative to the last absolute header.
                         in_metadata = false;
-                        // Save previous_header before tabular mode, so exiting tabular restores context
-                        if !header_value.starts_with('.') {
+                        let resolved_header: String = if let Some(rest) = header_value.strip_prefix('.') {
+                            if let Some(ref base) = self.previous_header {
+                                format!("{base}.{rest}")
+                            } else {
+                                rest.to_string()
+                            }
+                        } else {
                             // Absolute tabular header — update previous_header
                             let base = header_value.split("[]").next().unwrap_or("");
                             self.previous_header = Some(base.to_string());
-                        }
+                            header_value.clone()
+                        };
                         self.current_header = None;
-                        self.parse_tabular_section(&header_value, &mut assignments);
+                        self.parse_tabular_section(&resolved_header, &mut assignments);
                     } else if header_value.is_empty() {
                         // Empty braces {} — root section reset
                         in_metadata = false;
