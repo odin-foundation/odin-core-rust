@@ -115,14 +115,12 @@ pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, u
             ))
         }
         TokenType::VerbPrefix => {
-            // Unquoted verb expression: %verbName args... — collect rest of line as raw string
-            // Stored as OdinValue::Verb so the transform parser can distinguish bare verbs
-            // from quoted strings that happen to start with %.
-            let verb_name = &token.value;
-            let is_custom = verb_name.starts_with('&');
-            let prefix = format!("%{verb_name}");
-            // Collect remaining tokens on the same line
-            let mut parts = vec![prefix];
+            // Unquoted verb expression: %verbName args... — collect rest of line
+            // as a raw string. Build into one buffer instead of allocating per token.
+            let is_custom = token.value.starts_with('&');
+            let mut raw_expr = String::with_capacity(token.value.len() + 16);
+            raw_expr.push('%');
+            raw_expr.push_str(&token.value);
             let mut consumed = 1;
             let mut i = pos + 1;
             while i < tokens.len() {
@@ -130,25 +128,23 @@ pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, u
                 if t.token_type == TokenType::Newline || t.token_type == TokenType::Comment {
                     break;
                 }
-                // Reconstruct token text
-                let text = match t.token_type {
-                    TokenType::ReferencePrefix => format!("@{}", t.value),
-                    TokenType::IntegerPrefix => format!("##{}", t.value),
-                    TokenType::NumberPrefix => format!("#{}", t.value),
-                    TokenType::CurrencyPrefix => format!("#${}", t.value),
-                    TokenType::PercentPrefix => format!("#%{}", t.value),
-                    TokenType::BooleanPrefix => "?".to_string(),
-                    TokenType::QuotedString => format!("\"{}\"", t.value),
-                    TokenType::Null => "~".to_string(),
-                    TokenType::Directive => format!(":{}", t.value),
-                    TokenType::VerbPrefix => format!("%{}", t.value),
-                    _ => t.value.to_string(),
-                };
-                parts.push(text);
+                raw_expr.push(' ');
+                match t.token_type {
+                    TokenType::ReferencePrefix => { raw_expr.push('@'); raw_expr.push_str(&t.value); }
+                    TokenType::IntegerPrefix => { raw_expr.push_str("##"); raw_expr.push_str(&t.value); }
+                    TokenType::NumberPrefix => { raw_expr.push('#'); raw_expr.push_str(&t.value); }
+                    TokenType::CurrencyPrefix => { raw_expr.push_str("#$"); raw_expr.push_str(&t.value); }
+                    TokenType::PercentPrefix => { raw_expr.push_str("#%"); raw_expr.push_str(&t.value); }
+                    TokenType::BooleanPrefix => raw_expr.push('?'),
+                    TokenType::QuotedString => { raw_expr.push('"'); raw_expr.push_str(&t.value); raw_expr.push('"'); }
+                    TokenType::Null => raw_expr.push('~'),
+                    TokenType::Directive => { raw_expr.push(':'); raw_expr.push_str(&t.value); }
+                    TokenType::VerbPrefix => { raw_expr.push('%'); raw_expr.push_str(&t.value); }
+                    _ => raw_expr.push_str(&t.value),
+                }
                 consumed += 1;
                 i += 1;
             }
-            let raw_expr = parts.join(" ");
             Ok((OdinValue::Verb {
                 verb: raw_expr,
                 is_custom,

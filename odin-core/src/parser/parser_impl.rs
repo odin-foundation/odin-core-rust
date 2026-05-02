@@ -898,13 +898,13 @@ impl<'a> Parser<'a> {
             // Generate assignments for this row
             if is_primitive {
                 // Primitive array: one value per row, key is items[0], items[1], etc.
-                if let Some(val) = values.first() {
+                if let Some(val) = values.into_iter().next() {
                     key_buf.clear();
                     key_buf.push_str(base_name);
                     key_buf.push('[');
                     let _ = write!(key_buf, "{row_index}");
                     key_buf.push(']');
-                    assignments.insert(key_buf.clone(), val.clone());
+                    assignments.insert(key_buf.clone(), val);
                 }
             } else {
                 key_buf.clear();
@@ -914,13 +914,10 @@ impl<'a> Parser<'a> {
                 key_buf.push(']');
                 key_buf.push('.');
                 let prefix_len = key_buf.len();
-                for (col_idx, col_name) in resolved_columns.iter().enumerate() {
-                    if let Some(val) = values.get(col_idx) {
-                        // Skip absent values (empty cells between commas)
-                        key_buf.truncate(prefix_len);
-                        key_buf.push_str(col_name);
-                        assignments.insert(key_buf.clone(), val.clone());
-                    }
+                for (col_name, val) in resolved_columns.iter().zip(values.into_iter()) {
+                    key_buf.truncate(prefix_len);
+                    key_buf.push_str(col_name);
+                    assignments.insert(key_buf.clone(), val);
                 }
             }
             row_index += 1;
@@ -1150,6 +1147,35 @@ mod tests {
         let doc = crate::parser::parse(input, Some(&opts)).unwrap();
         assert_eq!(doc.get_string("items[0]"), Some("c"));
         assert_eq!(doc.get_string("items[1]"), Some("b"));
+    }
+
+    // ── Verb expression parsing ──────────────────────────────────────────
+
+    #[test]
+    fn verb_simple_args_preserved() {
+        // Verb args are joined with single spaces; leading '%' is preserved.
+        let input = "result = %lookup users name\n";
+        let doc = Odin::parse(input).unwrap();
+        let val = doc.get("result").unwrap();
+        if let OdinValue::Verb { verb, .. } = val {
+            assert_eq!(verb, "%lookup users name");
+        } else {
+            panic!("expected Verb value, got {:?}", val);
+        }
+    }
+
+    #[test]
+    fn verb_with_quoted_arg() {
+        let input = "msg = %concat \"hello\" \"world\"\n";
+        let doc = Odin::parse(input).unwrap();
+        let val = doc.get("msg").unwrap();
+        if let OdinValue::Verb { verb, .. } = val {
+            assert!(verb.starts_with("%concat"));
+            assert!(verb.contains("\"hello\""));
+            assert!(verb.contains("\"world\""));
+        } else {
+            panic!("expected Verb value");
+        }
     }
 
     // ── Modifiers attached to values ─────────────────────────────────────
