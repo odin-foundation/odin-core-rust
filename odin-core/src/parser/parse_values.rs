@@ -200,12 +200,10 @@ fn parse_number(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseEr
     })?;
 
     let decimal_places = if raw.contains('.') {
-        // Find the decimal part (before any 'e'/'E')
-        let lower = raw.to_lowercase();
-        let num_part = if let Some(e_pos) = lower.find('e') {
-            &raw[..e_pos]
-        } else {
-            raw
+        // Find the decimal part (before any 'e'/'E') without allocating.
+        let num_part = match raw.find(|c: char| c == 'e' || c == 'E') {
+            Some(e_pos) => &raw[..e_pos],
+            None => raw,
         };
         num_part.find('.').map(|dot_pos| (num_part.len() - dot_pos - 1) as u8)
     } else {
@@ -376,21 +374,24 @@ fn base64_decode(input: &str) -> Vec<u8> {
 
 /// Parse and validate a date string (YYYY-MM-DD).
 fn parse_date_value(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
-    let parts: Vec<&str> = raw.split('-').collect();
-    if parts.len() != 3 {
-        return Err(ParseError::with_message(
-            ParseErrorCode::UnexpectedCharacter,
-            line, col,
-            &format!("invalid date: {raw}"),
-        ));
-    }
-    let year = parts[0].parse::<i32>().map_err(|_| {
+    let mut iter = raw.split('-');
+    let (year_s, month_s, day_s) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
+        (Some(y), Some(m), Some(d), None) => (y, m, d),
+        _ => {
+            return Err(ParseError::with_message(
+                ParseErrorCode::UnexpectedCharacter,
+                line, col,
+                &format!("invalid date: {raw}"),
+            ));
+        }
+    };
+    let year = year_s.parse::<i32>().map_err(|_| {
         ParseError::with_message(ParseErrorCode::UnexpectedCharacter, line, col, &format!("invalid date: {raw}"))
     })?;
-    let month = parts[1].parse::<u8>().map_err(|_| {
+    let month = month_s.parse::<u8>().map_err(|_| {
         ParseError::with_message(ParseErrorCode::UnexpectedCharacter, line, col, &format!("invalid date: {raw}"))
     })?;
-    let day = parts[2].parse::<u8>().map_err(|_| {
+    let day = day_s.parse::<u8>().map_err(|_| {
         ParseError::with_message(ParseErrorCode::UnexpectedCharacter, line, col, &format!("invalid date: {raw}"))
     })?;
 

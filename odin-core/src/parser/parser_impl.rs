@@ -97,6 +97,24 @@ impl<'a> Parser<'a> {
         Ok(documents)
     }
 
+    /// Parse all documents but keep only the last — single-doc fast path
+    /// avoids allocating a `Vec<OdinDocument>` for the common case.
+    fn parse_last_document(&mut self) -> Result<OdinDocument, ParseError> {
+        let mut latest = self.parse_single_document()?;
+        loop {
+            self.skip_newlines();
+            if !self.is_at_end() && self.peek().map(|t| t.token_type) == Some(TokenType::DocumentSeparator) {
+                self.advance();
+                self.skip_newlines();
+                self.current_header = None;
+                latest = self.parse_single_document()?;
+            } else {
+                break;
+            }
+        }
+        Ok(latest)
+    }
+
     /// Parse a single document (up to `---` separator or EOF).
     fn parse_single_document(&mut self) -> Result<OdinDocument, ParseError> {
         // Estimate capacity from token count (roughly 1 assignment per 4 tokens)
@@ -932,17 +950,7 @@ pub fn parse_tokens<'a>(
     options: &ParseOptions,
 ) -> Result<OdinDocument, ParseError> {
     let mut parser = Parser::new(tokens, options);
-    let docs = parser.parse_documents()?;
-    // Return the last document (for single-document compat)
-    Ok(docs.into_iter().last().unwrap_or_else(|| OdinDocument {
-        metadata: OrderedMap::new(),
-        assignments: OrderedMap::new(),
-        modifiers: OrderedMap::new(),
-        imports: Vec::new(),
-        schemas: Vec::new(),
-        conditionals: Vec::new(),
-        comments: Vec::new(),
-    }))
+    parser.parse_last_document()
 }
 
 /// Parse a token stream into multiple documents (for document chaining).

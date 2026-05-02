@@ -15,7 +15,9 @@ struct Tokenizer<'a> {
     bytes: &'a [u8],
     pos: usize,
     line: usize,
-    column: usize,
+    /// Byte offset where the current line starts. Column is derived as
+    /// `pos - line_start + 1`, so we don't update a counter per byte.
+    line_start: usize,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -27,8 +29,13 @@ impl<'a> Tokenizer<'a> {
             bytes: source.as_bytes(),
             pos: 0,
             line: 1,
-            column: 1,
+            line_start: 0,
         }
+    }
+
+    #[inline]
+    fn column(&self) -> usize {
+        self.pos - self.line_start + 1
     }
 
     #[inline]
@@ -57,9 +64,7 @@ impl<'a> Tokenizer<'a> {
         self.pos += 1;
         if ch == b'\n' {
             self.line += 1;
-            self.column = 1;
-        } else {
-            self.column += 1;
+            self.line_start = self.pos;
         }
         ch
     }
@@ -109,7 +114,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_comment(&mut self) -> Token<'a> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
         self.advance(); // skip `;`
         while !self.is_at_end() && self.peek() != Some(b'\n') {
             self.advance();
@@ -120,7 +125,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_quoted_string(&mut self) -> Result<Token<'a>, ParseError> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
         self.advance(); // skip opening `"`
         let content_start = self.pos;
 
@@ -140,10 +145,9 @@ impl<'a> Tokenizer<'a> {
 
         if !needs_processing {
             // Fast path: no escapes, borrow directly from source.
-            // No newlines in content, so line stays the same.
+            // No newlines in content, so column is derived from pos.
             let content_end = peek_pos;
             self.pos = content_end;
-            self.column = start_col + 1 + (content_end - content_start);
             self.advance(); // skip closing `"`
             return Ok(self.make_borrowed(
                 TokenType::QuotedString, start, start_line, start_col,
@@ -200,7 +204,7 @@ impl<'a> Tokenizer<'a> {
                     _ => {
                         return Err(ParseError::with_message(
                             ParseErrorCode::InvalidEscapeSequence,
-                            self.line, self.column,
+                            self.line, self.column(),
                             &format!("unknown escape: \\{}", esc as char),
                         ));
                     }
@@ -252,7 +256,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_header(&mut self) -> Result<Token<'a>, ParseError> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
         self.advance(); // skip `{`
         let content_start = self.pos;
 
@@ -304,7 +308,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_identifier(&mut self) -> Result<Token<'a>, ParseError> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
 
         let first = self.current_byte();
 
@@ -359,22 +363,20 @@ impl<'a> Tokenizer<'a> {
     fn scan_bare_value(&mut self) -> Token<'a> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
 
         while !self.is_at_end() {
             match self.peek() {
                 Some(b'\n' | b'\r' | b';') => break,
                 Some(b' ' | b'\t') => {
+                    // skip_whitespace only consumes ' ' and '\t' (no newlines),
+                    // so line/line_start are invariant — only pos needs restore.
                     let saved_pos = self.pos;
-                    let saved_line = self.line;
-                    let saved_col = self.column;
                     self.skip_whitespace();
                     if self.is_at_end() || matches!(self.peek(), Some(b'\n' | b'\r' | b';')) {
                         break;
                     }
                     self.pos = saved_pos;
-                    self.line = saved_line;
-                    self.column = saved_col;
                     self.advance();
                 }
                 _ => { self.advance(); }
@@ -404,7 +406,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_number(&mut self) -> Token<'a> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
         self.scan_number_inline();
         self.make_borrowed(TokenType::NumericLiteral, start, start_line, start_col, &self.source[start..self.pos])
     }
@@ -413,7 +415,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_date_or_timestamp(&mut self) -> Token<'a> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
 
         while !self.is_at_end() {
             match self.peek() {
@@ -434,7 +436,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_time(&mut self) -> Token<'a> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
 
         while !self.is_at_end() {
             match self.peek() {
@@ -449,7 +451,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_duration(&mut self) -> Token<'a> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
 
         while !self.is_at_end() {
             match self.peek() {
@@ -466,7 +468,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_directive(&mut self) -> Token<'a> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
         self.advance(); // skip `:`
 
         let name_start = self.pos;
@@ -486,7 +488,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_at(&mut self) -> Result<Token<'a>, ParseError> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
         self.advance(); // skip `@`
 
         // Read the keyword/path after @
@@ -594,7 +596,7 @@ impl<'a> Tokenizer<'a> {
     fn scan_extension_path(&mut self) -> Token<'a> {
         let start = self.pos;
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
         self.advance(); // skip `&`
 
         while !self.is_at_end() && matches!(self.peek(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.')) {
@@ -613,7 +615,7 @@ impl<'a> Tokenizer<'a> {
 
         let ch = self.current_byte();
         let start_line = self.line;
-        let start_col = self.column;
+        let start_col = self.column();
         let start_pos = self.pos;
 
         match ch {
@@ -843,7 +845,7 @@ pub fn tokenize<'a>(source: &'a str, options: &ParseOptions) -> Result<Vec<Token
         tokenizer.pos,
         tokenizer.pos,
         tokenizer.line,
-        tokenizer.column,
+        tokenizer.column(),
         "",
     ));
 

@@ -39,9 +39,13 @@ use crate::types::errors::ParseError;
 ///
 /// Returns `ParseError` if the input is not valid ODIN text.
 pub fn parse(input: &str, options: Option<&ParseOptions>) -> Result<OdinDocument, ParseError> {
-    let opts = options.cloned().unwrap_or_default();
-    let tokens = tokenizer::tokenize(input, &opts)?;
-    parser_impl::parse_tokens(&tokens, input, &opts)
+    let default_opts;
+    let opts = match options {
+        Some(o) => o,
+        None => { default_opts = ParseOptions::default(); &default_opts }
+    };
+    let tokens = tokenizer::tokenize(input, opts)?;
+    parser_impl::parse_tokens(&tokens, input, opts)
 }
 
 /// Parse ODIN text into a chain of documents.
@@ -52,7 +56,11 @@ pub fn parse(input: &str, options: Option<&ParseOptions>) -> Result<OdinDocument
 ///
 /// Returns `ParseError` if the input is not valid ODIN text.
 pub fn parse_documents(input: &str, options: Option<&ParseOptions>) -> Result<Vec<OdinDocument>, ParseError> {
-    let opts = options.cloned().unwrap_or_default();
-    let tokens = tokenizer::tokenize(input, &opts)?;
-    parser_impl::parse_tokens_multi(&tokens, input, &opts)
+    let default_opts;
+    let opts = match options {
+        Some(o) => o,
+        None => { default_opts = ParseOptions::default(); &default_opts }
+    };
+    let tokens = tokenizer::tokenize(input, opts)?;
+    parser_impl::parse_tokens_multi(&tokens, input, opts)
 }
