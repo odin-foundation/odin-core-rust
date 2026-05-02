@@ -109,7 +109,8 @@ impl<'a> Parser<'a> {
         let conditionals = Vec::new();
         let mut comments: Vec<OdinComment> = Vec::new();
         let mut in_metadata = false;
-        let mut array_indices: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        // Next expected contiguous index per array base.
+        let mut array_indices: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         self.skip_newlines();
 
@@ -292,8 +293,8 @@ impl<'a> Parser<'a> {
                         token.value.to_string()
                     };
 
-                    // Normalize leading zeros in array indices: [007] -> [7]
-                    {
+                    // Normalize leading zeros in array indices: [007] -> [7].
+                    if full_path.as_bytes().contains(&b'[') {
                         let mut normalized = String::with_capacity(full_path.len());
                         let mut i = 0;
                         let bytes = full_path.as_bytes();
@@ -376,7 +377,7 @@ impl<'a> Parser<'a> {
                         }
                     }
 
-                    // Second pass: track first array index for contiguity (P013)
+                    // Second pass: track first array index for contiguity (P013).
                     if let Some(bracket_pos) = full_path.find('[') {
                         let array_base = &full_path[..bracket_pos];
                         if let Some(close_pos) = full_path[bracket_pos..].find(']') {
@@ -385,31 +386,26 @@ impl<'a> Parser<'a> {
                             // Check for empty brackets (array clear)
                             if idx_str.is_empty() {
                                 // Array clear syntax: items[] = ~
-                                // Allow this through
-                            } else if let Ok(idx) = idx_str.parse::<i64>() {
-                                if idx < 0 {
-                                    // Already handled above
-                                } else {
-                                    let idx = idx as usize;
-                                    // Avoid to_string() per element — only allocate key for first occurrence
-                                    let indices = if let Some(v) = array_indices.get_mut(array_base) {
-                                        v
-                                    } else {
-                                        array_indices.insert(array_base.to_string(), Vec::new());
-                                        array_indices.get_mut(array_base).unwrap()
-                                    };
-                                    if !indices.contains(&idx) {
-                                        // Check contiguity
-                                        let expected = if indices.is_empty() { 0 } else { indices.iter().copied().max().unwrap_or(0) + 1 };
-                                        if idx != expected {
-                                            return Err(ParseError::with_message(
-                                                ParseErrorCode::NonContiguousArrayIndices,
-                                                path_line, path_col,
-                                                &format!("Non-contiguous array indices: expected {expected}, got {idx}"),
-                                            ));
-                                        }
-                                        indices.push(idx);
+                            } else if let Ok(idx) = idx_str.parse::<usize>() {
+                                if let Some(expected) = array_indices.get_mut(array_base) {
+                                    if idx == *expected {
+                                        *expected += 1;
+                                    } else if idx > *expected {
+                                        return Err(ParseError::with_message(
+                                            ParseErrorCode::NonContiguousArrayIndices,
+                                            path_line, path_col,
+                                            &format!("Non-contiguous array indices: expected {}, got {idx}", *expected),
+                                        ));
                                     }
+                                    // idx < expected: re-assignment, allowed (duplicate-path check handles it)
+                                } else if idx == 0 {
+                                    array_indices.insert(array_base.to_string(), 1);
+                                } else {
+                                    return Err(ParseError::with_message(
+                                        ParseErrorCode::NonContiguousArrayIndices,
+                                        path_line, path_col,
+                                        &format!("Non-contiguous array indices: expected 0, got {idx}"),
+                                    ));
                                 }
                             }
                         }
@@ -576,6 +572,8 @@ impl<'a> Parser<'a> {
         }
 
         let mut row_index: usize = 0;
+        let mut key_buf = String::with_capacity(64);
+        use std::fmt::Write as _;
 
         // Consume tokens until the next Header or EOF
         loop {
@@ -681,11 +679,20 @@ impl<'a> Parser<'a> {
             }
 
             // Generate metadata entries for this row
+            key_buf.clear();
+            key_buf.push_str("table.");
+            key_buf.push_str(table_name);
+            key_buf.push('[');
+            let _ = write!(key_buf, "{row_index}");
+            key_buf.push(']');
+            key_buf.push('.');
+            let prefix_len = key_buf.len();
             for (col_idx, col_name) in columns.iter().enumerate() {
                 if let Some(val) = values.get(col_idx) {
-                    let key = format!("table.{table_name}[{row_index}].{col_name}");
+                    key_buf.truncate(prefix_len);
+                    key_buf.push_str(col_name);
                     metadata.insert(
-                        key,
+                        key_buf.clone(),
                         crate::types::values::OdinValue::String {
                             value: val.clone(),
                             modifiers: None,
@@ -753,6 +760,8 @@ impl<'a> Parser<'a> {
         };
 
         let mut row_index: usize = 0;
+        let mut key_buf = String::with_capacity(64);
+        use std::fmt::Write as _;
 
         loop {
             self.skip_newlines();
@@ -890,15 +899,27 @@ impl<'a> Parser<'a> {
             if is_primitive {
                 // Primitive array: one value per row, key is items[0], items[1], etc.
                 if let Some(val) = values.first() {
-                    let key = format!("{base_name}[{row_index}]");
-                    assignments.insert(key, val.clone());
+                    key_buf.clear();
+                    key_buf.push_str(base_name);
+                    key_buf.push('[');
+                    let _ = write!(key_buf, "{row_index}");
+                    key_buf.push(']');
+                    assignments.insert(key_buf.clone(), val.clone());
                 }
             } else {
+                key_buf.clear();
+                key_buf.push_str(base_name);
+                key_buf.push('[');
+                let _ = write!(key_buf, "{row_index}");
+                key_buf.push(']');
+                key_buf.push('.');
+                let prefix_len = key_buf.len();
                 for (col_idx, col_name) in resolved_columns.iter().enumerate() {
                     if let Some(val) = values.get(col_idx) {
                         // Skip absent values (empty cells between commas)
-                        let key = format!("{base_name}[{row_index}].{col_name}");
-                        assignments.insert(key, val.clone());
+                        key_buf.truncate(prefix_len);
+                        key_buf.push_str(col_name);
+                        assignments.insert(key_buf.clone(), val.clone());
                     }
                 }
             }
