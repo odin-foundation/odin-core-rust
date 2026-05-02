@@ -4583,9 +4583,10 @@ mod extended_tests {
     #[test]
     fn random_with_max() {
         let r = random_verb(&[i(100)], &ctx()).unwrap();
+        // random(N) returns int in [0, N] inclusive — match the doc comment on random_verb.
         match r {
-            DynValue::Float(v) => assert!(v >= 0.0 && v < 100.0, "random={v}"),
-            DynValue::Integer(v) => assert!(v >= 0 && v < 100, "random={v}"),
+            DynValue::Float(v) => assert!((0.0..=100.0).contains(&v), "random={v}"),
+            DynValue::Integer(v) => assert!((0..=100).contains(&v), "random={v}"),
             _ => panic!("Expected numeric"),
         }
     }
