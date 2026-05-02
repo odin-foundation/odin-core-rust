@@ -201,8 +201,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TokenType::Import => {
-                    let line = token.line;
-                    let col = token.column;
+                    let line = token.line as usize;
+                    let col = token.column as usize;
                     let value = token.value.to_string();
                     self.advance();
 
@@ -241,8 +241,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TokenType::Schema => {
-                    let line = token.line;
-                    let col = token.column;
+                    let line = token.line as usize;
+                    let col = token.column as usize;
                     let value = token.value.to_string();
                     self.advance();
 
@@ -261,8 +261,8 @@ impl<'a> Parser<'a> {
                     });
                 }
                 TokenType::Conditional => {
-                    let line = token.line;
-                    let col = token.column;
+                    let line = token.line as usize;
+                    let col = token.column as usize;
                     let value = token.value.to_string();
                     self.advance();
 
@@ -277,8 +277,8 @@ impl<'a> Parser<'a> {
                     // Store conditional — skip for now, just validate
                 }
                 TokenType::Path | TokenType::BooleanLiteral => {
-                    let path_line = token.line;
-                    let path_col = token.column;
+                    let path_line = token.line as usize;
+                    let path_col = token.column as usize;
 
                     // Build full path directly from token value — avoids intermediate
                     // to_string() + format!() double allocation for section fields.
@@ -485,7 +485,7 @@ impl<'a> Parser<'a> {
                             let bad = self.current_token();
                             return Err(ParseError::with_message(
                                 ParseErrorCode::UnexpectedCharacter,
-                                bad.line, bad.column,
+                                bad.line as usize, bad.column as usize,
                                 &format!("Unexpected content after value: {:?}", bad.value),
                             ));
                         }
@@ -520,7 +520,7 @@ impl<'a> Parser<'a> {
                         comments.push(OdinComment {
                             text,
                             associated_path: None,
-                            line: token.line,
+                            line: token.line as usize,
                         });
                     }
                     self.advance();
@@ -1122,6 +1122,34 @@ mod tests {
         let input = "items[0] = \"a\"\nitems[5] = \"b\"";
         let result = Odin::parse(input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn array_starting_at_nonzero_errors() {
+        // First index must be 0 (not 2 or any other value).
+        let input = "items[2] = \"a\"";
+        assert!(Odin::parse(input).is_err());
+    }
+
+    #[test]
+    fn array_index_reassign_errors_by_default() {
+        // items[0] then items[0] is a duplicate path; rejected unless allow_duplicates.
+        let input = "items[0] = \"a\"\nitems[0] = \"b\"";
+        assert!(Odin::parse(input).is_err());
+    }
+
+    #[test]
+    fn array_index_reassign_allowed_with_option() {
+        // With allow_duplicates the second write wins; contiguity tracking must
+        // not reject idx < expected.
+        let opts = crate::types::options::ParseOptions {
+            allow_duplicates: true,
+            ..Default::default()
+        };
+        let input = "items[0] = \"a\"\nitems[1] = \"b\"\nitems[0] = \"c\"";
+        let doc = crate::parser::parse(input, Some(&opts)).unwrap();
+        assert_eq!(doc.get_string("items[0]"), Some("c"));
+        assert_eq!(doc.get_string("items[1]"), Some("b"));
     }
 
     // ── Modifiers attached to values ─────────────────────────────────────

@@ -76,18 +76,18 @@ pub enum TokenType {
 /// that require processing (e.g., strings with escape sequences) allocate.
 #[derive(Debug, Clone)]
 pub struct Token<'a> {
-    /// The token type.
-    pub token_type: TokenType,
-    /// Byte offset in the source text where the token starts.
-    pub start: usize,
-    /// Byte offset in the source text where the token ends (exclusive).
-    pub end: usize,
-    /// Line number (1-based).
-    pub line: usize,
-    /// Column number (1-based).
-    pub column: usize,
     /// The token's text content — borrowed from source when possible.
     pub value: Cow<'a, str>,
+    /// Byte offset in the source text where the token starts.
+    pub start: u32,
+    /// Byte offset in the source text where the token ends (exclusive).
+    pub end: u32,
+    /// Line number (1-based).
+    pub line: u32,
+    /// Column number (1-based).
+    pub column: u32,
+    /// The token type.
+    pub token_type: TokenType,
 }
 
 impl<'a> Token<'a> {
@@ -103,10 +103,10 @@ impl<'a> Token<'a> {
     ) -> Self {
         Self {
             token_type,
-            start,
-            end,
-            line,
-            column,
+            start: start as u32,
+            end: end as u32,
+            line: line as u32,
+            column: column as u32,
             value: Cow::Borrowed(value),
         }
     }
@@ -123,10 +123,10 @@ impl<'a> Token<'a> {
     ) -> Self {
         Self {
             token_type,
-            start,
-            end,
-            line,
-            column,
+            start: start as u32,
+            end: end as u32,
+            line: line as u32,
+            column: column as u32,
             value: Cow::Owned(value),
         }
     }

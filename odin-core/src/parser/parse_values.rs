@@ -48,37 +48,37 @@ pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, u
                     // Bare strings are not allowed in ODIN
                     Err(ParseError::with_message(
                         ParseErrorCode::BareStringNotAllowed,
-                        token.line, token.column,
+                        token.line as usize, token.column as usize,
                         &format!("Unquoted string \"{}\" - use double quotes", token.value),
                     ))
                 }
             }
         }
         TokenType::NumberPrefix => {
-            let value = parse_number(&token.value, token.line, token.column)?;
+            let value = parse_number(&token.value, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::IntegerPrefix => {
-            let value = parse_integer(&token.value, token.line, token.column)?;
+            let value = parse_integer(&token.value, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::CurrencyPrefix => {
-            let value = parse_currency(&token.value, token.line, token.column)?;
+            let value = parse_currency(&token.value, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::PercentPrefix => {
-            let value = parse_percent(&token.value, token.line, token.column)?;
+            let value = parse_percent(&token.value, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::ReferencePrefix => {
             Ok((OdinValues::reference(&*token.value), 1))
         }
         TokenType::BinaryPrefix => {
-            let value = parse_binary(&token.value, token.line, token.column)?;
+            let value = parse_binary(&token.value, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::DateLiteral => {
-            parse_date_value(&token.value, token.line, token.column)
+            parse_date_value(&token.value, token.line as usize, token.column as usize)
                 .map(|v| (v, 1))
         }
         TokenType::TimeLiteral => {
@@ -93,7 +93,7 @@ pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, u
         TokenType::Path => {
             // Path tokens in value position can be temporal values
             if is_date_like(&token.value) {
-                if let Ok(val) = parse_date_value(&token.value, token.line, token.column) {
+                if let Ok(val) = parse_date_value(&token.value, token.line as usize, token.column as usize) {
                     return Ok((val, 1));
                 }
             }
@@ -110,7 +110,7 @@ pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, u
             // Bare string — not allowed
             Err(ParseError::with_message(
                 ParseErrorCode::BareStringNotAllowed,
-                token.line, token.column,
+                token.line as usize, token.column as usize,
                 &format!("Unquoted string \"{}\" - use double quotes", token.value),
             ))
         }
@@ -160,7 +160,7 @@ pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, u
         _ => {
             Err(ParseError::with_message(
                 ParseErrorCode::UnexpectedCharacter,
-                token.line, token.column,
+                token.line as usize, token.column as usize,
                 &format!("unexpected token type {:?} for value", token.token_type),
             ))
         }

@@ -823,6 +823,10 @@ pub fn tokenize<'a>(source: &'a str, options: &ParseOptions) -> Result<Vec<Token
     if source.len() > options.max_size {
         return Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1));
     }
+    // Token positions are u32; reject sources that would overflow.
+    if source.len() > u32::MAX as usize {
+        return Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1));
+    }
 
     let mut tokenizer = Tokenizer::new(source);
     let estimated_size = source.len() / 12 + 16;
