@@ -64,20 +64,36 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> OrderedMap<K, V> {
         self.inner.entry(key)
     }
 
-    pub fn get(&self, key: &K) -> Option<&V> {
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         self.inner.get(key)
     }
 
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         self.inner.get_mut(key)
     }
 
-    pub fn contains_key(&self, key: &K) -> bool {
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         self.inner.contains_key(key)
     }
 
     /// Remove a key, shifting later entries to maintain insertion order. O(n).
-    pub fn remove(&mut self, key: &K) -> Option<V> {
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: ?Sized + std::hash::Hash + Eq,
+    {
         self.inner.shift_remove(key)
     }
 

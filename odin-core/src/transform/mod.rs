@@ -28,7 +28,7 @@ use crate::types::errors::ParseError;
 /// Returns `ParseError` if the transform text is not valid ODIN.
 pub fn parse_transform(input: &str) -> Result<OdinTransform, ParseError> {
     let doc = crate::parser::parse(input, None)?;
-    Ok(parser::parse_transform_doc(&doc))
+    Ok(parser::parse_transform_doc(doc))
 }
 
 /// Execute a transform against source data.

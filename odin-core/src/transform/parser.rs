@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use crate::types::document::OdinDocument;
+use crate::types::ordered_map::OrderedMap;
 use crate::types::transform::{OdinTransform, TransformMetadata, SourceConfig, SourceDiscriminator, TargetConfig, AccumulatorDef, LookupTable, ImportRef, ConfidentialMode, TransformSegment, SegmentDirective, Discriminator, FieldMapping, FieldExpression, VerbCall, VerbArg};
 use crate::types::transform::DynValue;
 use crate::types::values::{OdinArrayItem, OdinModifiers, OdinValue, OdinValues};
@@ -17,17 +20,19 @@ use crate::types::values::{OdinArrayItem, OdinModifiers, OdinValue, OdinValues};
 /// The document is expected to follow the ODIN transform specification:
 /// - `{$}` metadata keys define version, direction, source/target config, etc.
 /// - Non-`$` sections define transform segments with field mappings.
-pub fn parse_transform_doc(doc: &OdinDocument) -> OdinTransform {
-    let metadata = parse_metadata(doc);
-    let source = parse_source_config(doc);
-    let target = parse_target_config(doc);
-    let constants = parse_constants(doc);
-    let accumulators = parse_accumulators(doc);
-    let tables = parse_lookup_tables(doc);
-    let imports = parse_imports(doc);
-    let enforce_confidential = parse_enforce_confidential(doc);
-    let strict_types = parse_strict_types(doc);
-    let segments = parse_segments(doc);
+pub fn parse_transform_doc(doc: OdinDocument) -> OdinTransform {
+    let metadata = parse_metadata(&doc);
+    let source = parse_source_config(&doc);
+    let target = parse_target_config(&doc);
+    let constants = parse_constants(&doc);
+    let accumulators = parse_accumulators(&doc);
+    let tables = parse_lookup_tables(&doc);
+    let imports = parse_imports(&doc);
+    let enforce_confidential = parse_enforce_confidential(&doc);
+    let strict_types = parse_strict_types(&doc);
+
+    let OdinDocument { assignments, modifiers, .. } = doc;
+    let segments = parse_segments(assignments, modifiers);
     let passes = collect_passes(&segments);
 
     OdinTransform {
@@ -420,44 +425,45 @@ fn merge_directive_modifiers(
 /// first `.` in the key). Each group becomes a `TransformSegment`. Fields that
 /// start with `_` are treated as directives (e.g., `_pass`, `_loop`, `_from`,
 /// `_if`). All other fields become `FieldMapping` entries.
-fn parse_segments(doc: &OdinDocument) -> Vec<TransformSegment> {
-    // Group assignments by their top-level section name.
-    // Keys are stored as "SectionName.field" by the parser when under a `{SectionName}` header.
-    // If there is no section prefix, the assignment is at the root level.
-    let mut section_order: Vec<String> = Vec::new();
-    let mut section_fields: HashMap<String, Vec<(String, OdinValue, Option<OdinModifiers>)>> =
-        HashMap::new();
+fn parse_segments(
+    assignments: OrderedMap<String, OdinValue>,
+    mut modifiers: OrderedMap<String, OdinModifiers>,
+) -> Vec<TransformSegment> {
+    // Group assignments by top-level section, preserving insertion order.
+    // Section count is typically small (<20), so a Vec with linear scan
+    // beats hashing.
+    let mut sections: Vec<(String, Vec<(String, OdinValue, Option<OdinModifiers>)>)> = Vec::new();
+    let has_modifiers = !modifiers.is_empty();
 
-    for (key, value) in &doc.assignments {
-        // Skip metadata entries (prefixed with $.)
+    for (mut key, value) in assignments.into_iter() {
         if key.starts_with("$.") {
             continue;
         }
+        let mods = if has_modifiers { modifiers.remove(&key) } else { None };
 
-        let (section, field) = split_section_key(key);
+        // Reuse the key allocation: truncate for section, slice for field.
+        let (section, field) = if let Some(dot) = key.find('.') {
+            let field = key[dot + 1..].to_string();
+            key.truncate(dot);
+            (key, field)
+        } else {
+            (String::new(), key)
+        };
 
-        // Skip sections that are metadata ($, $const, $accumulator, $table, $source, $target, etc.)
         if section.starts_with('$') {
             continue;
         }
 
-        if !section_fields.contains_key(section) {
-            section_order.push(section.to_string());
+        if let Some(slot) = sections.iter_mut().find(|(s, _)| s == &section) {
+            slot.1.push((field, value, mods));
+        } else {
+            sections.push((section, vec![(field, value, mods)]));
         }
-        let modifiers = doc.modifiers.get(key).cloned();
-        section_fields
-            .entry(section.to_string())
-            .or_default()
-            .push((field.to_string(), value.clone(), modifiers));
     }
 
-    // Build segments in order.
-    section_order
+    sections
         .into_iter()
-        .map(|section_name| {
-            let fields = section_fields.remove(&section_name).unwrap_or_default();
-            build_segment(section_name, fields)
-        })
+        .map(|(section_name, fields)| build_segment(section_name, fields))
         .collect()
 }
 
@@ -501,12 +507,10 @@ fn build_segment(
     let mut discriminator: Option<Discriminator> = None;
     let mut pass: Option<usize> = None;
     let mut condition: Option<String> = None;
-    let mut mappings: Vec<FieldMapping> = Vec::new();
     let mut children: Vec<TransformSegment> = Vec::new();
 
-    // Collect child fields and track original item order.
-    let mut child_fields: HashMap<String, Vec<(String, OdinValue, Option<OdinModifiers>)>> =
-        HashMap::new();
+    let mut child_fields: FxHashMap<String, Vec<(String, OdinValue, Option<OdinModifiers>)>> =
+        FxHashMap::default();
 
     // Track interleaved order: either a direct mapping or a child section reference
     enum ItemRef {
@@ -514,7 +518,7 @@ fn build_segment(
         ChildRef(String),
     }
     let mut item_order: Vec<ItemRef> = Vec::new();
-    let mut seen_children: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_children: FxHashSet<String> = FxHashSet::default();
 
     for (field, value, modifiers) in fields {
         // Check for nested sub-section (e.g., "Items.Name" under "Customer").
@@ -573,65 +577,24 @@ fn build_segment(
                     }
                 }
                 _ => {
-                    let mut dirs = value.directives().to_vec();
-                    let (expr, trailing_dirs) = value_to_field_expression_with_directives(&value);
-                    // Merge trailing directives from expression parsing
-                    for td in trailing_dirs {
-                        if !dirs.iter().any(|d| d.name == td.name) {
-                            dirs.push(td);
-                        }
-                    }
-                    // Promote formatting directives from verb args to FieldMapping
-                    let fmt_dirs = collect_formatting_directives(&expr);
-                    for fd in fmt_dirs {
-                        if !dirs.iter().any(|d| d.name == fd.name) {
-                            dirs.push(fd);
-                        }
-                    }
-                    let merged_mods = merge_directive_modifiers(modifiers, &dirs);
-                    let m = FieldMapping {
-                        target: field,
-                        expression: expr,
-                        directives: dirs,
-                        modifiers: merged_mods,
-                    };
-                    item_order.push(ItemRef::Mapping(m.clone()));
-                    mappings.push(m);
+                    let m = build_field_mapping(field, value, modifiers);
+                    item_order.push(ItemRef::Mapping(m));
                 }
             }
         } else {
-            let mut dirs = value.directives().to_vec();
-            let (expr, trailing_dirs) = value_to_field_expression_with_directives(&value);
-            // Merge trailing directives from expression parsing
-            for td in trailing_dirs {
-                if !dirs.iter().any(|d| d.name == td.name) {
-                    dirs.push(td);
-                }
-            }
-            // Promote formatting directives from verb args to FieldMapping
-            let fmt_dirs = collect_formatting_directives(&expr);
-            for fd in fmt_dirs {
-                if !dirs.iter().any(|d| d.name == fd.name) {
-                    dirs.push(fd);
-                }
-            }
-            let merged_mods = merge_directive_modifiers(modifiers, &dirs);
-            let m = FieldMapping {
-                target: field,
-                expression: expr,
-                directives: dirs,
-                modifiers: merged_mods,
-            };
-            item_order.push(ItemRef::Mapping(m.clone()));
-            mappings.push(m);
+            let m = build_field_mapping(field, value, modifiers);
+            item_order.push(ItemRef::Mapping(m));
         }
     }
 
-    // Build the interleaved `items` list from item_order.
-    let mut items: Vec<SegmentItem> = Vec::new();
+    // Build interleaved `items` and the flat `mappings` list together so
+    // each FieldMapping is cloned exactly once per output side.
+    let mut items: Vec<SegmentItem> = Vec::with_capacity(item_order.len());
+    let mut mappings: Vec<FieldMapping> = Vec::with_capacity(item_order.len());
     for item_ref in item_order {
         match item_ref {
             ItemRef::Mapping(m) => {
+                mappings.push(m.clone());
                 items.push(SegmentItem::Mapping(m));
             }
             ItemRef::ChildRef(child_name) => {
@@ -644,26 +607,7 @@ fn build_segment(
                         // Flatten: emit as dotted-path mappings in order
                         for (child_field, value, mods) in cf {
                             let full_target = format!("{child_name}.{child_field}");
-                            let mut dirs = value.directives().to_vec();
-                            let (expr, trailing_dirs) = value_to_field_expression_with_directives(&value);
-                            for td in trailing_dirs {
-                                if !dirs.iter().any(|d| d.name == td.name) {
-                                    dirs.push(td);
-                                }
-                            }
-                            let fmt_dirs = collect_formatting_directives(&expr);
-                            for fd in fmt_dirs {
-                                if !dirs.iter().any(|d| d.name == fd.name) {
-                                    dirs.push(fd);
-                                }
-                            }
-                            let merged_mods = merge_directive_modifiers(mods, &dirs);
-                            let m = FieldMapping {
-                                target: full_target,
-                                expression: expr,
-                                directives: dirs,
-                                modifiers: merged_mods,
-                            };
+                            let m = build_field_mapping(full_target, value, mods);
                             mappings.push(m.clone());
                             items.push(SegmentItem::Mapping(m));
                         }
@@ -672,14 +616,6 @@ fn build_segment(
             }
         }
     }
-
-    // Rebuild mappings from items to preserve correct interleaved order.
-    // Direct mappings were added during field iteration, but flattened child
-    // mappings are added during item_order processing. Using items order ensures
-    // that e.g. `name.first` appears before `dob` when defined that way.
-    let mappings: Vec<FieldMapping> = items.iter().filter_map(|item| {
-        if let SegmentItem::Mapping(m) = item { Some(m.clone()) } else { None }
-    }).collect();
 
     // Determine if segment is an array (name ends with [])
     let is_array = name.ends_with("[]");
@@ -724,6 +660,48 @@ fn build_segment(
         items,
         pass,
         condition,
+    }
+}
+
+/// Build a `FieldMapping` from a target name, a source value, and optional
+/// modifiers. Merges trailing directives from the expression and any
+/// formatting directives promoted from verb args.
+fn build_field_mapping(
+    target: String,
+    value: OdinValue,
+    modifiers: Option<OdinModifiers>,
+) -> FieldMapping {
+    // Fast path: bare reference like `@.path :type X` — the dominant shape in
+    // transform docs. Moves `path` and `directives` out instead of cloning.
+    if let OdinValue::Reference { path, directives, .. } = value {
+        let merged_mods = merge_directive_modifiers(modifiers, &directives);
+        return FieldMapping {
+            target,
+            expression: FieldExpression::Copy(path),
+            directives,
+            modifiers: merged_mods,
+        };
+    }
+
+    let mut dirs = value.directives().to_vec();
+    let (expr, trailing_dirs) = value_to_field_expression_with_directives(&value);
+    for td in trailing_dirs {
+        if !dirs.iter().any(|d| d.name == td.name) {
+            dirs.push(td);
+        }
+    }
+    let fmt_dirs = collect_formatting_directives(&expr);
+    for fd in fmt_dirs {
+        if !dirs.iter().any(|d| d.name == fd.name) {
+            dirs.push(fd);
+        }
+    }
+    let merged_mods = merge_directive_modifiers(modifiers, &dirs);
+    FieldMapping {
+        target,
+        expression: expr,
+        directives: dirs,
+        modifiers: merged_mods,
     }
 }
 
@@ -1366,7 +1344,7 @@ fn collect_passes_recursive(segments: &[TransformSegment], passes: &mut Vec<usiz
 /// Get a metadata value as a `String`, handling both `OdinValue::String` and
 /// other types by converting through `Display`.
 fn get_meta_string(doc: &OdinDocument, key: &str) -> Option<String> {
-    let value = doc.metadata.get(&key.to_string())?;
+    let value = doc.metadata.get(key)?;
     Some(odin_value_to_string(value))
 }
 
@@ -1416,7 +1394,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.metadata.odin_version.as_deref(), Some("1.0.0"));
         assert_eq!(transform.metadata.transform_version.as_deref(), Some("1.0.0"));
         assert_eq!(transform.metadata.direction.as_deref(), Some("json->odin"));
@@ -1432,7 +1410,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
 
         let source = transform.source.as_ref().unwrap();
         assert_eq!(source.format, "json");
@@ -1449,7 +1427,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.constants.len(), 2);
         assert_eq!(
             transform.constants.get("version").unwrap().as_str(),
@@ -1469,7 +1447,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.accumulators.len(), 2);
         assert_eq!(
             transform.accumulators.get("total").unwrap().initial.as_i64(),
@@ -1485,7 +1463,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.accumulators.len(), 1);
         assert!(transform.accumulators.contains_key("total"));
     }
@@ -1497,7 +1475,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.enforce_confidential, Some(ConfidentialMode::Redact));
     }
 
@@ -1508,7 +1486,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.enforce_confidential, Some(ConfidentialMode::Mask));
     }
 
@@ -1519,7 +1497,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert!(transform.strict_types);
     }
 
@@ -1530,7 +1508,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert!(transform.strict_types);
     }
 
@@ -1543,7 +1521,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.segments.len(), 1);
         assert_eq!(transform.segments[0].name, "Customer");
         assert_eq!(transform.segments[0].mappings.len(), 2);
@@ -1564,7 +1542,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.segments.len(), 1);
 
         let status_mapping = &transform.segments[0].mappings[0];
@@ -1594,7 +1572,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.segments.len(), 1);
 
         let mapping = &transform.segments[0].mappings[0];
@@ -1628,7 +1606,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.segments.len(), 1);
 
         let seg = &transform.segments[0];
@@ -1650,7 +1628,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.passes, vec![1, 2]);
     }
 
@@ -1661,7 +1639,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert!(transform.source.is_none());
     }
 
@@ -1669,7 +1647,7 @@ mod tests {
     fn test_empty_document_produces_empty_transform() {
         let doc = OdinDocumentBuilder::new().build().unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert!(transform.metadata.odin_version.is_none());
         assert!(transform.source.is_none());
         assert_eq!(transform.target.format, "");
@@ -1692,7 +1670,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         assert_eq!(transform.segments.len(), 3);
         assert_eq!(transform.segments[0].name, "Alpha");
         assert_eq!(transform.segments[1].name, "Beta");
@@ -1709,7 +1687,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         let mapping = &transform.segments[0].mappings[0];
 
         match &mapping.expression {
@@ -1745,7 +1723,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         let mapping = &transform.segments[0].mappings[0];
         assert_eq!(mapping.target, "SSN");
         let m = mapping.modifiers.as_ref().unwrap();
@@ -1764,7 +1742,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transform = parse_transform_doc(&doc);
+        let transform = parse_transform_doc(doc);
         let mapping = &transform.segments[0].mappings[0];
         match &mapping.expression {
             FieldExpression::Transform(vc) => {
