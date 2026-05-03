@@ -1,24 +1,18 @@
-//! Streaming fast-path parser for the common ODIN shape.
+//! ODIN parser — single-pass byte walker producing an `OdinDocument`.
 //!
-//! Walks the source bytes once, building the `OdinDocument` directly without
-//! materializing a `Vec<Token>`. Bails (returns `None`) the moment it sees
-//! any feature outside its supported subset — the caller then falls back to
-//! the regular tokenize-then-parse pipeline.
+//! Walks the source bytes once and writes assignments directly into the
+//! document. No token vector is materialized.
 //!
-//! Supported subset (what large.odin and similar scalar-heavy docs use):
-//! - `{$}` metadata header
-//! - `{section}`, `{section.sub}`, `{.relative}` headers (no brackets, no `:`)
-//! - `; line comments` and blank lines
-//! - `path = value` assignments where `path` is dotted identifiers with
-//!   optional `[N]` indices, and `value` is one of:
-//!   string (no escapes), `##integer`, `#number`, `#$currency[:CODE]`,
-//!   `#%percent`, `?true`/`?false`, `true`/`false`, `~`, `@reference`,
-//!   `YYYY-MM-DD`, `YYYY-MM-DDT…` timestamps, `T…` times, `P…` durations.
-//!
-//! Bails on: modifiers (`!`/`*`/`-`), directives (`:foo`), escape sequences,
-//! multi-line strings, verbs (`%`), binary (`^`), `@import`/`@schema`/`@if`,
-//! tabular (`[] :`), `$table.` headers, document separators (`---`),
-//! conditionals.
+//! Covers every ODIN shape: scalars, all value types (string/number/integer/
+//! currency/percent/boolean/null/reference/binary/date/timestamp/time/
+//! duration), `{section}` / `{section.sub}` / `{.relative}` /
+//! `{records[N]}` / `{@TypeRef}` headers, tabular records, primitive arrays
+//! (`{name[] : ~}`), relative dotted sub-blocks (`{.tags[] : ~}`), lookup
+//! tables (`{$table.NAME[col1, col2]}`), modifiers (`!` / `*` / `-`),
+//! trailing directives (`:type`, `:default`, …), verbs (`%verb …`), binary
+//! (`^base64`), document separators (`---`), `@import` / `@schema` / `@if`
+//! directives, escape sequences in strings, comment preservation, and
+//! extension paths (`&com.acme.field = …`).
 
 use rustc_hash::FxHashMap;
 
@@ -30,15 +24,14 @@ use crate::types::values::{DirectiveValue, OdinDirective, OdinModifiers, OdinVal
 
 const MAX_ARRAY_INDEX: i64 = 1_000_000;
 
-pub(super) fn try_parse_fast(source: &str, options: &ParseOptions) -> Option<Result<OdinDocument, ParseError>> {
+pub(super) fn parse(source: &str, options: &ParseOptions) -> Result<OdinDocument, ParseError> {
     if source.len() > options.max_size {
-        return Some(Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1)));
+        return Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1));
     }
     if source.len() > u32::MAX as usize {
-        return Some(Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1)));
+        return Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1));
     }
-    let p = FastParser::new(source, options);
-    p.run()
+    Parser::new(source, options).run()
 }
 
 pub(super) fn parse_documents(source: &str, options: &ParseOptions) -> Result<Vec<OdinDocument>, ParseError> {
@@ -48,7 +41,7 @@ pub(super) fn parse_documents(source: &str, options: &ParseOptions) -> Result<Ve
     if source.len() > u32::MAX as usize {
         return Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1));
     }
-    let p = FastParser::new(source, options);
+    let p = Parser::new(source, options);
     p.run_documents()
 }
 
@@ -64,10 +57,7 @@ fn empty_doc() -> OdinDocument {
     }
 }
 
-/// Generic fallback when an internal Bail reaches the top-level run loop.
-/// Most bail conditions should produce a more specific error closer to the
-/// failure point — this is the catch-all for anything that hasn't been
-/// converted yet.
+/// Catch-all when an internal `Bail` reaches the top-level run loop.
 fn bail_to_err(line: usize, col: usize) -> ParseError {
     ParseError::with_message(
         ParseErrorCode::UnexpectedCharacter,
@@ -88,7 +78,7 @@ fn find_comment_start_quote_aware(s: &str) -> Option<usize> {
     None
 }
 
-struct FastParser<'a> {
+struct Parser<'a> {
     source: &'a str,
     bytes: &'a [u8],
     pos: usize,
@@ -110,22 +100,18 @@ struct FastParser<'a> {
     tabular: Option<TabularContext>,
 }
 
-/// Active tabular section state. Set by `parse_header` when it encounters
-/// `{name[] : col1, col2, ...}`; cleared when the next `{header}` or EOF
-/// is reached.
+/// Active tabular section state — set on `{name[] : ...}` headers.
 struct TabularContext {
     base_name: String,
     columns: Vec<String>,
     row_index: usize,
     key_buf: String,
     is_primitive: bool,
-    /// When true, rows are written to `metadata` with key `table.NAME[i].col`
-    /// (lookup-table form `{$table.NAME[col1, col2]}`). When false, rows are
-    /// written to `assignments` with key `name[i].col` (record-shaped tabular).
+    /// True for `{$table.NAME[...]}` lookup tables — rows go to metadata.
     is_metadata_table: bool,
 }
 
-impl<'a> FastParser<'a> {
+impl<'a> Parser<'a> {
     fn new(source: &'a str, options: &'a ParseOptions) -> Self {
         let est_paths = source.len() / 28 + 16;
         Self {
@@ -156,11 +142,9 @@ impl<'a> FastParser<'a> {
         (self.pos - self.line_start) as u32 + 1
     }
 
-    fn run(self) -> Option<Result<OdinDocument, ParseError>> {
-        match self.run_loop(false) {
-            Ok(mut docs) => Some(Ok(docs.pop().unwrap_or_else(empty_doc))),
-            Err(e) => Some(Err(e)),
-        }
+    fn run(self) -> Result<OdinDocument, ParseError> {
+        let mut docs = self.run_loop(false)?;
+        Ok(docs.pop().unwrap_or_else(empty_doc))
     }
 
     fn run_documents(self) -> Result<Vec<OdinDocument>, ParseError> {
@@ -181,16 +165,16 @@ impl<'a> FastParser<'a> {
             }
             if self.tabular.is_some() {
                 match self.parse_tabular_row() {
-                    FastResult::Ok => continue,
-                    FastResult::Bail => return Err(bail_to_err(line, col)),
-                    FastResult::Err(e) => return Err(e),
+                    StepResult::Ok => continue,
+                    StepResult::Bail => return Err(bail_to_err(line, col)),
+                    StepResult::Err(e) => return Err(e),
                 }
             }
             match b {
                 b'{' => match self.parse_header() {
-                    FastResult::Ok => {}
-                    FastResult::Bail => return Err(bail_to_err(line, col)),
-                    FastResult::Err(e) => return Err(e),
+                    StepResult::Ok => {}
+                    StepResult::Bail => return Err(bail_to_err(line, col)),
+                    StepResult::Err(e) => return Err(e),
                 },
                 b'-' if self.peek_eq(b"---") => {
                     self.pos += 3;
@@ -204,14 +188,14 @@ impl<'a> FastParser<'a> {
                     continue;
                 }
                 b'@' => match self.parse_top_directive() {
-                    FastResult::Ok => {}
-                    FastResult::Bail => return Err(bail_to_err(line, col)),
-                    FastResult::Err(e) => return Err(e),
+                    StepResult::Ok => {}
+                    StepResult::Bail => return Err(bail_to_err(line, col)),
+                    StepResult::Err(e) => return Err(e),
                 },
                 _ => match self.parse_assignment() {
-                    FastResult::Ok => {}
-                    FastResult::Bail => return Err(bail_to_err(line, col)),
-                    FastResult::Err(e) => return Err(e),
+                    StepResult::Ok => {}
+                    StepResult::Bail => return Err(bail_to_err(line, col)),
+                    StepResult::Err(e) => return Err(e),
                 },
             }
         }
@@ -257,9 +241,8 @@ impl<'a> FastParser<'a> {
         self.tabular = None;
     }
 
-    /// Advance through whitespace, blank lines, and `;` line comments.
-    /// Two consecutive newlines inside the root `{$}` metadata section exit
-    /// metadata mode (matches parser_impl semantics). Returns `false` on EOF.
+    /// Skip whitespace, blank lines, and `;` comments. Two newlines inside
+    /// the root `{$}` section exit metadata mode. Returns `false` on EOF.
     fn skip_blanks_and_comments(&mut self) -> bool {
         let mut newlines_in_a_row: u32 = 0;
         while self.pos < self.bytes.len() {
@@ -286,8 +269,7 @@ impl<'a> FastParser<'a> {
         self.bytes[self.pos..].starts_with(needle)
     }
 
-    /// Skip past a `;` line comment. When `preserve_comments` is enabled,
-    /// capture it. Position must be on `;`; advances to (but not past) `\n`.
+    /// Skip past a `;` comment, capturing it when `preserve_comments` is on.
     fn skip_comment(&mut self) {
         debug_assert_eq!(self.bytes[self.pos], b';');
         let end = match memchr::memchr(b'\n', &self.bytes[self.pos..]) {
@@ -307,7 +289,7 @@ impl<'a> FastParser<'a> {
         self.pos = end;
     }
 
-    fn parse_header(&mut self) -> FastResult {
+    fn parse_header(&mut self) -> StepResult {
         let start_line = self.line;
         let start_col = self.col();
         debug_assert_eq!(self.bytes[self.pos], b'{');
@@ -318,7 +300,7 @@ impl<'a> FastParser<'a> {
         let close = match memchr::memchr2(b'}', b'\n', &self.bytes[self.pos..]) {
             Some(off) => off,
             None => {
-                return FastResult::Err(ParseError::with_message(
+                return StepResult::Err(ParseError::with_message(
                     ParseErrorCode::InvalidHeaderSyntax,
                     start_line as usize, start_col as usize,
                     "Unclosed section header",
@@ -327,7 +309,7 @@ impl<'a> FastParser<'a> {
         };
         let close_pos = self.pos + close;
         if self.bytes[close_pos] != b'}' {
-            return FastResult::Err(ParseError::with_message(
+            return StepResult::Err(ParseError::with_message(
                 ParseErrorCode::InvalidHeaderSyntax,
                 start_line as usize, start_col as usize,
                 "Unclosed section header",
@@ -340,12 +322,12 @@ impl<'a> FastParser<'a> {
             let name_part = &header[..colon_pos];
             let cols_str = &header[colon_pos + 3..];
             // Must end with `[]` after the name.
-            let Some(name) = name_part.strip_suffix("[]") else { return FastResult::Bail; };
-            if name.is_empty() { return FastResult::Bail; }
+            let Some(name) = name_part.strip_suffix("[]") else { return StepResult::Bail; };
+            if name.is_empty() { return StepResult::Bail; }
 
             // Resolve relative base `.name` against previous absolute header.
             let resolved_base = if let Some(rest) = name.strip_prefix('.') {
-                if rest.is_empty() { return FastResult::Bail; }
+                if rest.is_empty() { return StepResult::Bail; }
                 match &self.previous_header {
                     Some(base) => format!("{base}.{rest}"),
                     None => rest.to_string(),
@@ -366,7 +348,7 @@ impl<'a> FastParser<'a> {
                 for raw in cols_str.split(',') {
                     let trimmed = raw.trim();
                     if trimmed.is_empty() {
-                        return FastResult::Err(ParseError::with_message(
+                        return StepResult::Err(ParseError::with_message(
                             ParseErrorCode::InvalidHeaderSyntax,
                             start_line as usize, start_col as usize,
                             "Empty column name in tabular header",
@@ -388,7 +370,7 @@ impl<'a> FastParser<'a> {
                     }
                 }
                 if cols.is_empty() {
-                    return FastResult::Err(ParseError::with_message(
+                    return StepResult::Err(ParseError::with_message(
                         ParseErrorCode::InvalidHeaderSyntax,
                         start_line as usize, start_col as usize,
                         "Tabular header must have at least one column",
@@ -416,28 +398,27 @@ impl<'a> FastParser<'a> {
             return self.skip_to_line_end(start_line, start_col);
         }
 
-        // Lookup-table header `{$table.NAME[col1, col2, ...]}` (also `$.table.NAME`).
-        // Body is CSV-shaped; each cell is a fully typed ODIN value (Number,
-        // Integer, etc.) — required for %lookup to match typed result columns.
+        // Lookup-table header `{$table.NAME[col1, col2, ...]}` — cells are
+        // fully typed ODIN values, written to metadata.
         if header.starts_with("$table.") || header.starts_with("$.table.") {
             let table_part = header
                 .strip_prefix("$.")
                 .or_else(|| header.strip_prefix('$'))
                 .unwrap_or(header);
-            let Some(rest) = table_part.strip_prefix("table.") else { return FastResult::Bail; };
-            let Some(bracket_pos) = rest.find('[') else { return FastResult::Bail; };
-            let Some(close_idx) = rest.find(']') else { return FastResult::Bail; };
-            if close_idx <= bracket_pos { return FastResult::Bail; }
+            let Some(rest) = table_part.strip_prefix("table.") else { return StepResult::Bail; };
+            let Some(bracket_pos) = rest.find('[') else { return StepResult::Bail; };
+            let Some(close_idx) = rest.find(']') else { return StepResult::Bail; };
+            if close_idx <= bracket_pos { return StepResult::Bail; }
             let table_name = &rest[..bracket_pos];
-            if table_name.is_empty() { return FastResult::Bail; }
+            if table_name.is_empty() { return StepResult::Bail; }
             let cols_str = &rest[bracket_pos + 1..close_idx];
             let mut columns = Vec::with_capacity(8);
             for raw in cols_str.split(',') {
                 let trimmed = raw.trim();
-                if trimmed.is_empty() { return FastResult::Bail; }
+                if trimmed.is_empty() { return StepResult::Bail; }
                 columns.push(trimmed.to_string());
             }
-            if columns.is_empty() { return FastResult::Bail; }
+            if columns.is_empty() { return StepResult::Bail; }
 
             self.pos = close_pos + 1;
             self.in_metadata = true;
@@ -460,18 +441,18 @@ impl<'a> FastParser<'a> {
         for (i, b) in header.as_bytes().iter().enumerate() {
             match b {
                 b'[' => {
-                    if in_index { return FastResult::Bail; }
+                    if in_index { return StepResult::Bail; }
                     bracket_depth += 1;
                     in_index = true;
                     idx_start = i + 1;
                 }
                 b']' => {
-                    if !in_index { return FastResult::Bail; }
+                    if !in_index { return StepResult::Bail; }
                     bracket_depth -= 1;
-                    if bracket_depth < 0 { return FastResult::Bail; }
+                    if bracket_depth < 0 { return StepResult::Bail; }
                     let idx = &header[idx_start..i];
                     if !idx.is_empty() && idx.parse::<i64>().is_err() {
-                        return FastResult::Err(ParseError::with_message(
+                        return StepResult::Err(ParseError::with_message(
                             ParseErrorCode::InvalidArrayIndex,
                             start_line as usize, start_col as usize,
                             &format!("Invalid array index: {idx}"),
@@ -483,7 +464,7 @@ impl<'a> FastParser<'a> {
             }
         }
         if bracket_depth != 0 {
-            return FastResult::Err(ParseError::with_message(
+            return StepResult::Err(ParseError::with_message(
                 ParseErrorCode::InvalidArrayIndex,
                 start_line as usize, start_col as usize,
                 "Invalid array index",
@@ -500,8 +481,7 @@ impl<'a> FastParser<'a> {
             self.in_metadata = true;
             self.current_header = Some(rest.to_string());
         } else if let Some(rest) = header.strip_prefix('@') {
-            // `{@TypeRef}` — type-reference section. Body fields land at
-            // `TypeRef.field`, matching parser_impl semantics.
+            // `{@TypeRef}` — body fields land at `TypeRef.field`.
             self.in_metadata = false;
             self.current_header = Some(rest.to_string());
         } else if let Some(rel) = header.strip_prefix('.') {
@@ -529,29 +509,28 @@ impl<'a> FastParser<'a> {
         self.skip_to_line_end(start_line, start_col)
     }
 
-    fn skip_to_line_end(&mut self, _line: u32, _col: u32) -> FastResult {
+    fn skip_to_line_end(&mut self, _line: u32, _col: u32) -> StepResult {
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
                 b';' => self.skip_comment(),
-                b'\n' => return FastResult::Ok,
-                _ => return FastResult::Bail,
+                b'\n' => return StepResult::Ok,
+                _ => return StepResult::Bail,
             }
         }
-        FastResult::Ok
+        StepResult::Ok
     }
 
-    fn parse_assignment(&mut self) -> FastResult {
+    fn parse_assignment(&mut self) -> StepResult {
         let path_line = self.line as usize;
         let path_col = self.col() as usize;
 
-        // Read the path identifier. Allowed bytes mirror the tokenizer's
-        // identifier scan — alphanumeric, `_`, `.`, `[`, `]`, leading `$`.
+        // Read the path: alphanumeric, `_`, `.`, `[`, `]`, leading `$` or `&`.
         let path_start = self.pos;
         let mut saw_bracket = false;
         let first = self.bytes[self.pos];
         if !is_path_start(first) {
-            return FastResult::Bail;
+            return StepResult::Bail;
         }
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
@@ -585,7 +564,7 @@ impl<'a> FastParser<'a> {
             self.pos += 1;
         }
         if self.pos >= self.bytes.len() || self.bytes[self.pos] != b'=' {
-            return FastResult::Err(ParseError::with_message(
+            return StepResult::Err(ParseError::with_message(
                 ParseErrorCode::UnexpectedCharacter,
                 path_line, path_col,
                 &format!("Expected '=' after '{}'", self.path_buf),
@@ -598,7 +577,7 @@ impl<'a> FastParser<'a> {
 
         // Validate path (depth + bracket ranges + first-bracket capture).
         match self.validate_path(path_line, path_col) {
-            FastResult::Ok => {}
+            StepResult::Ok => {}
             other => return other,
         }
 
@@ -612,7 +591,7 @@ impl<'a> FastParser<'a> {
                     if self.bytes.get(self.pos + 1).copied() == Some(b'-')
                         && self.bytes.get(self.pos + 2).copied() == Some(b'-')
                     {
-                        return FastResult::Bail;
+                        return StepResult::Bail;
                     }
                     mods.deprecated = true;
                     self.pos += 1;
@@ -621,7 +600,7 @@ impl<'a> FastParser<'a> {
             }
         }
 
-        // Parse value. Empty value = empty string (modifiers/directives dropped, matches parser_impl).
+        // Empty value = empty string; modifiers/directives are dropped.
         let value = if self.pos >= self.bytes.len()
             || self.bytes[self.pos] == b'\n'
             || self.bytes[self.pos] == b'\r'
@@ -630,9 +609,9 @@ impl<'a> FastParser<'a> {
             OdinValues::string("")
         } else {
             let mut v = match self.parse_value(path_line, path_col) {
-                FastValue::Ok(v) => v,
-                FastValue::Bail => return FastResult::Bail,
-                FastValue::Err(e) => return FastResult::Err(e),
+                ValueStep::Ok(v) => v,
+                ValueStep::Bail => return StepResult::Bail,
+                ValueStep::Err(e) => return StepResult::Err(e),
             };
             if mods.has_any() {
                 v = v.with_modifiers(mods.clone());
@@ -641,7 +620,7 @@ impl<'a> FastParser<'a> {
             // Trailing directives: `:type integer`, `:format ssn`, ...
             let directives = match self.parse_trailing_directives() {
                 Ok(d) => d,
-                Err(e) => return FastResult::Err(e),
+                Err(e) => return StepResult::Err(e),
             };
             if !directives.is_empty() {
                 v = v.with_directives(directives);
@@ -655,17 +634,13 @@ impl<'a> FastParser<'a> {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
                 b';' => self.skip_comment(),
                 b'\n' => break,
-                _ => return FastResult::Bail,
+                _ => return StepResult::Bail,
             }
         }
-        // Leave any trailing `\n` for `skip_blanks_and_comments` to count —
-        // that's where the blank-line-exits-metadata logic lives.
+        // Trailing `\n` is left for skip_blanks_and_comments to count.
 
-        // Insert with entry-API dup detection. Replicates parser_impl semantics
-        // (bare-key when path starts with `$.` outside metadata mode). Use
-        // clone() rather than mem::take so path_buf retains its capacity
-        // across assignments — taking the String would force reallocation
-        // on the next push_str.
+        // Bare-key when path starts with `$.` outside metadata mode.
+        // Clone instead of mem::take to preserve path_buf capacity.
         let (key, target_is_metadata) = if self.in_metadata {
             (self.path_buf.clone(), true)
         } else if self.path_buf.starts_with("$.") {
@@ -679,7 +654,7 @@ impl<'a> FastParser<'a> {
         } else {
             match target.entry(key) {
                 indexmap::map::Entry::Occupied(o) => {
-                    return FastResult::Err(ParseError::with_message(
+                    return StepResult::Err(ParseError::with_message(
                         ParseErrorCode::DuplicatePathAssignment,
                         path_line, path_col,
                         o.key(),
@@ -688,12 +663,11 @@ impl<'a> FastParser<'a> {
                 indexmap::map::Entry::Vacant(e) => { e.insert(value); }
             }
         }
-        FastResult::Ok
+        StepResult::Ok
     }
 
-    /// Parse a top-level `@import` / `@schema` / `@if` directive. Anything
-    /// else after `@` (e.g. `@TypeRef` in unexpected position) bails.
-    fn parse_top_directive(&mut self) -> FastResult {
+    /// Parse a top-level `@import` / `@schema` / `@if` directive.
+    fn parse_top_directive(&mut self) -> StepResult {
         let line = self.line as usize;
         let col = self.col() as usize;
         debug_assert_eq!(self.bytes[self.pos], b'@');
@@ -706,7 +680,7 @@ impl<'a> FastParser<'a> {
             } else { break; }
         }
         let kw_len = self.pos - kw_start;
-        if kw_len == 0 { return FastResult::Bail; }
+        if kw_len == 0 { return StepResult::Bail; }
         let kw = &self.source[kw_start..self.pos];
         let kw_owned = kw.to_string();
 
@@ -727,13 +701,13 @@ impl<'a> FastParser<'a> {
         match kw_owned.as_str() {
             "import" => {
                 if rest.is_empty() {
-                    return FastResult::Err(ParseError::with_message(
+                    return StepResult::Err(ParseError::with_message(
                         ParseErrorCode::InvalidDirective, line, col,
                         "Invalid import directive syntax",
                     ));
                 }
                 if rest.ends_with(" as") {
-                    return FastResult::Err(ParseError::with_message(
+                    return StepResult::Err(ParseError::with_message(
                         ParseErrorCode::InvalidDirective, line, col,
                         "Import alias requires identifier",
                     ));
@@ -742,7 +716,7 @@ impl<'a> FastParser<'a> {
                     let path = rest[..as_pos].trim().to_string();
                     let alias = rest[as_pos + 4..].trim();
                     if alias.is_empty() {
-                        return FastResult::Err(ParseError::with_message(
+                        return StepResult::Err(ParseError::with_message(
                             ParseErrorCode::InvalidDirective, line, col,
                             "Import alias requires identifier",
                         ));
@@ -754,7 +728,7 @@ impl<'a> FastParser<'a> {
             }
             "schema" => {
                 if rest.is_empty() {
-                    return FastResult::Err(ParseError::with_message(
+                    return StepResult::Err(ParseError::with_message(
                         ParseErrorCode::InvalidDirective, line, col,
                         "Schema directive requires URL",
                     ));
@@ -763,20 +737,19 @@ impl<'a> FastParser<'a> {
             }
             "if" => {
                 if rest.is_empty() {
-                    return FastResult::Err(ParseError::with_message(
+                    return StepResult::Err(ParseError::with_message(
                         ParseErrorCode::InvalidDirective, line, col,
                         "Conditional directive requires expression",
                     ));
                 }
-                // Validate-only: parser_impl also drops the parsed expression.
+                // Validate-only: the parsed expression is dropped.
             }
-            _ => return FastResult::Bail,
+            _ => return StepResult::Bail,
         }
-        FastResult::Ok
+        StepResult::Ok
     }
 
-    /// Parse a sequence of `:name [value]` trailing directives. Stops at
-    /// newline / `;` comment / non-`:` content.
+    /// Parse trailing `:name [value]` directives until newline/comment.
     fn parse_trailing_directives(&mut self) -> Result<Vec<OdinDirective>, ParseError> {
         let mut directives = Vec::new();
         loop {
@@ -814,14 +787,14 @@ impl<'a> FastParser<'a> {
                     let line = self.line as usize;
                     let col = self.col() as usize;
                     match self.parse_quoted_string(line, col) {
-                        FastValue::Ok(OdinValue::String { value, .. }) => {
+                        ValueStep::Ok(OdinValue::String { value, .. }) => {
                             if let Ok(n) = value.parse::<f64>() {
                                 Some(DirectiveValue::Number(n))
                             } else {
                                 Some(DirectiveValue::String(value))
                             }
                         }
-                        FastValue::Err(e) => return Err(e),
+                        ValueStep::Err(e) => return Err(e),
                         _ => return Err(ParseError::with_message(
                             ParseErrorCode::UnexpectedCharacter,
                             line, col,
@@ -850,35 +823,32 @@ impl<'a> FastParser<'a> {
         Ok(directives)
     }
 
-    /// Parse one comma-separated tabular row, generating `name[row].col = val`
-    /// assignments. Bails on assignment-style lines (`_loop = "@x"`) or any
-    /// non-value content.
-    fn parse_tabular_row(&mut self) -> FastResult {
+    /// Parse one tabular row → `name[row].col = val` assignments.
+    fn parse_tabular_row(&mut self) -> StepResult {
         let mut ctx = self.tabular.take().expect("must be in tabular mode");
         let result = self.parse_tabular_row_inner(&mut ctx);
-        if !matches!(result, FastResult::Bail | FastResult::Err(_)) {
+        if !matches!(result, StepResult::Bail | StepResult::Err(_)) {
             self.tabular = Some(ctx);
         }
         result
     }
 
-    /// Handle `field = value` lines mixed into a tabular section. Stores at
-    /// `{base_name}[].{field}` and consumes the rest of the line (directives
-    /// included). Position must be just past the `=`.
+    /// Handle `field = value` lines inside a tabular section, stored at
+    /// `{base_name}[].{field}`. Position must be just past the `=`.
     fn parse_tabular_assignment(
         &mut self,
         ctx: &TabularContext,
         field: &str,
         line: usize,
         col: usize,
-    ) -> FastResult {
+    ) -> StepResult {
         while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
             self.pos += 1;
         }
         let value = match self.parse_value(line, col) {
-            FastValue::Ok(v) => v,
-            FastValue::Bail => return FastResult::Err(bail_to_err(line, col)),
-            FastValue::Err(e) => return FastResult::Err(e),
+            ValueStep::Ok(v) => v,
+            ValueStep::Bail => return StepResult::Err(bail_to_err(line, col)),
+            ValueStep::Err(e) => return StepResult::Err(e),
         };
         // Skip any trailing directives or whitespace until end of line.
         while self.pos < self.bytes.len() {
@@ -894,16 +864,15 @@ impl<'a> FastParser<'a> {
         } else {
             self.assignments.insert(key, value);
         }
-        FastResult::Ok
+        StepResult::Ok
     }
 
-    fn parse_tabular_row_inner(&mut self, ctx: &mut TabularContext) -> FastResult {
+    fn parse_tabular_row_inner(&mut self, ctx: &mut TabularContext) -> StepResult {
         let line = self.line as usize;
         let col = self.col() as usize;
 
-        // Detect assignment-style lines mixed into tabular data, e.g.
-        // `_loop = "@features"` inside `{features[] : name, enabled}`. These
-        // store at `{base_name}[].{field}` and don't advance the row index.
+        // Assignment lines mixed into tabular data (`_loop = "@x"`) store at
+        // `{base_name}[].{field}` and don't advance the row index.
         if let Some(eq_off) = memchr::memchr2(b'=', b'\n', &self.bytes[self.pos..]) {
             if self.bytes[self.pos + eq_off] == b'=' {
                 let prefix = &self.bytes[self.pos..self.pos + eq_off];
@@ -948,8 +917,7 @@ impl<'a> FastParser<'a> {
             if self.pos >= self.bytes.len() { break; }
             match self.bytes[self.pos] {
                 b'\n' | b'\r' | b';' => break,
-                // Empty cell: `,,` or `, ,` — skip this column without writing
-                // an assignment. Matches parser_impl semantics for absent cells.
+                // Empty cell (`,,` or `, ,`) — column stays unassigned.
                 b',' if !ctx.is_primitive => {
                     self.pos += 1;
                     col_idx += 1;
@@ -960,9 +928,9 @@ impl<'a> FastParser<'a> {
             }
 
             let value = match self.parse_value(line, col) {
-                FastValue::Ok(v) => v,
-                FastValue::Bail => return FastResult::Bail,
-                FastValue::Err(e) => return FastResult::Err(e),
+                ValueStep::Ok(v) => v,
+                ValueStep::Bail => return StepResult::Bail,
+                ValueStep::Err(e) => return StepResult::Err(e),
             };
             had_value = true;
 
@@ -988,11 +956,11 @@ impl<'a> FastParser<'a> {
             if self.pos >= self.bytes.len() { break; }
             match self.bytes[self.pos] {
                 b',' => {
-                    if ctx.is_primitive { return FastResult::Bail; }
+                    if ctx.is_primitive { return StepResult::Bail; }
                     self.pos += 1;
                 }
                 b'\n' | b'\r' | b';' => break,
-                _ => return FastResult::Bail,
+                _ => return StepResult::Bail,
             }
         }
 
@@ -1002,29 +970,29 @@ impl<'a> FastParser<'a> {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
                 b';' => self.skip_comment(),
                 b'\n' => break,
-                _ => return FastResult::Bail,
+                _ => return StepResult::Bail,
             }
         }
 
         if had_value {
             ctx.row_index += 1;
         }
-        FastResult::Ok
+        StepResult::Ok
     }
 
-    fn validate_path(&mut self, line: usize, col: usize) -> FastResult {
+    fn validate_path(&mut self, line: usize, col: usize) -> StepResult {
         let bytes = self.path_buf.as_bytes();
         let mut depth: usize = 1;
         if memchr::memchr(b'[', bytes).is_none() {
             depth += memchr::memchr_iter(b'.', bytes).count();
             if depth > self.options.max_depth {
-                return FastResult::Err(ParseError::with_message(
+                return StepResult::Err(ParseError::with_message(
                     ParseErrorCode::MaximumDepthExceeded,
                     line, col,
                     &format!("Maximum nesting depth exceeded: {depth} > {}", self.options.max_depth),
                 ));
             }
-            return FastResult::Ok;
+            return StepResult::Ok;
         }
         let mut cumulative: i64 = 0;
         let mut first_bracket: Option<(usize, usize, usize)> = None;
@@ -1045,7 +1013,7 @@ impl<'a> FastParser<'a> {
                         // Negative indices like `[-1]` — error early to match
                         // the regular parser's contract.
                         if idx_slice.starts_with('-') {
-                            return FastResult::Err(ParseError::with_message(
+                            return StepResult::Err(ParseError::with_message(
                                 ParseErrorCode::InvalidArrayIndex,
                                 line, col,
                                 &format!("Negative array index: {idx_slice}"),
@@ -1055,7 +1023,7 @@ impl<'a> FastParser<'a> {
                             match idx_slice.parse::<i64>() {
                                 Ok(idx) => {
                                     if idx > MAX_ARRAY_INDEX {
-                                        return FastResult::Err(ParseError::with_message(
+                                        return StepResult::Err(ParseError::with_message(
                                             ParseErrorCode::ArrayIndexOutOfRange,
                                             line, col,
                                             &format!("Array index {idx} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
@@ -1063,7 +1031,7 @@ impl<'a> FastParser<'a> {
                                     }
                                     cumulative += idx;
                                     if cumulative > MAX_ARRAY_INDEX {
-                                        return FastResult::Err(ParseError::with_message(
+                                        return StepResult::Err(ParseError::with_message(
                                             ParseErrorCode::ArrayIndexOutOfRange,
                                             line, col,
                                             &format!("Cumulative array indices exceed maximum allowed value of {MAX_ARRAY_INDEX}"),
@@ -1071,7 +1039,7 @@ impl<'a> FastParser<'a> {
                                     }
                                 }
                                 Err(_) => {
-                                    return FastResult::Err(ParseError::with_message(
+                                    return StepResult::Err(ParseError::with_message(
                                         ParseErrorCode::ArrayIndexOutOfRange,
                                         line, col,
                                         &format!("Array index {idx_slice} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
@@ -1088,7 +1056,7 @@ impl<'a> FastParser<'a> {
             } else { i += 1; }
         }
         if depth > self.options.max_depth {
-            return FastResult::Err(ParseError::with_message(
+            return StepResult::Err(ParseError::with_message(
                 ParseErrorCode::MaximumDepthExceeded,
                 line, col,
                 &format!("Maximum nesting depth exceeded: {depth} > {}", self.options.max_depth),
@@ -1102,7 +1070,7 @@ impl<'a> FastParser<'a> {
                     if let Some(expected) = self.array_indices.get_mut(array_base) {
                         if idx == *expected { *expected += 1; }
                         else if idx > *expected {
-                            return FastResult::Err(ParseError::with_message(
+                            return StepResult::Err(ParseError::with_message(
                                 ParseErrorCode::NonContiguousArrayIndices,
                                 line, col,
                                 &format!("Non-contiguous array indices: expected {}, got {idx}", *expected),
@@ -1111,7 +1079,7 @@ impl<'a> FastParser<'a> {
                     } else if idx == 0 {
                         self.array_indices.insert(array_base.to_string(), 1);
                     } else {
-                        return FastResult::Err(ParseError::with_message(
+                        return StepResult::Err(ParseError::with_message(
                             ParseErrorCode::NonContiguousArrayIndices,
                             line, col,
                             &format!("Non-contiguous array indices: expected 0, got {idx}"),
@@ -1120,39 +1088,37 @@ impl<'a> FastParser<'a> {
                 }
             }
         }
-        FastResult::Ok
+        StepResult::Ok
     }
 
-    fn parse_value(&mut self, line: usize, col: usize) -> FastValue {
+    fn parse_value(&mut self, line: usize, col: usize) -> ValueStep {
         let b = self.bytes[self.pos];
         match b {
             b'"' => self.parse_quoted_string(line, col),
             b'#' => self.parse_hash_value(line, col),
             b'?' => self.parse_boolean_prefix(line, col),
-            b'~' => { self.pos += 1; FastValue::Ok(OdinValues::null()) }
+            b'~' => { self.pos += 1; ValueStep::Ok(OdinValues::null()) }
             b'@' => self.parse_reference(line, col),
             b'%' => self.parse_verb(line, col),
             b'^' => self.parse_binary_value(line, col),
             b't' if self.peek_eq(b"true") && !self.is_value_continuation(4) => {
                 self.pos += 4;
-                FastValue::Ok(OdinValues::boolean(true))
+                ValueStep::Ok(OdinValues::boolean(true))
             }
             b'f' if self.peek_eq(b"false") && !self.is_value_continuation(5) => {
                 self.pos += 5;
-                FastValue::Ok(OdinValues::boolean(false))
+                ValueStep::Ok(OdinValues::boolean(false))
             }
             b'T' => self.parse_time(line, col),
             b'P' => self.parse_duration_or_bail(),
             b'0'..=b'9' => self.parse_date_like(line, col),
-            // Letters or other identifier bytes here mean a bare unquoted
-            // string was supplied as a value (`name = John`). ODIN requires
-            // strings to be quoted.
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' => FastValue::Err(ParseError::with_message(
+            // Bare unquoted string in value position (`name = John`).
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => ValueStep::Err(ParseError::with_message(
                 ParseErrorCode::BareStringNotAllowed,
                 line, col,
                 "Strings must be quoted",
             )),
-            _ => FastValue::Err(ParseError::with_message(
+            _ => ValueStep::Err(ParseError::with_message(
                 ParseErrorCode::UnexpectedCharacter,
                 line, col,
                 &format!("Unexpected character '{}'", b as char),
@@ -1168,7 +1134,7 @@ impl<'a> FastParser<'a> {
         }
     }
 
-    fn parse_quoted_string(&mut self, line: usize, col: usize) -> FastValue {
+    fn parse_quoted_string(&mut self, line: usize, col: usize) -> ValueStep {
         debug_assert_eq!(self.bytes[self.pos], b'"');
         let start_line = self.line;
         let start_col = self.col();
@@ -1183,9 +1149,9 @@ impl<'a> FastParser<'a> {
                         // No escapes — slice directly.
                         let s = &self.source[content_start..p];
                         self.pos = p + 1;
-                        FastValue::Ok(OdinValues::string(s))
+                        ValueStep::Ok(OdinValues::string(s))
                     }
-                    b'\n' => FastValue::Err(ParseError::new(
+                    b'\n' => ValueStep::Err(ParseError::new(
                         ParseErrorCode::UnterminatedString,
                         start_line as usize, start_col as usize,
                     )),
@@ -1196,15 +1162,14 @@ impl<'a> FastParser<'a> {
                     _ => unreachable!(),
                 }
             }
-            None => FastValue::Err(ParseError::new(
+            None => ValueStep::Err(ParseError::new(
                 ParseErrorCode::UnterminatedString,
                 start_line as usize, start_col as usize,
             )),
         }
     }
 
-    /// Slow path: walk to the closing quote validating each escape. Captures
-    /// the raw content range and unescapes via parse_values::unescape_string.
+    /// Walk to the closing quote, validating each escape, then unescape.
     fn parse_quoted_string_escaped(
         &mut self,
         content_start: usize,
@@ -1212,16 +1177,16 @@ impl<'a> FastParser<'a> {
         _col: usize,
         start_line: u32,
         start_col: u32,
-    ) -> FastValue {
+    ) -> ValueStep {
         while self.pos < self.bytes.len() {
             let ch = self.bytes[self.pos];
             if ch == b'"' {
                 let raw = &self.source[content_start..self.pos];
                 self.pos += 1;
-                return FastValue::Ok(OdinValues::string(super::parse_values::unescape_string(raw)));
+                return ValueStep::Ok(OdinValues::string(super::parse_values::unescape_string(raw)));
             }
             if ch == b'\n' {
-                return FastValue::Err(ParseError::new(
+                return ValueStep::Err(ParseError::new(
                     ParseErrorCode::UnterminatedString,
                     start_line as usize, start_col as usize,
                 ));
@@ -1229,7 +1194,7 @@ impl<'a> FastParser<'a> {
             if ch == b'\\' {
                 self.pos += 1;
                 if self.pos >= self.bytes.len() {
-                    return FastValue::Err(ParseError::new(
+                    return ValueStep::Err(ParseError::new(
                         ParseErrorCode::UnterminatedString,
                         start_line as usize, start_col as usize,
                     ));
@@ -1240,7 +1205,7 @@ impl<'a> FastParser<'a> {
                     b'n' | b'r' | b't' | b'\\' | b'"' | b'/' | b'0' => {}
                     b'u' => {
                         if let Err(e) = self.consume_unicode_hex(4, start_line, start_col) {
-                            return FastValue::Err(e);
+                            return ValueStep::Err(e);
                         }
                         // Optional surrogate continuation: \uXXXX (low surrogate)
                         if self.pos + 1 < self.bytes.len()
@@ -1249,17 +1214,17 @@ impl<'a> FastParser<'a> {
                         {
                             self.pos += 2;
                             if let Err(e) = self.consume_unicode_hex(4, start_line, start_col) {
-                                return FastValue::Err(e);
+                                return ValueStep::Err(e);
                             }
                         }
                     }
                     b'U' => {
                         if let Err(e) = self.consume_unicode_hex(8, start_line, start_col) {
-                            return FastValue::Err(e);
+                            return ValueStep::Err(e);
                         }
                     }
                     _ => {
-                        return FastValue::Err(ParseError::with_message(
+                        return ValueStep::Err(ParseError::with_message(
                             ParseErrorCode::InvalidEscapeSequence,
                             self.line as usize, self.col() as usize,
                             &format!("unknown escape: \\{}", esc as char),
@@ -1270,7 +1235,7 @@ impl<'a> FastParser<'a> {
                 self.pos += 1;
             }
         }
-        FastValue::Err(ParseError::new(
+        ValueStep::Err(ParseError::new(
             ParseErrorCode::UnterminatedString,
             start_line as usize, start_col as usize,
         ))
@@ -1306,7 +1271,7 @@ impl<'a> FastParser<'a> {
         Ok(())
     }
 
-    fn parse_hash_value(&mut self, line: usize, col: usize) -> FastValue {
+    fn parse_hash_value(&mut self, line: usize, col: usize) -> ValueStep {
         debug_assert_eq!(self.bytes[self.pos], b'#');
         let next = self.bytes.get(self.pos + 1).copied();
         match next {
@@ -1326,7 +1291,7 @@ impl<'a> FastParser<'a> {
                 self.pos += 1;
                 self.parse_typed_numeric(line, col, NumKind::Number)
             }
-            None => FastValue::Err(ParseError::with_message(
+            None => ValueStep::Err(ParseError::with_message(
                 ParseErrorCode::InvalidTypePrefix,
                 line, col,
                 "empty number after '#'",
@@ -1334,12 +1299,10 @@ impl<'a> FastParser<'a> {
         }
     }
 
-    fn parse_typed_numeric(&mut self, line: usize, col: usize, kind: NumKind) -> FastValue {
+    fn parse_typed_numeric(&mut self, line: usize, col: usize, kind: NumKind) -> ValueStep {
         let val_start = self.pos;
-        // Match the tokenizer's scan_number_inline: optional leading `-`,
-        // then digits / `.` / exponent. Refusing letters here lets
-        // `##abc` fall through to parse_integer's empty-value error,
-        // matching the regular pipeline.
+        // Optional leading `-`, then digits / `.` / exponent. Letters are
+        // refused so `##abc` falls through to parse_integer's empty-value error.
         if self.bytes.get(self.pos).copied() == Some(b'-') {
             self.pos += 1;
         }
@@ -1362,39 +1325,39 @@ impl<'a> FastParser<'a> {
         let raw = &self.source[val_start..self.pos];
         match kind {
             NumKind::Integer => match super::parse_values::parse_integer(raw, line, col) {
-                Ok(v) => FastValue::Ok(v),
-                Err(e) => FastValue::Err(e),
+                Ok(v) => ValueStep::Ok(v),
+                Err(e) => ValueStep::Err(e),
             },
             NumKind::Number => match super::parse_values::parse_number(raw, line, col) {
-                Ok(v) => FastValue::Ok(v),
-                Err(e) => FastValue::Err(e),
+                Ok(v) => ValueStep::Ok(v),
+                Err(e) => ValueStep::Err(e),
             },
             NumKind::Currency => match super::parse_values::parse_currency(raw, line, col) {
-                Ok(v) => FastValue::Ok(v),
-                Err(e) => FastValue::Err(e),
+                Ok(v) => ValueStep::Ok(v),
+                Err(e) => ValueStep::Err(e),
             },
             NumKind::Percent => match super::parse_values::parse_percent(raw, line, col) {
-                Ok(v) => FastValue::Ok(v),
-                Err(e) => FastValue::Err(e),
+                Ok(v) => ValueStep::Ok(v),
+                Err(e) => ValueStep::Err(e),
             },
         }
     }
 
-    fn parse_boolean_prefix(&mut self, _line: usize, _col: usize) -> FastValue {
+    fn parse_boolean_prefix(&mut self, _line: usize, _col: usize) -> ValueStep {
         debug_assert_eq!(self.bytes[self.pos], b'?');
         self.pos += 1;
         if self.peek_eq(b"true") && !self.is_value_continuation(4) {
             self.pos += 4;
-            FastValue::Ok(OdinValues::boolean(true))
+            ValueStep::Ok(OdinValues::boolean(true))
         } else if self.peek_eq(b"false") && !self.is_value_continuation(5) {
             self.pos += 5;
-            FastValue::Ok(OdinValues::boolean(false))
+            ValueStep::Ok(OdinValues::boolean(false))
         } else {
-            FastValue::Ok(OdinValues::boolean(true))
+            ValueStep::Ok(OdinValues::boolean(true))
         }
     }
 
-    fn parse_reference(&mut self, _line: usize, _col: usize) -> FastValue {
+    fn parse_reference(&mut self, _line: usize, _col: usize) -> ValueStep {
         debug_assert_eq!(self.bytes[self.pos], b'@');
         self.pos += 1;
         let start = self.pos;
@@ -1412,10 +1375,10 @@ impl<'a> FastParser<'a> {
         } else {
             raw.to_string()
         };
-        FastValue::Ok(OdinValues::reference(&normalized))
+        ValueStep::Ok(OdinValues::reference(&normalized))
     }
 
-    fn parse_date_like(&mut self, line: usize, col: usize) -> FastValue {
+    fn parse_date_like(&mut self, line: usize, col: usize) -> ValueStep {
         let start = self.pos;
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
@@ -1425,16 +1388,16 @@ impl<'a> FastParser<'a> {
         }
         let raw = &self.source[start..self.pos];
         if raw.contains('T') {
-            FastValue::Ok(OdinValues::timestamp(0, raw))
+            ValueStep::Ok(OdinValues::timestamp(0, raw))
         } else {
             match super::parse_values::parse_date_value(raw, line, col) {
-                Ok(v) => FastValue::Ok(v),
-                Err(e) => FastValue::Err(e),
+                Ok(v) => ValueStep::Ok(v),
+                Err(e) => ValueStep::Err(e),
             }
         }
     }
 
-    fn parse_time(&mut self, _line: usize, _col: usize) -> FastValue {
+    fn parse_time(&mut self, _line: usize, _col: usize) -> ValueStep {
         let start = self.pos;
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
@@ -1443,10 +1406,10 @@ impl<'a> FastParser<'a> {
             }
         }
         let raw = &self.source[start..self.pos];
-        FastValue::Ok(OdinValues::time(raw))
+        ValueStep::Ok(OdinValues::time(raw))
     }
 
-    fn parse_verb(&mut self, _line: usize, _col: usize) -> FastValue {
+    fn parse_verb(&mut self, _line: usize, _col: usize) -> ValueStep {
         debug_assert_eq!(self.bytes[self.pos], b'%');
         let start = self.pos;
         self.pos += 1; // skip `%`
@@ -1461,9 +1424,7 @@ impl<'a> FastParser<'a> {
         while trimmed > self.pos && matches!(self.bytes[trimmed - 1], b' ' | b'\t' | b'\r') {
             trimmed -= 1;
         }
-        // Build the canonical raw expression: collapse runs of internal
-        // whitespace to a single space (matches parser_impl's token-by-token
-        // reconstruction so verb-string equality holds).
+        // Canonicalize: collapse runs of internal whitespace to single spaces.
         let slice = &self.source[start..trimmed];
         let mut raw_expr = String::with_capacity(slice.len());
         let mut last_was_space = false;
@@ -1477,7 +1438,7 @@ impl<'a> FastParser<'a> {
             last_was_space = is_space;
         }
         self.pos = trimmed;
-        FastValue::Ok(OdinValue::Verb {
+        ValueStep::Ok(OdinValue::Verb {
             verb: raw_expr,
             is_custom,
             args: vec![],
@@ -1486,7 +1447,7 @@ impl<'a> FastParser<'a> {
         })
     }
 
-    fn parse_binary_value(&mut self, line: usize, col: usize) -> FastValue {
+    fn parse_binary_value(&mut self, line: usize, col: usize) -> ValueStep {
         debug_assert_eq!(self.bytes[self.pos], b'^');
         self.pos += 1; // skip `^`
         let val_start = self.pos;
@@ -1498,18 +1459,18 @@ impl<'a> FastParser<'a> {
         }
         let raw = &self.source[val_start..self.pos];
         match super::parse_values::parse_binary(raw, line, col) {
-            Ok(v) => FastValue::Ok(v),
-            Err(e) => FastValue::Err(e),
+            Ok(v) => ValueStep::Ok(v),
+            Err(e) => ValueStep::Err(e),
         }
     }
 
-    fn parse_duration_or_bail(&mut self) -> FastValue {
+    fn parse_duration_or_bail(&mut self) -> ValueStep {
         // ISO-8601 durations start with `P` followed by a digit or `T`.
         // Anything else (`P` alone, `Pfoo`) is malformed.
         let line = self.line as usize;
         let col = self.col() as usize;
         if self.bytes.get(self.pos + 1).copied().is_none_or(|b| !(b.is_ascii_digit() || b == b'T')) {
-            return FastValue::Err(ParseError::with_message(
+            return ValueStep::Err(ParseError::with_message(
                 ParseErrorCode::BareStringNotAllowed,
                 line, col,
                 "Invalid duration format",
@@ -1522,15 +1483,15 @@ impl<'a> FastParser<'a> {
                 _ => self.pos += 1,
             }
         }
-        FastValue::Ok(OdinValues::duration(&self.source[start..self.pos]))
+        ValueStep::Ok(OdinValues::duration(&self.source[start..self.pos]))
     }
 }
 
 #[derive(Debug)]
-enum FastResult { Ok, Bail, Err(ParseError) }
+enum StepResult { Ok, Bail, Err(ParseError) }
 
 #[derive(Debug)]
-enum FastValue { Ok(OdinValue), Bail, Err(ParseError) }
+enum ValueStep { Ok(OdinValue), Bail, Err(ParseError) }
 
 #[derive(Debug, Clone, Copy)]
 enum NumKind { Integer, Number, Currency, Percent }

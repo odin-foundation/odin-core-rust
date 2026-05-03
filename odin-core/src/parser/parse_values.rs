@@ -3,8 +3,7 @@
 use crate::types::values::{OdinValue, OdinValues};
 use crate::types::errors::{ParseError, ParseErrorCode};
 
-/// Unescape a quoted-string body. Mirrors the escape processing the
-/// tokenizer used to do eagerly; called only for `QuotedStringEscaped` tokens.
+/// Unescape a quoted-string body (`\n`, `\t`, `\"`, `\\`, `\u{XXXX}`, …).
 pub(super) fn unescape_string(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());

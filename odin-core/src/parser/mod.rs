@@ -1,18 +1,14 @@
 //! ODIN text parser.
 //!
-//! Converts ODIN text into an `OdinDocument`.
+//! Converts ODIN text into an `OdinDocument` via a single-pass byte walker
+//! (`parser`). Handles scalars, sections (including indexed
+//! `{records[N]}` and `{@TypeRef}`), tabular shapes (record-style,
+//! primitive arrays, relative dotted sub-blocks, lookup tables via
+//! `{$table.NAME[...]}`), modifiers, trailing directives, verbs, binary,
+//! document separators, `@import` / `@schema` / `@if` directives, and
+//! (when enabled) comment preservation.
 //!
-//! The primary path is `streaming_fast` — a single-pass byte walker that
-//! never materializes a token stream. It handles scalars, sections,
-//! tabular shapes (including primitive arrays and relative dotted
-//! sub-blocks), modifiers, trailing directives, verbs, binary,
-//! document separators, `@import` / `@schema` / `@if` directives,
-//! and (when enabled) comment preservation.
-//!
-//! When the streaming parser sees a feature it doesn't implement
-//! (`{$table.NAME[...]}` headers, multi-line headers, type-ref
-//! header shapes), it bails and the tokenize+parse fallback in
-//! `tokenizer` + `parser_impl` takes over.
+//! For chunk-based incremental parsing, see [`streaming`].
 //!
 //! # Example
 //!
@@ -24,7 +20,7 @@
 //! ```
 
 mod parse_values;
-mod streaming_fast;
+mod parser;
 pub mod streaming;
 
 #[cfg(test)]
@@ -49,8 +45,7 @@ pub fn parse(input: &str, options: Option<&ParseOptions>) -> Result<OdinDocument
         None => { default_opts = ParseOptions::default(); &default_opts }
     };
     let source = input.strip_prefix('\u{FEFF}').unwrap_or(input);
-    streaming_fast::try_parse_fast(source, opts)
-        .expect("streaming parser always returns a result")
+    parser::parse(source, opts)
 }
 
 /// Parse ODIN text into a chain of documents.
@@ -67,5 +62,5 @@ pub fn parse_documents(input: &str, options: Option<&ParseOptions>) -> Result<Ve
         None => { default_opts = ParseOptions::default(); &default_opts }
     };
     let source = input.strip_prefix('\u{FEFF}').unwrap_or(input);
-    streaming_fast::parse_documents(source, opts)
+    parser::parse_documents(source, opts)
 }
