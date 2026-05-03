@@ -322,8 +322,69 @@ impl<'a> Parser<'a> {
 
                     self.advance();
 
-                    // Check nesting depth (P010) — count dots and brackets
-                    let depth = 1 + full_path.bytes().filter(|&b| b == b'.' || b == b'[').count();
+                    // Single-pass: depth check + per-bracket range validation +
+                    // capture first bracket info for downstream contiguity check.
+                    const MAX_ARRAY_INDEX: i64 = 1_000_000;
+                    let mut depth: usize = 1;
+                    let mut cumulative: i64 = 0;
+                    let mut first_bracket: Option<(usize, usize, usize)> = None; // (base_end, idx_start, idx_end)
+
+                    let bytes = full_path.as_bytes();
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        let b = bytes[i];
+                        if b == b'.' {
+                            depth += 1;
+                            i += 1;
+                        } else if b == b'[' {
+                            depth += 1;
+                            let bracket_start = i;
+                            let idx_start = i + 1;
+                            let close = bytes[idx_start..].iter().position(|&c| c == b']');
+                            match close {
+                                None => break,
+                                Some(off) => {
+                                    let idx_end = idx_start + off;
+                                    let idx_slice = &full_path[idx_start..idx_end];
+                                    if !idx_slice.is_empty() && idx_slice.bytes().all(|c| c.is_ascii_digit()) {
+                                        match idx_slice.parse::<i64>() {
+                                            Ok(idx) => {
+                                                if idx > MAX_ARRAY_INDEX {
+                                                    return Err(ParseError::with_message(
+                                                        ParseErrorCode::ArrayIndexOutOfRange,
+                                                        path_line, path_col,
+                                                        &format!("Array index {idx} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
+                                                    ));
+                                                }
+                                                cumulative += idx;
+                                                if cumulative > MAX_ARRAY_INDEX {
+                                                    return Err(ParseError::with_message(
+                                                        ParseErrorCode::ArrayIndexOutOfRange,
+                                                        path_line, path_col,
+                                                        &format!("Cumulative array indices exceed maximum allowed value of {MAX_ARRAY_INDEX}"),
+                                                    ));
+                                                }
+                                            }
+                                            Err(_) => {
+                                                return Err(ParseError::with_message(
+                                                    ParseErrorCode::ArrayIndexOutOfRange,
+                                                    path_line, path_col,
+                                                    &format!("Array index {idx_slice} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    if first_bracket.is_none() {
+                                        first_bracket = Some((bracket_start, idx_start, idx_end));
+                                    }
+                                    i = idx_end + 1;
+                                }
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+
                     if depth > self.options.max_depth {
                         return Err(ParseError::with_message(
                             ParseErrorCode::MaximumDepthExceeded,
@@ -332,70 +393,12 @@ impl<'a> Parser<'a> {
                         ));
                     }
 
-                    // Validate array indices
-                    // First pass: check ALL bracket indices for P015 (range check)
-                    {
-                        const MAX_ARRAY_INDEX: i64 = 1_000_000;
-                        let mut cumulative: i64 = 0;
-                        let mut search_start = 0;
-                        while let Some(bp) = full_path[search_start..].find('[') {
-                            let abs_bp = search_start + bp;
-                            if let Some(cp) = full_path[abs_bp..].find(']') {
-                                let idx_str = &full_path[abs_bp + 1..abs_bp + cp];
-                                if !idx_str.is_empty() && idx_str.bytes().all(|b| b.is_ascii_digit()) {
-                                    match idx_str.parse::<i64>() {
-                                        Ok(idx) => {
-                                            if idx < 0 {
-                                                return Err(ParseError::with_message(
-                                                    ParseErrorCode::InvalidArrayIndex,
-                                                    path_line, path_col,
-                                                    &format!("Negative array index: {idx}"),
-                                                ));
-                                            }
-                                            if idx > MAX_ARRAY_INDEX {
-                                                return Err(ParseError::with_message(
-                                                    ParseErrorCode::ArrayIndexOutOfRange,
-                                                    path_line, path_col,
-                                                    &format!("Array index {idx} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
-                                                ));
-                                            }
-                                            cumulative += idx;
-                                            if cumulative > MAX_ARRAY_INDEX {
-                                                return Err(ParseError::with_message(
-                                                    ParseErrorCode::ArrayIndexOutOfRange,
-                                                    path_line, path_col,
-                                                    &format!("Cumulative array indices exceed maximum allowed value of {MAX_ARRAY_INDEX}"),
-                                                ));
-                                            }
-                                        }
-                                        Err(_) => {
-                                            // All-digit but doesn't fit in i64 — must
-                                            // be larger than MAX_ARRAY_INDEX.
-                                            return Err(ParseError::with_message(
-                                                ParseErrorCode::ArrayIndexOutOfRange,
-                                                path_line, path_col,
-                                                &format!("Array index {idx_str} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
-                                            ));
-                                        }
-                                    }
-                                }
-                                search_start = abs_bp + cp + 1;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    // Second pass: track first array index for contiguity (P013).
-                    if let Some(bracket_pos) = full_path.find('[') {
-                        let array_base = &full_path[..bracket_pos];
-                        if let Some(close_pos) = full_path[bracket_pos..].find(']') {
-                            let idx_str = &full_path[bracket_pos + 1..bracket_pos + close_pos];
-
-                            // Check for empty brackets (array clear)
-                            if idx_str.is_empty() {
-                                // Array clear syntax: items[] = ~
-                            } else if let Ok(idx) = idx_str.parse::<usize>() {
+                    // Contiguity check using captured first-bracket info (P013).
+                    if let Some((base_end, idx_start, idx_end)) = first_bracket {
+                        let idx_slice = &full_path[idx_start..idx_end];
+                        if !idx_slice.is_empty() {
+                            if let Ok(idx) = idx_slice.parse::<usize>() {
+                                let array_base = &full_path[..base_end];
                                 if let Some(expected) = array_indices.get_mut(array_base) {
                                     if idx == *expected {
                                         *expected += 1;
@@ -406,7 +409,7 @@ impl<'a> Parser<'a> {
                                             &format!("Non-contiguous array indices: expected {}, got {idx}", *expected),
                                         ));
                                     }
-                                    // idx < expected: re-assignment, allowed (duplicate-path check handles it)
+                                    // idx < expected: re-assignment, allowed
                                 } else if idx == 0 {
                                     array_indices.insert(array_base.to_string(), 1);
                                 } else {
