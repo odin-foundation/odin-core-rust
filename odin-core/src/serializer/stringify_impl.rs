@@ -29,18 +29,23 @@ pub fn stringify(doc: &OdinDocument, options: Option<&StringifyOptions>) -> Stri
         }
     }
 
-    // Group assignments by header sections
-    let mut current_section: Option<&str> = None;
+    let canonical_meta = opts.canonical && !doc.metadata.is_empty();
 
-    // In canonical mode, merge metadata as $.key entries
+    if !opts.sort_keys && !canonical_meta {
+        // Stream directly — no Vec, no sort.
+        let mut current_section: Option<&str> = None;
+        for (path, value) in &doc.assignments {
+            write_entry(&mut output, path, value, &mut current_section, opts.canonical);
+        }
+        return output;
+    }
+
     let mut meta_keys: Vec<(String, &OdinValue)> = Vec::new();
-    if opts.canonical && !doc.metadata.is_empty() {
+    if canonical_meta {
         for (key, value) in &doc.metadata {
             meta_keys.push((format!("$.{key}"), value));
         }
     }
-
-    // Collect paths to determine sections
     let mut entries: Vec<(&String, &OdinValue)> = doc.assignments.iter().collect();
     for (key, value) in &meta_keys {
         entries.push((key, value));
@@ -53,36 +58,40 @@ pub fn stringify(doc: &OdinDocument, options: Option<&StringifyOptions>) -> Stri
         }
     }
 
+    let mut current_section: Option<&str> = None;
     for (path, value) in &entries {
-        // Determine section from path
-        let (section, field) = split_path(path);
-
-        if section != current_section {
-            if let Some(sec) = section {
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push('{');
-                output.push_str(sec);
-                output.push_str("}\n");
-            }
-            current_section = section;
-        }
-
-        // Write field assignment
-        output.push_str(field);
-        output.push_str(" = ");
-
-        // Write modifiers before the value (after `= `)
-        if let Some(mods) = value.modifiers() {
-            write_modifiers(&mut output, mods);
-        }
-
-        write_value(&mut output, value, opts.canonical);
-        output.push('\n');
+        write_entry(&mut output, path, value, &mut current_section, opts.canonical);
     }
 
     output
+}
+
+fn write_entry<'a>(
+    output: &mut String,
+    path: &'a str,
+    value: &OdinValue,
+    current_section: &mut Option<&'a str>,
+    canonical: bool,
+) {
+    let (section, field) = split_path(path);
+    if section != *current_section {
+        if let Some(sec) = section {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push('{');
+            output.push_str(sec);
+            output.push_str("}\n");
+        }
+        *current_section = section;
+    }
+    output.push_str(field);
+    output.push_str(" = ");
+    if let Some(mods) = value.modifiers() {
+        write_modifiers(output, mods);
+    }
+    write_value(output, value, canonical);
+    output.push('\n');
 }
 
 /// Split a path into (section, field) parts — zero allocations.
