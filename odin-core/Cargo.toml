@@ -21,6 +21,11 @@ regex = ["dep:regex"]
 ryu = "1.0"
 itoa = "1.0"
 
+# Fast non-cryptographic hashing for parser-internal short-string keys.
+rustc-hash = "2"
+# Insertion-order-preserving map with single-storage keys.
+indexmap = "2"
+
 # JSON parsing/serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }

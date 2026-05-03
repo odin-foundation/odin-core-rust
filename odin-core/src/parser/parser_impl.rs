@@ -128,7 +128,7 @@ impl<'a> Parser<'a> {
         let mut comments: Vec<OdinComment> = Vec::new();
         let mut in_metadata = false;
         // Next expected contiguous index per array base.
-        let mut array_indices: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut array_indices: rustc_hash::FxHashMap<String, usize> = rustc_hash::FxHashMap::default();
 
         self.skip_newlines();
 
