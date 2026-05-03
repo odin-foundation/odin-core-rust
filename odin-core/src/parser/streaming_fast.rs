@@ -239,13 +239,25 @@ impl<'a> FastParser<'a> {
         self.pos += 1;
         let content_start = self.pos;
 
-        // Find `}` on the same line. Bail on multi-line headers (rare).
+        // Headers must close on the same line.
         let close = match memchr::memchr2(b'}', b'\n', &self.bytes[self.pos..]) {
             Some(off) => off,
-            None => return FastResult::Bail,
+            None => {
+                return FastResult::Err(ParseError::with_message(
+                    ParseErrorCode::InvalidHeaderSyntax,
+                    start_line as usize, start_col as usize,
+                    "Unclosed section header",
+                ));
+            }
         };
         let close_pos = self.pos + close;
-        if self.bytes[close_pos] != b'}' { return FastResult::Bail; }
+        if self.bytes[close_pos] != b'}' {
+            return FastResult::Err(ParseError::with_message(
+                ParseErrorCode::InvalidHeaderSyntax,
+                start_line as usize, start_col as usize,
+                "Unclosed section header",
+            ));
+        }
         let header = &self.source[content_start..close_pos];
 
         // Tabular header `{name[] : col1, col2, ...}` (absolute or relative).
@@ -343,11 +355,42 @@ impl<'a> FastParser<'a> {
             });
             return self.skip_to_line_end(start_line, start_col);
         }
-        if header.contains("[]") {
-            return FastResult::Bail;
+        // Brackets must balance and indices must be parseable. `{records[0]}`
+        // is fine; `{invalid[}` is not.
+        let mut bracket_depth: i32 = 0;
+        let mut in_index = false;
+        let mut idx_start = 0usize;
+        for (i, b) in header.as_bytes().iter().enumerate() {
+            match b {
+                b'[' => {
+                    if in_index { return FastResult::Bail; }
+                    bracket_depth += 1;
+                    in_index = true;
+                    idx_start = i + 1;
+                }
+                b']' => {
+                    if !in_index { return FastResult::Bail; }
+                    bracket_depth -= 1;
+                    if bracket_depth < 0 { return FastResult::Bail; }
+                    let idx = &header[idx_start..i];
+                    if !idx.is_empty() && idx.parse::<i64>().is_err() {
+                        return FastResult::Err(ParseError::with_message(
+                            ParseErrorCode::InvalidArrayIndex,
+                            start_line as usize, start_col as usize,
+                            &format!("Invalid array index: {idx}"),
+                        ));
+                    }
+                    in_index = false;
+                }
+                _ => {}
+            }
         }
-        if header.contains('[') || header.contains(']') {
-            return FastResult::Bail;
+        if bracket_depth != 0 {
+            return FastResult::Err(ParseError::with_message(
+                ParseErrorCode::InvalidArrayIndex,
+                start_line as usize, start_col as usize,
+                "Invalid array index",
+            ));
         }
 
         self.pos = close_pos + 1;
