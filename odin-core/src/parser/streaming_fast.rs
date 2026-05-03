@@ -22,7 +22,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::types::document::OdinDocument;
+use crate::types::document::{OdinDocument, OdinImport, OdinSchema};
 use crate::types::errors::{ParseError, ParseErrorCode};
 use crate::types::ordered_map::OrderedMap;
 use crate::types::options::ParseOptions;
@@ -51,10 +51,19 @@ pub(super) fn try_parse_fast(source: &str, options: &ParseOptions) -> Option<Res
 /// Conservative: any false positive just falls through to the regular parser.
 fn is_fast_path_eligible(bytes: &[u8]) -> bool {
     if memchr::memmem::find(bytes, b"$table").is_some() { return false; }
-    if memchr::memmem::find(bytes, b"@import").is_some() { return false; }
-    if memchr::memmem::find(bytes, b"@schema").is_some() { return false; }
-    if memchr::memmem::find(bytes, b"@if ").is_some() { return false; }
     true
+}
+
+fn find_comment_start_quote_aware(s: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 struct FastParser<'a> {
@@ -67,6 +76,8 @@ struct FastParser<'a> {
     metadata: OrderedMap<String, OdinValue>,
     assignments: OrderedMap<String, OdinValue>,
     modifiers_map: OrderedMap<String, OdinModifiers>,
+    imports: Vec<OdinImport>,
+    schemas: Vec<OdinSchema>,
     array_indices: FxHashMap<String, usize>,
     current_header: Option<String>,
     previous_header: Option<String>,
@@ -99,6 +110,8 @@ impl<'a> FastParser<'a> {
             metadata: OrderedMap::with_capacity(est_paths.min(32)),
             assignments: OrderedMap::with_capacity(est_paths),
             modifiers_map: OrderedMap::new(),
+            imports: Vec::new(),
+            schemas: Vec::new(),
             array_indices: FxHashMap::default(),
             current_header: None,
             previous_header: None,
@@ -152,7 +165,11 @@ impl<'a> FastParser<'a> {
                     self.tabular = None;
                     continue;
                 }
-                b'@' => return None,
+                b'@' => match self.parse_top_directive() {
+                    FastResult::Ok => {}
+                    FastResult::Bail => return None,
+                    FastResult::Err(e) => return Some(Err(e)),
+                },
                 _ => match self.parse_assignment() {
                     FastResult::Ok => {}
                     FastResult::Bail => return None,
@@ -164,8 +181,8 @@ impl<'a> FastParser<'a> {
             metadata: self.metadata,
             assignments: self.assignments,
             modifiers: self.modifiers_map,
-            imports: Vec::new(),
-            schemas: Vec::new(),
+            imports: self.imports,
+            schemas: self.schemas,
             conditionals: Vec::new(),
             comments: Vec::new(),
         }))
@@ -475,6 +492,90 @@ impl<'a> FastParser<'a> {
                 }
                 indexmap::map::Entry::Vacant(e) => { e.insert(value); }
             }
+        }
+        FastResult::Ok
+    }
+
+    /// Parse a top-level `@import` / `@schema` / `@if` directive. Anything
+    /// else after `@` (e.g. `@TypeRef` in unexpected position) bails.
+    fn parse_top_directive(&mut self) -> FastResult {
+        let line = self.line as usize;
+        let col = self.col() as usize;
+        debug_assert_eq!(self.bytes[self.pos], b'@');
+        self.pos += 1;
+        let kw_start = self.pos;
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if matches!(b, b'a'..=b'z' | b'A'..=b'Z') {
+                self.pos += 1;
+            } else { break; }
+        }
+        let kw_len = self.pos - kw_start;
+        if kw_len == 0 { return FastResult::Bail; }
+        let kw = &self.source[kw_start..self.pos];
+        let kw_owned = kw.to_string();
+
+        // Whitespace then rest of line.
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
+            self.pos += 1;
+        }
+        let rest_start = self.pos;
+        while self.pos < self.bytes.len() && !matches!(self.bytes[self.pos], b'\n' | b'\r') {
+            self.pos += 1;
+        }
+        let raw_rest = self.source[rest_start..self.pos].trim();
+        let rest = match find_comment_start_quote_aware(raw_rest) {
+            Some(idx) => raw_rest[..idx].trim(),
+            None => raw_rest,
+        };
+
+        match kw_owned.as_str() {
+            "import" => {
+                if rest.is_empty() {
+                    return FastResult::Err(ParseError::with_message(
+                        ParseErrorCode::InvalidDirective, line, col,
+                        "Invalid import directive syntax",
+                    ));
+                }
+                if rest.ends_with(" as") {
+                    return FastResult::Err(ParseError::with_message(
+                        ParseErrorCode::InvalidDirective, line, col,
+                        "Import alias requires identifier",
+                    ));
+                }
+                if let Some(as_pos) = rest.find(" as ") {
+                    let path = rest[..as_pos].trim().to_string();
+                    let alias = rest[as_pos + 4..].trim();
+                    if alias.is_empty() {
+                        return FastResult::Err(ParseError::with_message(
+                            ParseErrorCode::InvalidDirective, line, col,
+                            "Import alias requires identifier",
+                        ));
+                    }
+                    self.imports.push(OdinImport { path, alias: Some(alias.to_string()), line });
+                } else {
+                    self.imports.push(OdinImport { path: rest.to_string(), alias: None, line });
+                }
+            }
+            "schema" => {
+                if rest.is_empty() {
+                    return FastResult::Err(ParseError::with_message(
+                        ParseErrorCode::InvalidDirective, line, col,
+                        "Schema directive requires URL",
+                    ));
+                }
+                self.schemas.push(OdinSchema { url: rest.to_string(), line });
+            }
+            "if" => {
+                if rest.is_empty() {
+                    return FastResult::Err(ParseError::with_message(
+                        ParseErrorCode::InvalidDirective, line, col,
+                        "Conditional directive requires expression",
+                    ));
+                }
+                // Validate-only: parser_impl also drops the parsed expression.
+            }
+            _ => return FastResult::Bail,
         }
         FastResult::Ok
     }
