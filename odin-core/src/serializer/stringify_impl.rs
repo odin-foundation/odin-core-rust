@@ -47,7 +47,7 @@ pub fn stringify(doc: &OdinDocument, options: Option<&StringifyOptions>) -> Stri
     }
     if opts.sort_keys {
         if opts.canonical {
-            entries.sort_by(|(a, _), (b, _)| canonical_path_compare(a, b));
+            entries.sort_by_cached_key(|(path, _)| canonical_sort_key(path));
         } else {
             entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         }
@@ -330,29 +330,38 @@ fn write_canonical_number(output: &mut String, value: f64) {
     }
 }
 
-/// Compare two paths with numeric array index sorting -- zero allocations.
-/// "items[2]" < "items[10]" (numeric), but "alpha" < "beta" (lexicographic).
-fn canonical_path_compare(a: &str, b: &str) -> std::cmp::Ordering {
-    // Fast path: if neither path contains '[', plain lexicographic suffices
-    if !a.as_bytes().contains(&b'[') && !b.as_bytes().contains(&b'[') {
-        return a.cmp(b);
-    }
+/// Sort key for a path; numeric for `[N]` segments, lexicographic otherwise.
+fn canonical_sort_key(path: &str) -> Vec<SegmentKey<'_>> {
+    PathSegmentIter::new(path)
+        .map(|seg| {
+            let numeric = if seg.starts_with('[') && seg.ends_with(']') {
+                seg[1..seg.len() - 1].parse::<usize>().ok()
+            } else {
+                None
+            };
+            SegmentKey { text: seg, numeric }
+        })
+        .collect()
+}
 
-    let mut a_iter = PathSegmentIter::new(a);
-    let mut b_iter = PathSegmentIter::new(b);
+#[derive(Eq, PartialEq)]
+struct SegmentKey<'a> {
+    text: &'a str,
+    numeric: Option<usize>,
+}
 
-    loop {
-        match (a_iter.next(), b_iter.next()) {
-            (Some(ap), Some(bp)) => {
-                let ord = compare_segments(ap, bp);
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            (Some(_), None) => return std::cmp::Ordering::Greater,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (None, None) => return std::cmp::Ordering::Equal,
+impl<'a> Ord for SegmentKey<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.numeric, other.numeric) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            _ => self.text.cmp(other.text),
         }
+    }
+}
+
+impl<'a> PartialOrd for SegmentKey<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -403,18 +412,6 @@ impl<'a> Iterator for PathSegmentIter<'a> {
         }
     }
 }
-
-/// Compare two path segments, treating [N] as numeric.
-fn compare_segments(a: &str, b: &str) -> std::cmp::Ordering {
-    // Check if both are array indices
-    if a.starts_with('[') && a.ends_with(']') && b.starts_with('[') && b.ends_with(']') {
-        let a_idx: usize = a[1..a.len()-1].parse().unwrap_or(0);
-        let b_idx: usize = b[1..b.len()-1].parse().unwrap_or(0);
-        return a_idx.cmp(&b_idx);
-    }
-    a.cmp(b)
-}
-
 
 #[cfg(test)]
 mod tests {
