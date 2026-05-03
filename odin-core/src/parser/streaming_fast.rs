@@ -26,7 +26,7 @@ use crate::types::document::OdinDocument;
 use crate::types::errors::{ParseError, ParseErrorCode};
 use crate::types::ordered_map::OrderedMap;
 use crate::types::options::ParseOptions;
-use crate::types::values::{OdinValue, OdinValues};
+use crate::types::values::{OdinModifiers, OdinValue, OdinValues};
 
 const MAX_ARRAY_INDEX: i64 = 1_000_000;
 
@@ -68,6 +68,7 @@ struct FastParser<'a> {
     options: &'a ParseOptions,
     metadata: OrderedMap<String, OdinValue>,
     assignments: OrderedMap<String, OdinValue>,
+    modifiers_map: OrderedMap<String, OdinModifiers>,
     array_indices: FxHashMap<String, usize>,
     current_header: Option<String>,
     previous_header: Option<String>,
@@ -99,6 +100,7 @@ impl<'a> FastParser<'a> {
             options,
             metadata: OrderedMap::with_capacity(est_paths.min(32)),
             assignments: OrderedMap::with_capacity(est_paths),
+            modifiers_map: OrderedMap::new(),
             array_indices: FxHashMap::default(),
             current_header: None,
             previous_header: None,
@@ -147,7 +149,7 @@ impl<'a> FastParser<'a> {
         Some(Ok(OdinDocument {
             metadata: self.metadata,
             assignments: self.assignments,
-            modifiers: OrderedMap::new(),
+            modifiers: self.modifiers_map,
             imports: Vec::new(),
             schemas: Vec::new(),
             conditionals: Vec::new(),
@@ -369,7 +371,26 @@ impl<'a> FastParser<'a> {
             other => return other,
         }
 
-        // Parse value. Empty value = empty string.
+        // Collect modifiers (`!`, `*`, `-`) before the value.
+        let mut mods = OdinModifiers::default();
+        loop {
+            match self.bytes.get(self.pos).copied() {
+                Some(b'!') => { mods.required = true; self.pos += 1; }
+                Some(b'*') => { mods.confidential = true; self.pos += 1; }
+                Some(b'-') => {
+                    if self.bytes.get(self.pos + 1).copied() == Some(b'-')
+                        && self.bytes.get(self.pos + 2).copied() == Some(b'-')
+                    {
+                        return FastResult::Bail;
+                    }
+                    mods.deprecated = true;
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Parse value. Empty value = empty string (modifiers dropped, matches parser_impl).
         let value = if self.pos >= self.bytes.len()
             || self.bytes[self.pos] == b'\n'
             || self.bytes[self.pos] == b'\r'
@@ -377,11 +398,16 @@ impl<'a> FastParser<'a> {
         {
             OdinValues::string("")
         } else {
-            match self.parse_value(path_line, path_col) {
+            let mut v = match self.parse_value(path_line, path_col) {
                 FastValue::Ok(v) => v,
                 FastValue::Bail => return FastResult::Bail,
                 FastValue::Err(e) => return FastResult::Err(e),
+            };
+            if mods.has_any() {
+                v = v.with_modifiers(mods.clone());
+                self.modifiers_map.insert(self.path_buf.clone(), mods);
             }
+            v
         };
 
         // Trailing whitespace, comment, or newline. Anything else bails
