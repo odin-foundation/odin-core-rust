@@ -26,7 +26,7 @@ use crate::types::document::OdinDocument;
 use crate::types::errors::{ParseError, ParseErrorCode};
 use crate::types::ordered_map::OrderedMap;
 use crate::types::options::ParseOptions;
-use crate::types::values::{OdinModifiers, OdinValue, OdinValues};
+use crate::types::values::{DirectiveValue, OdinDirective, OdinModifiers, OdinValue, OdinValues};
 
 const MAX_ARRAY_INDEX: i64 = 1_000_000;
 
@@ -390,7 +390,7 @@ impl<'a> FastParser<'a> {
             }
         }
 
-        // Parse value. Empty value = empty string (modifiers dropped, matches parser_impl).
+        // Parse value. Empty value = empty string (modifiers/directives dropped, matches parser_impl).
         let value = if self.pos >= self.bytes.len()
             || self.bytes[self.pos] == b'\n'
             || self.bytes[self.pos] == b'\r'
@@ -407,11 +407,18 @@ impl<'a> FastParser<'a> {
                 v = v.with_modifiers(mods.clone());
                 self.modifiers_map.insert(self.path_buf.clone(), mods);
             }
+            // Trailing directives: `:type integer`, `:format ssn`, ...
+            let directives = match self.parse_trailing_directives() {
+                Ok(d) => d,
+                Err(e) => return FastResult::Err(e),
+            };
+            if !directives.is_empty() {
+                v = v.with_directives(directives);
+            }
             v
         };
 
-        // Trailing whitespace, comment, or newline. Anything else bails
-        // (could be a directive, modifier mid-line, etc.).
+        // Trailing whitespace, comment, or newline. Anything else bails.
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
@@ -456,6 +463,81 @@ impl<'a> FastParser<'a> {
             }
         }
         FastResult::Ok
+    }
+
+    /// Parse a sequence of `:name [value]` trailing directives. Stops at
+    /// newline / `;` comment / non-`:` content.
+    fn parse_trailing_directives(&mut self) -> Result<Vec<OdinDirective>, ParseError> {
+        let mut directives = Vec::new();
+        loop {
+            while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
+                self.pos += 1;
+            }
+            if self.pos >= self.bytes.len() { break; }
+            if !matches!(self.bytes[self.pos], b':') { break; }
+            self.pos += 1;
+            let name_start = self.pos;
+            while self.pos < self.bytes.len() {
+                let b = self.bytes[self.pos];
+                if matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') {
+                    self.pos += 1;
+                } else { break; }
+            }
+            if self.pos == name_start {
+                return Err(ParseError::with_message(
+                    ParseErrorCode::UnexpectedCharacter,
+                    self.line as usize, self.col() as usize,
+                    "directive name missing",
+                ));
+            }
+            let name = self.source[name_start..self.pos].to_string();
+            while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
+                self.pos += 1;
+            }
+            let dir_value = if self.pos < self.bytes.len() {
+                let next = self.bytes[self.pos];
+                if matches!(next, b'\n' | b'\r' | b';' | b':') {
+                    None
+                } else if next == b'"' {
+                    // Quoted directive value — parse the same way as a value
+                    // string so escapes and quote-stripping are handled.
+                    let line = self.line as usize;
+                    let col = self.col() as usize;
+                    match self.parse_quoted_string(line, col) {
+                        FastValue::Ok(OdinValue::String { value, .. }) => {
+                            if let Ok(n) = value.parse::<f64>() {
+                                Some(DirectiveValue::Number(n))
+                            } else {
+                                Some(DirectiveValue::String(value))
+                            }
+                        }
+                        FastValue::Err(e) => return Err(e),
+                        _ => return Err(ParseError::with_message(
+                            ParseErrorCode::UnexpectedCharacter,
+                            line, col,
+                            "expected quoted directive value",
+                        )),
+                    }
+                } else {
+                    let val_start = self.pos;
+                    while self.pos < self.bytes.len() {
+                        let b = self.bytes[self.pos];
+                        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b';' | b':') { break; }
+                        self.pos += 1;
+                    }
+                    let v = self.source[val_start..self.pos].to_string();
+                    if let Ok(n) = v.parse::<f64>() {
+                        Some(DirectiveValue::Number(n))
+                    } else {
+                        Some(DirectiveValue::String(v))
+                    }
+                }
+            } else {
+                None
+            };
+            directives.push(OdinDirective { name, value: dir_value });
+        }
+        Ok(directives)
     }
 
     /// Parse one comma-separated tabular row, generating `name[row].col = val`
