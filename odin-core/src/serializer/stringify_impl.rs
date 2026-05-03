@@ -208,7 +208,7 @@ fn write_value(output: &mut String, value: &OdinValue, canonical: bool) {
                 output.push_str(alg);
                 output.push(':');
             }
-            output.push_str(&base64_encode(data));
+            base64_encode_into(data, output);
         }
         OdinValue::Verb { verb, is_custom, args, .. } => {
             output.push('%');
@@ -290,40 +290,46 @@ fn write_escaped_string(output: &mut String, s: &str) {
     output.push_str(&s[last..]);
 }
 
-/// Simple base64 encoder (no external dependency).
+/// Simple base64 encoder. The `_into` variant writes directly into a caller's
+/// buffer to avoid an intermediate `String` allocation in the hot path.
+#[cfg(test)]
 fn base64_encode(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
+    base64_encode_into(data, &mut s);
+    s
+}
+
+fn base64_encode_into(data: &[u8], output: &mut String) {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    output.reserve(data.len().div_ceil(3) * 4);
     let mut i = 0;
 
     while i + 2 < data.len() {
         let n = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8) | u32::from(data[i + 2]);
-        result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-        result.push(ALPHABET[(n >> 6) as usize & 0x3F] as char);
-        result.push(ALPHABET[n as usize & 0x3F] as char);
+        output.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
+        output.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
+        output.push(ALPHABET[(n >> 6) as usize & 0x3F] as char);
+        output.push(ALPHABET[n as usize & 0x3F] as char);
         i += 3;
     }
 
     match data.len() - i {
         1 => {
             let n = u32::from(data[i]) << 16;
-            result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-            result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-            result.push('=');
-            result.push('=');
+            output.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
+            output.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
+            output.push('=');
+            output.push('=');
         }
         2 => {
             let n = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8);
-            result.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
-            result.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
-            result.push(ALPHABET[(n >> 6) as usize & 0x3F] as char);
-            result.push('=');
+            output.push(ALPHABET[(n >> 18) as usize & 0x3F] as char);
+            output.push(ALPHABET[(n >> 12) as usize & 0x3F] as char);
+            output.push(ALPHABET[(n >> 6) as usize & 0x3F] as char);
+            output.push('=');
         }
         _ => {}
     }
-
-    result
 }
 
 /// Write a number in canonical form directly to the output buffer — zero intermediate allocations.
