@@ -37,21 +37,8 @@ pub(super) fn try_parse_fast(source: &str, options: &ParseOptions) -> Option<Res
     if source.len() > u32::MAX as usize {
         return Some(Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1)));
     }
-    // Upfront scan for bail markers — much cheaper than partially parsing
-    // and then bailing mid-stream (which throws away the partial work and
-    // forces the full parser to re-parse from byte 0).
-    if !is_fast_path_eligible(source.as_bytes()) {
-        return None;
-    }
     let p = FastParser::new(source, options);
     p.run()
-}
-
-/// Quick byte-pattern scan for features that the fast path doesn't handle.
-/// Conservative: any false positive just falls through to the regular parser.
-fn is_fast_path_eligible(bytes: &[u8]) -> bool {
-    if memchr::memmem::find(bytes, b"$table").is_some() { return false; }
-    true
 }
 
 fn find_comment_start_quote_aware(s: &str) -> Option<usize> {
@@ -97,6 +84,10 @@ struct TabularContext {
     row_index: usize,
     key_buf: String,
     is_primitive: bool,
+    /// When true, rows are written to `metadata` with key `table.NAME[i].col`
+    /// (lookup-table form `{$table.NAME[col1, col2]}`). When false, rows are
+    /// written to `assignments` with key `name[i].col` (record-shaped tabular).
+    is_metadata_table: bool,
 }
 
 impl<'a> FastParser<'a> {
@@ -311,13 +302,46 @@ impl<'a> FastParser<'a> {
                 row_index: 0,
                 key_buf: String::with_capacity(64),
                 is_primitive,
+                is_metadata_table: false,
             });
             return self.skip_to_line_end(start_line, start_col);
         }
 
-        // Other bracket / colon shapes: bail.
+        // Lookup-table header `{$table.NAME[col1, col2, ...]}` (also `$.table.NAME`).
+        // Body is CSV-shaped; each cell is a fully typed ODIN value (Number,
+        // Integer, etc.) — required for %lookup to match typed result columns.
         if header.starts_with("$table.") || header.starts_with("$.table.") {
-            return FastResult::Bail;
+            let table_part = header
+                .strip_prefix("$.")
+                .or_else(|| header.strip_prefix('$'))
+                .unwrap_or(header);
+            let Some(rest) = table_part.strip_prefix("table.") else { return FastResult::Bail; };
+            let Some(bracket_pos) = rest.find('[') else { return FastResult::Bail; };
+            let Some(close_idx) = rest.find(']') else { return FastResult::Bail; };
+            if close_idx <= bracket_pos { return FastResult::Bail; }
+            let table_name = &rest[..bracket_pos];
+            if table_name.is_empty() { return FastResult::Bail; }
+            let cols_str = &rest[bracket_pos + 1..close_idx];
+            let mut columns = Vec::with_capacity(8);
+            for raw in cols_str.split(',') {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() { return FastResult::Bail; }
+                columns.push(trimmed.to_string());
+            }
+            if columns.is_empty() { return FastResult::Bail; }
+
+            self.pos = close_pos + 1;
+            self.in_metadata = true;
+            self.current_header = None;
+            self.tabular = Some(TabularContext {
+                base_name: format!("table.{table_name}"),
+                columns,
+                row_index: 0,
+                key_buf: String::with_capacity(64),
+                is_primitive: false,
+                is_metadata_table: true,
+            });
+            return self.skip_to_line_end(start_line, start_col);
         }
         if header.contains("[]") {
             return FastResult::Bail;
@@ -335,9 +359,11 @@ impl<'a> FastParser<'a> {
             // Named metadata `{$const}`, `{$accumulator}`, ...
             self.in_metadata = true;
             self.current_header = Some(rest.to_string());
-        } else if header.starts_with('@') {
-            // `{@TypeRef}` — bail; handled by full parser.
-            return FastResult::Bail;
+        } else if let Some(rest) = header.strip_prefix('@') {
+            // `{@TypeRef}` — type-reference section. Body fields land at
+            // `TypeRef.field`, matching parser_impl semantics.
+            self.in_metadata = false;
+            self.current_header = Some(rest.to_string());
         } else if let Some(rel) = header.strip_prefix('.') {
             // `{.relative}` — resolve against previous absolute header.
             self.in_metadata = false;
@@ -760,7 +786,11 @@ impl<'a> FastParser<'a> {
             } else if col_idx < ctx.columns.len() {
                 ctx.key_buf.truncate(prefix_len);
                 ctx.key_buf.push_str(&ctx.columns[col_idx]);
-                self.assignments.insert(ctx.key_buf.clone(), value);
+                if ctx.is_metadata_table {
+                    self.metadata.insert(ctx.key_buf.clone(), value);
+                } else {
+                    self.assignments.insert(ctx.key_buf.clone(), value);
+                }
             }
             col_idx += 1;
 

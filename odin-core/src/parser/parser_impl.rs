@@ -597,89 +597,39 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Collect values on this line (string literals, identifiers, commas)
-            let mut values: Vec<String> = Vec::new();
-            let mut current_val: Option<String> = None;
+            // Collect typed OdinValues on this line. Each cell is parsed via
+            // parse_value so type prefixes (`##`, `#`, `#$`, `?`, `~`, etc.)
+            // survive into the lookup table — required for %lookup to match
+            // typed result columns.
+            let mut values: Vec<crate::types::values::OdinValue> = Vec::new();
 
             while !self.is_at_end() {
                 let tok = self.current_token();
                 match tok.token_type {
                     TokenType::Newline | TokenType::Header | TokenType::DocumentSeparator => break,
-                    TokenType::Comment => {
-                        self.advance();
-                        break;
-                    }
-                    TokenType::QuotedString => {
-                        let v = tok.value(self.source).to_string();
-                        self.advance();
-                        current_val = Some(v);
-                        // Check for comma after
-                        if !self.is_at_end() {
-                            if let Some(next) = self.peek() {
-                                if next.token_type == TokenType::Newline
-                                    || next.token_type == TokenType::Header
-                                    || next.token_type == TokenType::Comment
-                                    || next.token_type == TokenType::DocumentSeparator
-                                {
-                                    // End of line
-                                    if let Some(v) = current_val.take() {
-                                        values.push(v);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    TokenType::Path | TokenType::BareWord => {
-                        // Could be a comma, comma+value, or bare value
-                        let v = tok.value(self.source).to_string();
-                        self.advance();
-                        if v == "," {
-                            if let Some(cv) = current_val.take() {
-                                values.push(cv);
-                            }
-                        } else if v.contains(',') {
-                            // Token contains comma-separated values (e.g., `, "Active"`)
-                            if let Some(cv) = current_val.take() {
-                                values.push(cv);
-                            }
-                            for part in v.split(',') {
-                                let trimmed = part.trim().trim_matches('"');
-                                if !trimmed.is_empty() {
-                                    values.push(trimmed.to_string());
+                    TokenType::Comment => { self.advance(); break; }
+                    TokenType::Comma => { self.advance(); continue; }
+                    _ => {
+                        if let Ok((val, consumed)) = parse_values::parse_value(self.tokens, self.pos, self.source) {
+                            self.pos += consumed;
+                            values.push(val);
+                            // Skip directives/garbage until comma or row end.
+                            while !self.is_at_end() {
+                                let t = self.current_token();
+                                match t.token_type {
+                                    TokenType::Comma => { self.advance(); break; }
+                                    TokenType::Newline | TokenType::Header
+                                    | TokenType::Comment | TokenType::DocumentSeparator => break,
+                                    _ => { self.advance(); }
                                 }
                             }
                         } else {
-                            current_val = Some(v);
-                        }
-                    }
-                    _ => {
-                        // Skip unexpected tokens (commas come through as various types)
-                        let v = tok.value(self.source).to_string();
-                        self.advance();
-                        if v == "," {
-                            if let Some(cv) = current_val.take() {
-                                values.push(cv);
-                            }
-                        } else if v.contains(',') {
-                            if let Some(cv) = current_val.take() {
-                                values.push(cv);
-                            }
-                            for part in v.split(',') {
-                                let trimmed = part.trim().trim_matches('"');
-                                if !trimmed.is_empty() {
-                                    values.push(trimmed.to_string());
-                                }
-                            }
+                            self.advance();
                         }
                     }
                 }
             }
-            if let Some(cv) = current_val.take() {
-                values.push(cv);
-            }
 
-            // Skip empty lines
             if values.is_empty() {
                 continue;
             }
@@ -693,19 +643,10 @@ impl<'a> Parser<'a> {
             key_buf.push(']');
             key_buf.push('.');
             let prefix_len = key_buf.len();
-            for (col_idx, col_name) in columns.iter().enumerate() {
-                if let Some(val) = values.get(col_idx) {
-                    key_buf.truncate(prefix_len);
-                    key_buf.push_str(col_name);
-                    metadata.insert(
-                        key_buf.clone(),
-                        crate::types::values::OdinValue::String {
-                            value: val.clone(),
-                            modifiers: None,
-                            directives: vec![],
-                        },
-                    );
-                }
+            for (col_name, val) in columns.iter().zip(values.into_iter()) {
+                key_buf.truncate(prefix_len);
+                key_buf.push_str(col_name);
+                metadata.insert(key_buf.clone(), val);
             }
             row_index += 1;
         }

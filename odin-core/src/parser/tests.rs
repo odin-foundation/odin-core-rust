@@ -280,3 +280,38 @@ fn preserve_comments_off_by_default() {
     let d = Odin::parse(src).unwrap();
     assert_eq!(d.comments.len(), 0);
 }
+
+// ─── Lookup Table ($table) Type Fidelity ───────────────────────────────────
+
+#[test]
+fn lookup_table_preserves_typed_cells() {
+    let src = "{$table.RATE[v, c, base, factor]}\n\"sedan\", \"liability\", ##250, #1.15\n\"truck\", \"collision\", ##300, #1.30\n";
+    let d = Odin::parse(src).unwrap();
+    use crate::types::values::OdinValue;
+    match d.metadata.get(&"table.RATE[0].base".to_string()).unwrap() {
+        OdinValue::Integer { value, .. } => assert_eq!(*value, 250),
+        other => panic!("expected Integer, got {other:?}"),
+    }
+    match d.metadata.get(&"table.RATE[0].factor".to_string()).unwrap() {
+        OdinValue::Number { value, .. } => assert!((value - 1.15).abs() < 1e-9),
+        other => panic!("expected Number, got {other:?}"),
+    }
+    match d.metadata.get(&"table.RATE[1].factor".to_string()).unwrap() {
+        OdinValue::Number { value, .. } => assert!((value - 1.30).abs() < 1e-9),
+        other => panic!("expected Number, got {other:?}"),
+    }
+}
+
+#[test]
+fn lookup_table_dot_prefix_form() {
+    let src = "{$.table.STATUS[code, name, active]}\n\"A\", \"Active\", ?true\n\"P\", \"Pending\", ?false\n";
+    let d = Odin::parse(src).unwrap();
+    use crate::types::values::OdinValue;
+    assert!(matches!(d.metadata.get(&"table.STATUS[0].code".to_string()), Some(OdinValue::String { .. })));
+    match d.metadata.get(&"table.STATUS[0].active".to_string()).unwrap() {
+        OdinValue::Boolean { value, .. } => assert!(*value),
+        other => panic!("expected Boolean, got {other:?}"),
+    }
+}
+
+
