@@ -355,28 +355,49 @@ fn execute_multi_record(
         let record_source = parse_record(line, source_format, delimiter);
         ctx.source = &DynValue::Null; // Not used for multi-record — process_mapping gets source directly
 
-        // Process items in order (preserves interleaved mapping/child order)
+        // Process items in order (preserves interleaved mapping/child order).
+        // For flat segments, items is empty — fall back to mappings.
         let mut record_output = DynValue::Object(Vec::new());
-        for item in &segment.items {
-            match item {
-                crate::types::transform::SegmentItem::Mapping(mapping) => {
-                    if mapping.target == "_type" {
-                        continue; // Skip discriminator mapping
+        if !segment.items.is_empty() {
+            for item in &segment.items {
+                match item {
+                    crate::types::transform::SegmentItem::Mapping(mapping) => {
+                        if mapping.target == "_type" {
+                            continue;
+                        }
+                        process_mapping(mapping, &mut ctx, &record_source, &mut record_output, "");
                     }
-                    process_mapping(mapping, &mut ctx, &record_source, &mut record_output, "");
+                    crate::types::transform::SegmentItem::Child(child_seg) => {
+                        for child_mapping in &child_seg.mappings {
+                            let full_target = format!("{}.{}", child_seg.name, child_mapping.target);
+                            let wrapper = FieldMapping {
+                                target: full_target,
+                                expression: child_mapping.expression.clone(),
+                                directives: child_mapping.directives.clone(),
+                                modifiers: child_mapping.modifiers.clone(),
+                            };
+                            process_mapping(&wrapper, &mut ctx, &record_source, &mut record_output, "");
+                        }
+                    }
                 }
-                crate::types::transform::SegmentItem::Child(child_seg) => {
-                    // Process child segment's mappings (flatten dotted paths)
-                    for child_mapping in &child_seg.mappings {
-                        let full_target = format!("{}.{}", child_seg.name, child_mapping.target);
-                        let wrapper = FieldMapping {
-                            target: full_target,
-                            expression: child_mapping.expression.clone(),
-                            directives: child_mapping.directives.clone(),
-                            modifiers: child_mapping.modifiers.clone(),
-                        };
-                        process_mapping(&wrapper, &mut ctx, &record_source, &mut record_output, "");
-                    }
+            }
+        } else {
+            for mapping in &segment.mappings {
+                if mapping.target == "_type" {
+                    continue;
+                }
+                process_mapping(mapping, &mut ctx, &record_source, &mut record_output, "");
+            }
+            for child_seg in &segment.children {
+                for child_mapping in &child_seg.mappings {
+                    let full_target = format!("{}.{}", child_seg.name, child_mapping.target);
+                    let wrapper = FieldMapping {
+                        target: full_target,
+                        expression: child_mapping.expression.clone(),
+                        directives: child_mapping.directives.clone(),
+                        modifiers: child_mapping.modifiers.clone(),
+                    };
+                    process_mapping(&wrapper, &mut ctx, &record_source, &mut record_output, "");
                 }
             }
         }

@@ -587,35 +587,48 @@ fn build_segment(
         }
     }
 
-    // Build interleaved `items` and the flat `mappings` list together so
-    // each FieldMapping is cloned exactly once per output side.
-    let mut items: Vec<SegmentItem> = Vec::with_capacity(item_order.len());
-    let mut mappings: Vec<FieldMapping> = Vec::with_capacity(item_order.len());
-    for item_ref in item_order {
-        match item_ref {
-            ItemRef::Mapping(m) => {
-                mappings.push(m.clone());
-                items.push(SegmentItem::Mapping(m));
+    // Flat segments (no child refs) only need `mappings` — leave `items`
+    // empty so the engine falls back to the mappings+children path. This
+    // avoids cloning every FieldMapping into both vecs.
+    let has_child_refs = item_order.iter().any(|it| matches!(it, ItemRef::ChildRef(_)));
+
+    let (mappings, items) = if !has_child_refs {
+        let mut mappings = Vec::with_capacity(item_order.len());
+        for item_ref in item_order {
+            if let ItemRef::Mapping(m) = item_ref {
+                mappings.push(m);
             }
-            ItemRef::ChildRef(child_name) => {
-                if let Some(cf) = child_fields.remove(&child_name) {
-                    if needs_child_segment(&child_name, &cf) {
-                        let seg = build_segment(child_name, cf);
-                        children.push(seg.clone());
-                        items.push(SegmentItem::Child(seg));
-                    } else {
-                        // Flatten: emit as dotted-path mappings in order
-                        for (child_field, value, mods) in cf {
-                            let full_target = format!("{child_name}.{child_field}");
-                            let m = build_field_mapping(full_target, value, mods);
-                            mappings.push(m.clone());
-                            items.push(SegmentItem::Mapping(m));
+        }
+        (mappings, Vec::new())
+    } else {
+        let mut items: Vec<SegmentItem> = Vec::with_capacity(item_order.len());
+        let mut mappings: Vec<FieldMapping> = Vec::with_capacity(item_order.len());
+        for item_ref in item_order {
+            match item_ref {
+                ItemRef::Mapping(m) => {
+                    mappings.push(m.clone());
+                    items.push(SegmentItem::Mapping(m));
+                }
+                ItemRef::ChildRef(child_name) => {
+                    if let Some(cf) = child_fields.remove(&child_name) {
+                        if needs_child_segment(&child_name, &cf) {
+                            let seg = build_segment(child_name, cf);
+                            children.push(seg.clone());
+                            items.push(SegmentItem::Child(seg));
+                        } else {
+                            for (child_field, value, mods) in cf {
+                                let full_target = format!("{child_name}.{child_field}");
+                                let m = build_field_mapping(full_target, value, mods);
+                                mappings.push(m.clone());
+                                items.push(SegmentItem::Mapping(m));
+                            }
                         }
                     }
                 }
             }
         }
-    }
+        (mappings, items)
+    };
 
     // Determine if segment is an array (name ends with [])
     let is_array = name.ends_with("[]");
