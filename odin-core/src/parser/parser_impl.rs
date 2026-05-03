@@ -16,6 +16,10 @@ struct Parser<'a> {
     current_header: Option<String>,
     /// Last absolute header path, used to resolve relative headers.
     previous_header: Option<String>,
+    /// Reused per-assignment path buffer.
+    path_buf: String,
+    /// Reused buffer for index-normalized paths (only used when needed).
+    norm_buf: String,
 }
 
 impl<'a> Parser<'a> {
@@ -26,6 +30,8 @@ impl<'a> Parser<'a> {
             options,
             current_header: None,
             previous_header: None,
+            path_buf: String::with_capacity(64),
+            norm_buf: String::with_capacity(64),
         }
     }
 
@@ -298,60 +304,21 @@ impl<'a> Parser<'a> {
                     let path_line = token.line as usize;
                     let path_col = token.column as usize;
 
-                    // Build full path directly from token value — avoids intermediate
-                    // to_string() + format!() double allocation for section fields.
-                    let mut full_path = if let Some(ref header) = self.current_header {
-                        let tv = &token.value;
-                        let mut s = String::with_capacity(header.len() + 1 + tv.len());
-                        s.push_str(header);
-                        s.push('.');
-                        s.push_str(tv);
-                        s
-                    } else {
-                        token.value.to_string()
-                    };
+                    // Build full path into the reused buffer. Single-expression
+                    // call lets the compiler split-borrow `path_buf` from
+                    // `current_header`/`tokens`.
+                    build_path(
+                        &mut self.path_buf,
+                        self.current_header.as_deref(),
+                        &self.tokens[self.pos].value,
+                    );
 
-                    // Normalize leading zeros in array indices: [007] -> [7].
-                    if full_path.as_bytes().contains(&b'[') {
-                        let mut normalized = String::with_capacity(full_path.len());
-                        let mut i = 0;
-                        let bytes = full_path.as_bytes();
-                        while i < bytes.len() {
-                            if bytes[i] == b'[' {
-                                normalized.push('[');
-                                i += 1;
-                                let start = i;
-                                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                                    i += 1;
-                                }
-                                if i > start && i < bytes.len() && bytes[i] == b']' {
-                                    // Parse and re-emit to strip leading zeros. On
-                                    // overflow, preserve the original digits so the
-                                    // validation pass can surface a real error
-                                    // instead of silently collapsing to [0].
-                                    match full_path[start..i].parse::<i64>() {
-                                        Ok(idx) => normalized.push_str(&idx.to_string()),
-                                        Err(_) => normalized.push_str(&full_path[start..i]),
-                                    }
-                                } else {
-                                    // Not a pure-digit index, preserve as-is
-                                    normalized.push_str(&full_path[start..i]);
-                                }
-                            } else {
-                                // Copy the run of non-`[` bytes as a single slice —
-                                // preserves UTF-8 and avoids per-byte push.
-                                let run_end = full_path[i..]
-                                    .as_bytes()
-                                    .iter()
-                                    .position(|&b| b == b'[')
-                                    .map(|p| i + p)
-                                    .unwrap_or(bytes.len());
-                                normalized.push_str(&full_path[i..run_end]);
-                                i = run_end;
-                            }
-                        }
-                        full_path = normalized;
+                    if path_index_needs_normalization(self.path_buf.as_bytes()) {
+                        self.norm_buf.clear();
+                        normalize_path_indices(&self.path_buf, &mut self.norm_buf);
+                        std::mem::swap(&mut self.path_buf, &mut self.norm_buf);
                     }
+                    let full_path = self.path_buf.clone();
 
                     self.advance();
 
@@ -963,6 +930,58 @@ impl<'a> Parser<'a> {
                 }
             }
             row_index += 1;
+        }
+    }
+}
+
+/// Build `header.value` (or just `value`) into `buf`. Reused across assignments.
+fn build_path(buf: &mut String, header: Option<&str>, value: &str) {
+    buf.clear();
+    if let Some(h) = header {
+        buf.push_str(h);
+        buf.push('.');
+    }
+    buf.push_str(value);
+}
+
+/// True if any `[N]` index in `path` has a leading zero (e.g., `[007]`).
+fn path_index_needs_normalization(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'0' && bytes[i + 2].is_ascii_digit() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Rewrite `path` into `out`, stripping leading zeros from numeric `[N]` indices.
+/// Preserves the original digits if they don't fit in `i64` so the validation
+/// pass can surface a real error instead of silently collapsing to `[0]`.
+fn normalize_path_indices(path: &str, out: &mut String) {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            out.push('[');
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start && i < bytes.len() && bytes[i] == b']' {
+                match path[start..i].parse::<i64>() {
+                    Ok(idx) => out.push_str(&idx.to_string()),
+                    Err(_) => out.push_str(&path[start..i]),
+                }
+            } else {
+                out.push_str(&path[start..i]);
+            }
+        } else {
+            let run_end = bytes[i..].iter().position(|&b| b == b'[').map(|p| i + p).unwrap_or(bytes.len());
+            out.push_str(&path[i..run_end]);
+            i = run_end;
         }
     }
 }
