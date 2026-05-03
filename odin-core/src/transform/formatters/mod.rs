@@ -1226,6 +1226,10 @@ pub fn format_odin_with_modifiers(
     modifiers: &std::collections::HashMap<String, crate::types::values::OdinModifiers>,
     include_header: bool,
 ) -> String {
+    // No modifiers: skip per-cell full-path construction.
+    if modifiers.is_empty() {
+        return format_odin(value, include_header);
+    }
     let mut output = String::new();
     if include_header {
         output.push_str("{$}\nodin = \"1.0.0\"\n");
