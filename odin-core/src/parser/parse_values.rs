@@ -302,7 +302,7 @@ fn needs_reference_normalization(bytes: &[u8]) -> bool {
     false
 }
 
-fn parse_number(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
+pub(super) fn parse_number(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
     if raw.is_empty() {
         return Err(ParseError::with_message(
             ParseErrorCode::InvalidTypePrefix, line, col, "empty number after '#'",
@@ -338,7 +338,7 @@ fn parse_number(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseEr
     })
 }
 
-fn parse_integer(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
+pub(super) fn parse_integer(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
     if raw.is_empty() {
         return Err(ParseError::with_message(
             ParseErrorCode::InvalidTypePrefix, line, col, "empty integer after '##'",
@@ -365,7 +365,7 @@ fn parse_integer(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseE
     }
 }
 
-fn parse_currency(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
+pub(super) fn parse_currency(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
     let (num_part, currency_code) = if let Some(colon_pos) = raw.find(':') {
         (&raw[..colon_pos], Some(raw[colon_pos + 1..].to_uppercase()))
     } else {
@@ -397,7 +397,7 @@ fn parse_currency(raw: &str, line: usize, col: usize) -> Result<OdinValue, Parse
     })
 }
 
-fn parse_percent(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
+pub(super) fn parse_percent(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
     let value: f64 = raw.parse().map_err(|_| {
         ParseError::with_message(ParseErrorCode::InvalidTypePrefix, line, col, &format!("invalid percent: {raw}"))
     })?;
@@ -483,7 +483,7 @@ fn base64_decode(input: &str) -> Vec<u8> {
     output
 }
 
-fn parse_date_value(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
+pub(super) fn parse_date_value(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
     let mut iter = raw.split('-');
     let (year_s, month_s, day_s) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
         (Some(y), Some(m), Some(d), None) => (y, m, d),

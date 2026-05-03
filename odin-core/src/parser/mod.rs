@@ -19,6 +19,7 @@ mod tokenizer;
 mod tokens;
 mod parser_impl;
 mod parse_values;
+mod streaming_fast;
 pub mod streaming;
 
 #[cfg(test)]
@@ -44,9 +45,10 @@ pub fn parse(input: &str, options: Option<&ParseOptions>) -> Result<OdinDocument
         Some(o) => o,
         None => { default_opts = ParseOptions::default(); &default_opts }
     };
-    // Tokenizer strips the UTF-8 BOM and produces offsets relative to the
-    // stripped source — pass the same view to the parser.
     let source = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+    if let Some(result) = streaming_fast::try_parse_fast(source, opts) {
+        return result;
+    }
     let tokens = tokenizer::tokenize(source, opts)?;
     parser_impl::parse_tokens(&tokens, source, opts)
 }
