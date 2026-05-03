@@ -1104,10 +1104,8 @@ fn resolve_sub_path(value: &DynValue, path: &str) -> DynValue {
         return value.clone();
     }
 
-    let segments = parse_path_segments(path);
     let mut current = value;
-
-    for seg in &segments {
+    for seg in PathSegmentIter::new(path) {
         match seg {
             PathSegment::Field(name) => {
                 match current.get(name) {
@@ -1116,7 +1114,6 @@ fn resolve_sub_path(value: &DynValue, path: &str) -> DynValue {
                 }
             }
             PathSegment::Index(name, idx) => {
-                // First resolve the field, then index into the array
                 let field_val = if name.is_empty() {
                     current
                 } else {
@@ -1125,7 +1122,7 @@ fn resolve_sub_path(value: &DynValue, path: &str) -> DynValue {
                         None => return DynValue::Null,
                     }
                 };
-                match field_val.get_index(*idx) {
+                match field_val.get_index(idx) {
                     Some(v) => current = v,
                     None => return DynValue::Null,
                 }
@@ -1136,77 +1133,79 @@ fn resolve_sub_path(value: &DynValue, path: &str) -> DynValue {
     current.clone()
 }
 
-/// A single segment of a dotted path.
-enum PathSegment {
-    /// A plain field name.
-    Field(String),
-    /// A field name with an array index, e.g., `items[0]`.
-    Index(String, usize),
+/// A single segment of a dotted path; borrows from the source path string.
+enum PathSegment<'a> {
+    Field(&'a str),
+    Index(&'a str, usize),
 }
 
-/// Parse a dotted path string into segments.
-///
-/// Handles `foo.bar.baz`, `items[0].name`, `[2].field`, etc.
-fn parse_path_segments(path: &str) -> Vec<PathSegment> {
-    let mut segments = Vec::new();
-    let mut remaining = path;
+/// Streams `PathSegment`s without allocating a Vec or per-segment Strings.
+struct PathSegmentIter<'a> {
+    remaining: &'a str,
+}
 
-    while !remaining.is_empty() {
-        // Skip leading dot
-        remaining = remaining.strip_prefix('.').unwrap_or(remaining);
-        if remaining.is_empty() {
-            break;
-        }
-
-        // Check if this segment starts with a bracket (bare index)
-        if remaining.starts_with('[') {
-            if let Some(bracket_end) = remaining.find(']') {
-                let idx_str = &remaining[1..bracket_end];
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    segments.push(PathSegment::Index(String::new(), idx));
-                }
-                remaining = &remaining[bracket_end + 1..];
-                continue;
-            }
-        }
-
-        // Find the end of this segment: next dot or bracket
-        let mut end = remaining.len();
-        let mut bracket_pos = None;
-        for (i, ch) in remaining.char_indices() {
-            if ch == '.' {
-                end = i;
-                break;
-            }
-            if ch == '[' && bracket_pos.is_none() {
-                bracket_pos = Some(i);
-            }
-            if ch == ']' && bracket_pos.is_some() {
-                end = i + 1;
-                break;
-            }
-        }
-
-        let segment_str = &remaining[..end];
-        remaining = &remaining[end..];
-
-        // Check if this segment has an array index
-        if let Some(bracket_start) = segment_str.find('[') {
-            if let Some(bracket_end) = segment_str.find(']') {
-                let field_name = &segment_str[..bracket_start];
-                let idx_str = &segment_str[bracket_start + 1..bracket_end];
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    segments.push(PathSegment::Index(field_name.to_string(), idx));
-                    continue;
-                }
-            }
-        }
-
-        // Plain field name
-        segments.push(PathSegment::Field(segment_str.to_string()));
+impl<'a> PathSegmentIter<'a> {
+    fn new(path: &'a str) -> Self {
+        Self { remaining: path }
     }
+}
 
-    segments
+impl<'a> Iterator for PathSegmentIter<'a> {
+    type Item = PathSegment<'a>;
+
+    fn next(&mut self) -> Option<PathSegment<'a>> {
+        loop {
+            self.remaining = self.remaining.strip_prefix('.').unwrap_or(self.remaining);
+            if self.remaining.is_empty() {
+                return None;
+            }
+
+            // Bare index: `[N]...`
+            if let Some(rest) = self.remaining.strip_prefix('[') {
+                if let Some(bracket_end) = rest.find(']') {
+                    let idx_str = &rest[..bracket_end];
+                    let parsed = idx_str.parse::<usize>().ok();
+                    self.remaining = &rest[bracket_end + 1..];
+                    if let Some(idx) = parsed {
+                        return Some(PathSegment::Index("", idx));
+                    }
+                    continue; // malformed bare index — skip
+                }
+            }
+
+            // Walk to end of segment: stop at `.` or after a matched `]`.
+            let bytes = self.remaining.as_bytes();
+            let mut end = bytes.len();
+            let mut saw_open = false;
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'.' {
+                    end = i;
+                    break;
+                }
+                if b == b'[' {
+                    saw_open = true;
+                } else if b == b']' && saw_open {
+                    end = i + 1;
+                    break;
+                }
+            }
+
+            let segment_str = &self.remaining[..end];
+            self.remaining = &self.remaining[end..];
+
+            if let Some(bracket_start) = segment_str.find('[') {
+                if let Some(bracket_end) = segment_str.find(']') {
+                    let field_name = &segment_str[..bracket_start];
+                    let idx_str = &segment_str[bracket_start + 1..bracket_end];
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        return Some(PathSegment::Index(field_name, idx));
+                    }
+                }
+            }
+
+            return Some(PathSegment::Field(segment_str));
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
