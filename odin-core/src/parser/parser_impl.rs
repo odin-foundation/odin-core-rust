@@ -328,6 +328,12 @@ impl<'a> Parser<'a> {
                     let mut first_bracket: Option<(usize, usize, usize)> = None; // (base_end, idx_start, idx_end)
 
                     let bytes = full_path.as_bytes();
+                    // Fast path: no brackets means just count dots for depth.
+                    // The vast majority of large-doc paths look like
+                    // `section.field` with no array indices at all.
+                    if memchr::memchr(b'[', bytes).is_none() {
+                        depth += memchr::memchr_iter(b'.', bytes).count();
+                    } else {
                     let mut i = 0;
                     while i < bytes.len() {
                         let b = bytes[i];
@@ -382,6 +388,7 @@ impl<'a> Parser<'a> {
                             i += 1;
                         }
                     }
+                    }
 
                     if depth > self.options.max_depth {
                         return Err(ParseError::with_message(
@@ -432,93 +439,82 @@ impl<'a> Parser<'a> {
                     }
                     self.advance(); // consume `=`
 
-                    // Check for duplicate paths
-                    if !self.options.allow_duplicates
-                        && ((in_metadata && metadata.contains_key(&full_path))
-                            || (!in_metadata && assignments.contains_key(&full_path)))
-                        {
-                            return Err(ParseError::with_message(
-                                ParseErrorCode::DuplicatePathAssignment,
-                                path_line, path_col,
-                                &full_path,
-                            ));
-                        }
-
-                    // Parse modifiers and value
                     let (mods, mod_consumed) = parse_values::parse_modifiers(self.tokens, self.pos, self.source);
                     self.pos += mod_consumed;
 
-                    if self.is_at_end() || self.current_token().token_type == TokenType::Newline {
-                        // Empty value — treat as empty string
-                        let value = crate::types::values::OdinValues::string("");
-                        if in_metadata {
-                            metadata.insert(full_path, value);
-                        } else {
-                            assignments.insert(full_path, value);
-                        }
-                        continue;
-                    }
-
-                    let (mut value, consumed) = parse_values::parse_value(self.tokens, self.pos, self.source)?;
-                    self.pos += consumed;
-
-                    // Parse trailing directives (e.g., `:type integer`, `:date`, `:pos 3 :len 8`)
-                    let mut directives = Vec::new();
-                    while !self.is_at_end() {
-                        let tt = self.current_token().token_type;
-                        if tt == TokenType::Newline || tt == TokenType::Comment {
-                            break;
-                        }
-                        if tt == TokenType::Directive {
-                            let dir_name = self.current_token().value(self.source).to_string();
-                            self.advance();
-                            // Check for directive value (next non-newline token)
-                            let dir_value = if self.is_at_end() {
-                                None
-                            } else {
-                                let next_tt = self.current_token().token_type;
-                                if next_tt != TokenType::Newline && next_tt != TokenType::Comment && next_tt != TokenType::Directive {
-                                    let v = self.current_token().value(self.source).to_string();
-                                    self.advance();
-                                    if let Ok(n) = v.parse::<f64>() {
-                                        Some(crate::types::values::DirectiveValue::Number(n))
-                                    } else {
-                                        Some(crate::types::values::DirectiveValue::String(v))
-                                    }
-                                } else {
-                                    None
-                                }
-                            };
-                            directives.push(crate::types::values::OdinDirective { name: dir_name, value: dir_value });
-                        } else {
-                            // Unexpected token after value — P001
-                            let bad = self.current_token();
-                            return Err(ParseError::with_message(
-                                ParseErrorCode::UnexpectedCharacter,
-                                bad.line as usize, bad.column as usize,
-                                &format!("Unexpected content after value: {:?}", bad.value(self.source)),
-                            ));
-                        }
-                    }
-                    if !directives.is_empty() {
-                        value = value.with_directives(directives);
-                    }
-
-                    // Apply modifiers to value
-                    if mods.has_any() {
-                        value = value.with_modifiers(mods.clone());
-                        modifiers.insert(full_path.clone(), mods);
-                    }
-
-                    if in_metadata {
-                        // Store in metadata only (canonical stringify merges as $.key)
-                        metadata.insert(full_path, value);
-                    } else if full_path.starts_with("$.") {
-                        // Canonical metadata path: $.key — store in metadata only
-                        let bare_key = full_path[2..].to_string();
-                        metadata.insert(bare_key, value);
+                    // Empty value (line ends right after `=`) — treat as empty string
+                    // and skip modifier/directive application to match prior behavior.
+                    let final_value = if self.is_at_end() || self.current_token().token_type == TokenType::Newline {
+                        crate::types::values::OdinValues::string("")
                     } else {
-                        assignments.insert(full_path, value);
+                        let (mut value, consumed) = parse_values::parse_value(self.tokens, self.pos, self.source)?;
+                        self.pos += consumed;
+
+                        // Trailing directives: `:type integer`, `:date`, `:pos 3 :len 8`, ...
+                        let mut directives = Vec::new();
+                        while !self.is_at_end() {
+                            let tt = self.current_token().token_type;
+                            if tt == TokenType::Newline || tt == TokenType::Comment { break; }
+                            if tt == TokenType::Directive {
+                                let dir_name = self.current_token().value(self.source).to_string();
+                                self.advance();
+                                let dir_value = if self.is_at_end() {
+                                    None
+                                } else {
+                                    let next_tt = self.current_token().token_type;
+                                    if next_tt != TokenType::Newline && next_tt != TokenType::Comment && next_tt != TokenType::Directive {
+                                        let v = self.current_token().value(self.source).to_string();
+                                        self.advance();
+                                        if let Ok(n) = v.parse::<f64>() {
+                                            Some(crate::types::values::DirectiveValue::Number(n))
+                                        } else {
+                                            Some(crate::types::values::DirectiveValue::String(v))
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                };
+                                directives.push(crate::types::values::OdinDirective { name: dir_name, value: dir_value });
+                            } else {
+                                let bad = self.current_token();
+                                return Err(ParseError::with_message(
+                                    ParseErrorCode::UnexpectedCharacter,
+                                    bad.line as usize, bad.column as usize,
+                                    &format!("Unexpected content after value: {:?}", bad.value(self.source)),
+                                ));
+                            }
+                        }
+                        if !directives.is_empty() { value = value.with_directives(directives); }
+                        if mods.has_any() {
+                            value = value.with_modifiers(mods.clone());
+                            modifiers.insert(full_path.clone(), mods);
+                        }
+                        value
+                    };
+
+                    // Compute final key + target map, then fuse the dup check
+                    // and insert into a single hash lookup via entry-API.
+                    let (key, target_is_metadata) = if in_metadata {
+                        (full_path, true)
+                    } else if full_path.starts_with("$.") {
+                        (full_path[2..].to_string(), true)
+                    } else {
+                        (full_path, false)
+                    };
+                    let target = if target_is_metadata { &mut metadata } else { &mut assignments };
+                    if self.options.allow_duplicates {
+                        target.insert(key, final_value);
+                    } else {
+                        match target.entry(key) {
+                            indexmap::map::Entry::Occupied(o) => {
+                                return Err(ParseError::with_message(
+                                    ParseErrorCode::DuplicatePathAssignment,
+                                    path_line, path_col,
+                                    o.key(),
+                                ));
+                            }
+                            indexmap::map::Entry::Vacant(e) => { e.insert(final_value); }
+                        }
                     }
                 }
                 TokenType::Newline | TokenType::Comment => {

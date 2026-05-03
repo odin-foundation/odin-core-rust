@@ -59,6 +59,11 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> OrderedMap<K, V> {
         self.inner.insert(key, value)
     }
 
+    /// Entry API for fused contains+insert in a single hash lookup.
+    pub fn entry(&mut self, key: K) -> indexmap::map::Entry<'_, K, V> {
+        self.inner.entry(key)
+    }
+
     pub fn get(&self, key: &K) -> Option<&V> {
         self.inner.get(key)
     }

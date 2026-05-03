@@ -25,6 +25,8 @@ itoa = "1.0"
 rustc-hash = "2"
 # Insertion-order-preserving map with single-storage keys.
 indexmap = "2"
+# SIMD-accelerated byte search for tokenizer hot scans.
+memchr = "2"
 
 # JSON parsing/serialization
 serde = { version = "1.0", features = ["derive"] }

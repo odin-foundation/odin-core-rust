@@ -91,11 +91,9 @@ impl<'a> Tokenizer<'a> {
 
     #[inline]
     fn skip_whitespace(&mut self) {
-        while !self.is_at_end() {
-            match self.peek() {
-                Some(b' ' | b'\t') => { self.advance(); }
-                _ => break,
-            }
+        // Bypass advance()'s `\n` check — we already know the byte is space/tab.
+        while let Some(b' ' | b'\t') = self.peek() {
+            self.pos += 1;
         }
     }
 
@@ -109,10 +107,12 @@ impl<'a> Tokenizer<'a> {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
-        self.advance(); // skip `;`
-        while !self.is_at_end() && self.peek() != Some(b'\n') {
-            self.advance();
-        }
+        // Comments contain no newlines by definition; SIMD-search for the
+        // line terminator (or run to EOF).
+        self.pos = match memchr::memchr(b'\n', &self.bytes[self.pos..]) {
+            Some(off) => self.pos + off,
+            None => self.bytes.len(),
+        };
         self.make(TokenType::Comment, start, self.pos, start_line, start_col)
     }
 
@@ -123,19 +123,16 @@ impl<'a> Tokenizer<'a> {
         self.advance(); // skip opening `"`
         let content_start = self.pos;
 
-        // Peek ahead: check if string has escapes or newlines.
+        // SIMD-accelerated search for the first interesting byte.
         // UTF-8 safety: continuation bytes (0x80-0xBF) never equal ASCII bytes,
-        // so scanning for `"`, `\`, `\n` byte-by-byte is safe even with multi-byte chars.
-        let mut peek_pos = content_start;
-        let mut needs_processing = false;
-        while peek_pos < self.bytes.len() {
-            match self.bytes[peek_pos] {
-                b'"' => break,
-                b'\\' | b'\n' => { needs_processing = true; break; }
-                _ => peek_pos += 1,
+        // so scanning for `"`, `\`, `\n` byte-wise is safe even with multi-byte chars.
+        let (peek_pos, needs_processing) = match memchr::memchr3(b'"', b'\\', b'\n', &self.bytes[content_start..]) {
+            Some(off) => {
+                let p = content_start + off;
+                (p, self.bytes[p] != b'"')
             }
-        }
-        if peek_pos >= self.bytes.len() { needs_processing = true; } // unterminated
+            None => (self.bytes.len(), true), // unterminated
+        };
 
         if !needs_processing {
             // Fast path: no escapes, value is the bytes between the quotes.
@@ -789,7 +786,9 @@ pub fn tokenize<'a>(source: &'a str, options: &ParseOptions) -> Result<Vec<Token
     }
 
     let mut tokenizer = Tokenizer::new(source);
-    let estimated_size = source.len() / 12 + 16;
+    // Scalar-heavy ODIN docs run ~7-8 bytes per token; previous /12 estimate
+    // forced a realloc partway through tokenization for typical inputs.
+    let estimated_size = source.len() / 8 + 16;
     let mut tokens = Vec::with_capacity(estimated_size);
 
     while !tokenizer.is_at_end() {
