@@ -44,8 +44,11 @@ pub fn parse(input: &str, options: Option<&ParseOptions>) -> Result<OdinDocument
         Some(o) => o,
         None => { default_opts = ParseOptions::default(); &default_opts }
     };
-    let tokens = tokenizer::tokenize(input, opts)?;
-    parser_impl::parse_tokens(&tokens, input, opts)
+    // Tokenizer strips the UTF-8 BOM and produces offsets relative to the
+    // stripped source — pass the same view to the parser.
+    let source = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+    let tokens = tokenizer::tokenize(source, opts)?;
+    parser_impl::parse_tokens(&tokens, source, opts)
 }
 
 /// Parse ODIN text into a chain of documents.
@@ -61,6 +64,7 @@ pub fn parse_documents(input: &str, options: Option<&ParseOptions>) -> Result<Ve
         Some(o) => o,
         None => { default_opts = ParseOptions::default(); &default_opts }
     };
-    let tokens = tokenizer::tokenize(input, opts)?;
-    parser_impl::parse_tokens_multi(&tokens, input, opts)
+    let source = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+    let tokens = tokenizer::tokenize(source, opts)?;
+    parser_impl::parse_tokens_multi(&tokens, source, opts)
 }

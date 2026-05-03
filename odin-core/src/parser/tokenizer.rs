@@ -99,19 +99,13 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    /// Create a token borrowing directly from the source text (zero allocation).
+    /// Construct a token whose logical value is `&source[value_start..value_end]`.
     #[inline]
-    fn make_borrowed(&self, token_type: TokenType, start: usize, start_line: usize, start_col: usize, value: &'a str) -> Token<'a> {
-        Token::borrowed(token_type, start, self.pos, start_line, start_col, value)
+    fn make(&self, token_type: TokenType, value_start: usize, value_end: usize, line: usize, col: usize) -> Token {
+        Token::new(token_type, value_start, value_end, line, col)
     }
 
-    /// Create a token with an owned (allocated) value.
-    #[inline]
-    fn make_owned(&self, token_type: TokenType, start: usize, start_line: usize, start_col: usize, value: String) -> Token<'a> {
-        Token::owned(token_type, start, self.pos, start_line, start_col, value)
-    }
-
-    fn scan_comment(&mut self) -> Token<'a> {
+    fn scan_comment(&mut self) -> Token {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -119,10 +113,10 @@ impl<'a> Tokenizer<'a> {
         while !self.is_at_end() && self.peek() != Some(b'\n') {
             self.advance();
         }
-        self.make_borrowed(TokenType::Comment, start, start_line, start_col, &self.source[start..self.pos])
+        self.make(TokenType::Comment, start, self.pos, start_line, start_col)
     }
 
-    fn scan_quoted_string(&mut self) -> Result<Token<'a>, ParseError> {
+    fn scan_quoted_string(&mut self) -> Result<Token, ParseError> {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -144,62 +138,47 @@ impl<'a> Tokenizer<'a> {
         if peek_pos >= self.bytes.len() { needs_processing = true; } // unterminated
 
         if !needs_processing {
-            // Fast path: no escapes, borrow directly from source.
-            // No newlines in content, so column is derived from pos.
+            // Fast path: no escapes, value is the bytes between the quotes.
             let content_end = peek_pos;
             self.pos = content_end;
             self.advance(); // skip closing `"`
-            return Ok(self.make_borrowed(
-                TokenType::QuotedString, start, start_line, start_col,
-                &self.source[content_start..content_end],
-            ));
+            return Ok(self.make(TokenType::QuotedString, content_start, content_end, start_line, start_col));
         }
 
-        // Slow path: escapes, newlines, or unterminated — need full processing
-        let mut value = String::new();
-
+        // Slow path: escapes / newlines / unterminated. Walk to the end without
+        // unescaping; emit QuotedStringEscaped with the raw content range and
+        // let parse_value handle the unescape on demand.
+        let _ = start;
         while !self.is_at_end() {
             let ch = self.current_byte();
             if ch == b'"' {
+                let content_end = self.pos;
                 self.advance(); // skip closing `"`
-                return Ok(self.make_owned(TokenType::QuotedString, start, start_line, start_col, value));
+                return Ok(self.make(TokenType::QuotedStringEscaped, content_start, content_end, start_line, start_col));
             }
             if ch == b'\\' {
                 self.advance();
                 if self.is_at_end() {
                     return Err(ParseError::new(ParseErrorCode::UnterminatedString, start_line, start_col));
                 }
+                // Validate the escape character so the tokenizer rejects bad
+                // sequences as early as today; the actual translation happens
+                // in `unescape_quoted` during value construction.
                 let esc = self.advance();
                 match esc {
-                    b'n' => value.push('\n'),
-                    b'r' => value.push('\r'),
-                    b't' => value.push('\t'),
-                    b'\\' => value.push('\\'),
-                    b'"' => value.push('"'),
-                    b'/' => value.push('/'),
-                    b'0' => value.push('\0'),
+                    b'n' | b'r' | b't' | b'\\' | b'"' | b'/' | b'0' => {}
                     b'u' => {
-                        let ch = self.scan_unicode_escape(4, start_line, start_col)?;
-                        if (0xD800..=0xDBFF).contains(&(ch as u32)) {
-                            if self.peek() == Some(b'\\') && self.peek_at(1) == Some(b'u') {
-                                self.advance();
-                                self.advance();
-                                let low = self.scan_unicode_escape(4, start_line, start_col)?;
-                                let low_code = low as u32;
-                                if (0xDC00..=0xDFFF).contains(&low_code) {
-                                    let code = 0x10000 + ((ch as u32 - 0xD800) << 10) + (low_code - 0xDC00);
-                                    if let Some(c) = char::from_u32(code) {
-                                        value.push(c);
-                                    }
-                                }
-                            }
-                        } else {
-                            value.push(ch);
+                        // consume 4 hex digits (validation only)
+                        let _ = self.scan_unicode_escape(4, start_line, start_col)?;
+                        // optional surrogate continuation: \uXXXX (low surrogate)
+                        if self.peek() == Some(b'\\') && self.peek_at(1) == Some(b'u') {
+                            self.advance();
+                            self.advance();
+                            let _ = self.scan_unicode_escape(4, start_line, start_col)?;
                         }
                     }
                     b'U' => {
-                        let ch = self.scan_unicode_escape(8, start_line, start_col)?;
-                        value.push(ch);
+                        let _ = self.scan_unicode_escape(8, start_line, start_col)?;
                     }
                     _ => {
                         return Err(ParseError::with_message(
@@ -212,11 +191,8 @@ impl<'a> Tokenizer<'a> {
             } else if ch == b'\n' {
                 return Err(ParseError::new(ParseErrorCode::UnterminatedString, start_line, start_col));
             } else if ch >= 0x80 {
-                if let Some(c) = self.advance_utf8_char() {
-                    value.push(c);
-                }
+                let _ = self.advance_utf8_char();
             } else {
-                value.push(ch as char);
                 self.advance();
             }
         }
@@ -253,7 +229,7 @@ impl<'a> Tokenizer<'a> {
         })
     }
 
-    fn scan_header(&mut self) -> Result<Token<'a>, ParseError> {
+    fn scan_header(&mut self) -> Result<Token, ParseError> {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -294,7 +270,9 @@ impl<'a> Tokenizer<'a> {
                         }
                     }
                 }
-                return Ok(self.make_borrowed(TokenType::Header, start, start_line, start_col, value));
+                let content_end = content_start + value.len();
+                let _ = start;
+                return Ok(self.make(TokenType::Header, content_start, content_end, start_line, start_col));
             }
             if ch == b'\n' {
                 return Err(ParseError::new(ParseErrorCode::InvalidHeaderSyntax, start_line, start_col));
@@ -305,7 +283,7 @@ impl<'a> Tokenizer<'a> {
         Err(ParseError::new(ParseErrorCode::InvalidHeaderSyntax, start_line, start_col))
     }
 
-    fn scan_identifier(&mut self) -> Result<Token<'a>, ParseError> {
+    fn scan_identifier(&mut self) -> Result<Token, ParseError> {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -355,12 +333,12 @@ impl<'a> Tokenizer<'a> {
         }
 
         match value {
-            "true" | "false" => Ok(self.make_borrowed(TokenType::BooleanLiteral, start, start_line, start_col, value)),
-            _ => Ok(self.make_borrowed(TokenType::Path, start, start_line, start_col, value)),
+            "true" | "false" => Ok(self.make(TokenType::BooleanLiteral, start, self.pos, start_line, start_col)),
+            _ => Ok(self.make(TokenType::Path, start, self.pos, start_line, start_col)),
         }
     }
 
-    fn scan_bare_value(&mut self) -> Token<'a> {
+    fn scan_bare_value(&mut self) -> Token {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -383,8 +361,9 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        let value = self.source[start..self.pos].trim_end();
-        self.make_borrowed(TokenType::BareWord, start, start_line, start_col, value)
+        let raw = &self.source[start..self.pos];
+        let trimmed_end = start + raw.trim_end().len();
+        self.make(TokenType::BareWord, start, trimmed_end, start_line, start_col)
     }
 
     /// Advance past a numeric value (digits, decimal point, scientific notation).
@@ -403,16 +382,16 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Scan a standalone number token (e.g., bare `42` or `3.14` in value position).
-    fn scan_number(&mut self) -> Token<'a> {
+    fn scan_number(&mut self) -> Token {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
         self.scan_number_inline();
-        self.make_borrowed(TokenType::NumericLiteral, start, start_line, start_col, &self.source[start..self.pos])
+        self.make(TokenType::NumericLiteral, start, self.pos, start_line, start_col)
     }
 
     /// Scan a date or timestamp value starting with YYYY-...
-    fn scan_date_or_timestamp(&mut self) -> Token<'a> {
+    fn scan_date_or_timestamp(&mut self) -> Token {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -427,13 +406,13 @@ impl<'a> Tokenizer<'a> {
         let value = &self.source[start..self.pos];
 
         if value.contains('T') {
-            self.make_borrowed(TokenType::TimestampLiteral, start, start_line, start_col, value)
+            self.make(TokenType::TimestampLiteral, start, self.pos, start_line, start_col)
         } else {
-            self.make_borrowed(TokenType::DateLiteral, start, start_line, start_col, value)
+            self.make(TokenType::DateLiteral, start, self.pos, start_line, start_col)
         }
     }
 
-    fn scan_time(&mut self) -> Token<'a> {
+    fn scan_time(&mut self) -> Token {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -445,10 +424,10 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        self.make_borrowed(TokenType::TimeLiteral, start, start_line, start_col, &self.source[start..self.pos])
+        self.make(TokenType::TimeLiteral, start, self.pos, start_line, start_col)
     }
 
-    fn scan_duration(&mut self) -> Token<'a> {
+    fn scan_duration(&mut self) -> Token {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -462,10 +441,10 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        self.make_borrowed(TokenType::DurationLiteral, start, start_line, start_col, &self.source[start..self.pos])
+        self.make(TokenType::DurationLiteral, start, self.pos, start_line, start_col)
     }
 
-    fn scan_directive(&mut self) -> Token<'a> {
+    fn scan_directive(&mut self) -> Token {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -481,11 +460,11 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        self.make_borrowed(TokenType::Directive, start, start_line, start_col, &self.source[name_start..self.pos])
+        self.make(TokenType::Directive, name_start, self.pos, start_line, start_col)
     }
 
     /// Scan an @ directive or reference.
-    fn scan_at(&mut self) -> Result<Token<'a>, ParseError> {
+    fn scan_at(&mut self) -> Result<Token, ParseError> {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -511,7 +490,9 @@ impl<'a> Tokenizer<'a> {
                 } else {
                     rest
                 };
-                Ok(self.make_borrowed(TokenType::Import, start, start_line, start_col, rest))
+                let rest_end = rest_start + rest.len();
+                let _ = start;
+                Ok(self.make(TokenType::Import, rest_start, rest_end, start_line, start_col))
             }
             "schema" => {
                 self.skip_whitespace();
@@ -525,7 +506,8 @@ impl<'a> Tokenizer<'a> {
                 } else {
                     rest
                 };
-                Ok(self.make_borrowed(TokenType::Schema, start, start_line, start_col, rest))
+                let rest_end = rest_start + rest.len();
+                Ok(self.make(TokenType::Schema, rest_start, rest_end, start_line, start_col))
             }
             "if" => {
                 self.skip_whitespace();
@@ -539,7 +521,8 @@ impl<'a> Tokenizer<'a> {
                 } else {
                     rest
                 };
-                Ok(self.make_borrowed(TokenType::Conditional, start, start_line, start_col, rest))
+                let rest_end = rest_start + rest.len();
+                Ok(self.make(TokenType::Conditional, rest_start, rest_end, start_line, start_col))
             }
             "" => {
                 if start_col == 1 {
@@ -549,7 +532,7 @@ impl<'a> Tokenizer<'a> {
                         "Unexpected character: @",
                     ));
                 }
-                Ok(self.make_borrowed(TokenType::ReferencePrefix, start, start_line, start_col, ""))
+                Ok(self.make(TokenType::ReferencePrefix, word_start, word_start, start_line, start_col))
             }
             _ => {
                 if start_col == 1 && !word.contains('[') && !word.contains('.') {
@@ -559,41 +542,16 @@ impl<'a> Tokenizer<'a> {
                         &format!("Invalid directive: @{word}"),
                     ));
                 }
-                // Normalize array indices (e.g., [007] -> [7])
-                let needs_norm = word.contains('[');
-                if needs_norm {
-                    let mut result = String::with_capacity(word.len());
-                    let bytes = word.as_bytes();
-                    let mut i = 0;
-                    while i < bytes.len() {
-                        if bytes[i] == b'[' {
-                            result.push('[');
-                            i += 1;
-                            let idx_start = i;
-                            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                                i += 1;
-                            }
-                            if i > idx_start && i < bytes.len() && bytes[i] == b']' {
-                                let idx: i64 = word[idx_start..i].parse().unwrap_or(0);
-                                result.push_str(&idx.to_string());
-                            } else {
-                                result.push_str(&word[idx_start..i]);
-                            }
-                        } else {
-                            result.push(bytes[i] as char);
-                            i += 1;
-                        }
-                    }
-                    Ok(self.make_owned(TokenType::ReferencePrefix, start, start_line, start_col, result))
-                } else {
-                    Ok(self.make_borrowed(TokenType::ReferencePrefix, start, start_line, start_col, word))
-                }
+                // Emit the raw text; consumers (parse_value) normalize
+                // leading-zero array indices on demand.
+                let _ = word;
+                Ok(self.make(TokenType::ReferencePrefix, word_start, self.pos, start_line, start_col))
             }
         }
     }
 
     /// Scan an extension path: &com.acme.field
-    fn scan_extension_path(&mut self) -> Token<'a> {
+    fn scan_extension_path(&mut self) -> Token {
         let start = self.pos;
         let start_line = self.line;
         let start_col = self.column();
@@ -603,10 +561,10 @@ impl<'a> Tokenizer<'a> {
             self.advance();
         }
         // source[start..self.pos] includes the `&` prefix
-        self.make_borrowed(TokenType::Path, start, start_line, start_col, &self.source[start..self.pos])
+        self.make(TokenType::Path, start, self.pos, start_line, start_col)
     }
 
-    fn next_token(&mut self) -> Result<Option<Token<'a>>, ParseError> {
+    fn next_token(&mut self) -> Result<Option<Token>, ParseError> {
         self.skip_whitespace();
 
         if self.is_at_end() {
@@ -621,25 +579,25 @@ impl<'a> Tokenizer<'a> {
         match ch {
             b'\n' => {
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::Newline, start_pos, self.pos, start_line, start_col, "\n")))
+                Ok(Some(Token::new(TokenType::Newline, start_pos, self.pos, start_line, start_col)))
             }
             b'\r' => {
                 self.advance();
                 if self.peek() == Some(b'\n') {
                     self.advance();
                 }
-                Ok(Some(Token::borrowed(TokenType::Newline, start_pos, self.pos, start_line, start_col, "\n")))
+                Ok(Some(Token::new(TokenType::Newline, start_pos, self.pos, start_line, start_col)))
             }
             b';' => Ok(Some(self.scan_comment())),
             b'{' => Ok(Some(self.scan_header()?)),
             b'=' => {
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::Equals, start_pos, self.pos, start_line, start_col, "=")))
+                Ok(Some(Token::new(TokenType::Equals, start_pos, self.pos, start_line, start_col)))
             }
             b'"' => Ok(Some(self.scan_quoted_string()?)),
             b'~' => {
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::Null, start_pos, self.pos, start_line, start_col, "~")))
+                Ok(Some(Token::new(TokenType::Null, start_pos, self.pos, start_line, start_col)))
             }
             b'@' => Ok(Some(self.scan_at()?)),
             b'^' => {
@@ -648,7 +606,7 @@ impl<'a> Tokenizer<'a> {
                 while !self.is_at_end() && !matches!(self.peek(), Some(b'\n' | b'\r' | b' ' | b'\t' | b';')) {
                     self.advance();
                 }
-                Ok(Some(self.make_borrowed(TokenType::BinaryPrefix, start_pos, start_line, start_col, &self.source[val_start..self.pos])))
+                Ok(Some(self.make(TokenType::BinaryPrefix, val_start, self.pos, start_line, start_col)))
             }
             b'#' => {
                 self.advance();
@@ -658,7 +616,7 @@ impl<'a> Tokenizer<'a> {
                         self.advance();
                         let val_start = self.pos;
                         self.scan_number_inline();
-                        Ok(Some(self.make_borrowed(TokenType::IntegerPrefix, start_pos, start_line, start_col, &self.source[val_start..self.pos])))
+                        Ok(Some(self.make(TokenType::IntegerPrefix, val_start, self.pos, start_line, start_col)))
                     }
                     Some(b'$') => {
                         // Currency prefix #$
@@ -672,20 +630,20 @@ impl<'a> Tokenizer<'a> {
                                 self.advance();
                             }
                         }
-                        Ok(Some(self.make_borrowed(TokenType::CurrencyPrefix, start_pos, start_line, start_col, &self.source[val_start..self.pos])))
+                        Ok(Some(self.make(TokenType::CurrencyPrefix, val_start, self.pos, start_line, start_col)))
                     }
                     Some(b'%') => {
                         // Percent prefix #%
                         self.advance();
                         let val_start = self.pos;
                         self.scan_number_inline();
-                        Ok(Some(self.make_borrowed(TokenType::PercentPrefix, start_pos, start_line, start_col, &self.source[val_start..self.pos])))
+                        Ok(Some(self.make(TokenType::PercentPrefix, val_start, self.pos, start_line, start_col)))
                     }
                     Some(b'0'..=b'9' | b'-' | b'.') => {
                         // Number prefix #
                         let val_start = self.pos;
                         self.scan_number_inline();
-                        Ok(Some(self.make_borrowed(TokenType::NumberPrefix, start_pos, start_line, start_col, &self.source[val_start..self.pos])))
+                        Ok(Some(self.make(TokenType::NumberPrefix, val_start, self.pos, start_line, start_col)))
                     }
                     _ => {
                         Err(ParseError::with_message(
@@ -698,7 +656,7 @@ impl<'a> Tokenizer<'a> {
             }
             b'?' => {
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::BooleanPrefix, start_pos, self.pos, start_line, start_col, "?")))
+                Ok(Some(Token::new(TokenType::BooleanPrefix, start_pos, self.pos, start_line, start_col)))
             }
             b'%' => {
                 self.advance();
@@ -709,15 +667,15 @@ impl<'a> Tokenizer<'a> {
                 while !self.is_at_end() && matches!(self.peek(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.')) {
                     self.advance();
                 }
-                Ok(Some(self.make_borrowed(TokenType::VerbPrefix, start_pos, start_line, start_col, &self.source[name_start..self.pos])))
+                Ok(Some(self.make(TokenType::VerbPrefix, name_start, self.pos, start_line, start_col)))
             }
             b'!' => {
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::Modifier, start_pos, self.pos, start_line, start_col, "!")))
+                Ok(Some(Token::new(TokenType::Modifier, start_pos, self.pos, start_line, start_col)))
             }
             b'*' => {
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::Modifier, start_pos, self.pos, start_line, start_col, "*")))
+                Ok(Some(Token::new(TokenType::Modifier, start_pos, self.pos, start_line, start_col)))
             }
             b'-' => {
                 // Check for document separator `---`
@@ -725,7 +683,7 @@ impl<'a> Tokenizer<'a> {
                     self.advance();
                     self.advance();
                     self.advance();
-                    return Ok(Some(Token::borrowed(TokenType::DocumentSeparator, start_pos, self.pos, start_line, start_col, "---")));
+                    return Ok(Some(Token::new(TokenType::DocumentSeparator, start_pos, self.pos, start_line, start_col)));
                 }
                 // Check if this is a deprecated modifier before a date: -YYYY-MM-DD
                 if self.peek_at(1).is_some_and(|c| c.is_ascii_digit())
@@ -735,7 +693,7 @@ impl<'a> Tokenizer<'a> {
                     && self.peek_at(5) == Some(b'-')
                 {
                     self.advance();
-                    return Ok(Some(Token::borrowed(TokenType::Modifier, start_pos, self.pos, start_line, start_col, "-")));
+                    return Ok(Some(Token::new(TokenType::Modifier, start_pos, self.pos, start_line, start_col)));
                 }
                 // Check if this is a negative number (followed by digit)
                 if self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) {
@@ -743,18 +701,18 @@ impl<'a> Tokenizer<'a> {
                 }
                 // Otherwise it's a deprecated modifier
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::Modifier, start_pos, self.pos, start_line, start_col, "-")))
+                Ok(Some(Token::new(TokenType::Modifier, start_pos, self.pos, start_line, start_col)))
             }
             b',' => {
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::Comma, start_pos, self.pos, start_line, start_col, ",")))
+                Ok(Some(Token::new(TokenType::Comma, start_pos, self.pos, start_line, start_col)))
             }
             b':' => {
                 Ok(Some(self.scan_directive()))
             }
             b'|' => {
                 self.advance();
-                Ok(Some(Token::borrowed(TokenType::Pipe, start_pos, self.pos, start_line, start_col, "|")))
+                Ok(Some(Token::new(TokenType::Pipe, start_pos, self.pos, start_line, start_col)))
             }
             b'0'..=b'9' => {
                 if self.looks_like_date() {
@@ -821,7 +779,7 @@ fn find_comment_start(s: &str) -> Option<usize> {
 }
 
 /// Tokenize ODIN source text into a vector of tokens.
-pub fn tokenize<'a>(source: &'a str, options: &ParseOptions) -> Result<Vec<Token<'a>>, ParseError> {
+pub fn tokenize<'a>(source: &'a str, options: &ParseOptions) -> Result<Vec<Token>, ParseError> {
     if source.len() > options.max_size {
         return Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1));
     }
@@ -840,13 +798,12 @@ pub fn tokenize<'a>(source: &'a str, options: &ParseOptions) -> Result<Vec<Token
         }
     }
 
-    tokens.push(Token::borrowed(
+    tokens.push(Token::new(
         TokenType::Eof,
         tokenizer.pos,
         tokenizer.pos,
         tokenizer.line,
         tokenizer.column(),
-        "",
     ));
 
     Ok(tokens)
@@ -861,9 +818,40 @@ mod tests {
         ParseOptions::default()
     }
 
-    /// Helper: tokenize and strip Newline/Eof for cleaner assertions.
-    fn tok(input: &str) -> Vec<Token<'_>> {
+    /// Test-only token wrapper: eagerly resolves `value` (and unescapes
+    /// `QuotedStringEscaped` to `QuotedString`) so existing tests keep their
+    /// `tokens[i].value` field-access pattern working.
+    pub struct TestToken {
+        pub token_type: TokenType,
+        pub value: String,
+        pub start: u32,
+        pub end: u32,
+        pub line: u32,
+        pub column: u32,
+    }
+
+    /// Helper: tokenize and return value-resolved tokens for assertions.
+    fn tok(input: &str) -> Vec<TestToken> {
         tokenize(input, &opts()).unwrap()
+            .into_iter()
+            .map(|t| {
+                let raw = t.value(input);
+                let (token_type, value) = match t.token_type {
+                    TokenType::QuotedStringEscaped => {
+                        (TokenType::QuotedString, super::super::parse_values::unescape_string(raw))
+                    }
+                    other => (other, raw.to_string()),
+                };
+                TestToken {
+                    token_type,
+                    value,
+                    start: t.start,
+                    end: t.end,
+                    line: t.line,
+                    column: t.column,
+                }
+            })
+            .collect()
     }
 
     fn types(input: &str) -> Vec<TokenType> {
@@ -871,7 +859,7 @@ mod tests {
     }
 
     fn values(input: &str) -> Vec<String> {
-        tok(input).iter().map(|t| t.value.to_string()).collect()
+        tok(input).iter().map(|t| t.value.clone()).collect()
     }
 
     // ── Empty / minimal input ─────────────────────────────────────────────

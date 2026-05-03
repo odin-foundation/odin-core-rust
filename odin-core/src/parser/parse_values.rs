@@ -7,120 +7,110 @@ use super::tokens::{Token, TokenType};
 /// Parse a value from a sequence of tokens starting at the given position.
 ///
 /// Returns the parsed value and the number of tokens consumed.
-pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, usize), ParseError> {
+pub fn parse_value(tokens: &[Token], pos: usize, source: &str) -> Result<(OdinValue, usize), ParseError> {
     if pos >= tokens.len() {
         return Err(ParseError::new(ParseErrorCode::UnexpectedCharacter, 0, 0));
     }
 
     let token = &tokens[pos];
+    let v = token.value(source);
 
     match token.token_type {
         TokenType::Null => Ok((OdinValues::null(), 1)),
         TokenType::BooleanLiteral => {
-            let value = token.value == "true";
-            Ok((OdinValues::boolean(value), 1))
+            Ok((OdinValues::boolean(v == "true"), 1))
         }
         TokenType::BooleanPrefix => {
-            // ?true or ?false — consume next token
             if pos + 1 < tokens.len() {
                 let next = &tokens[pos + 1];
-                match next.value.as_ref() {
+                match next.value(source) {
                     "true" => Ok((OdinValues::boolean(true), 2)),
                     "false" => Ok((OdinValues::boolean(false), 2)),
-                    _ => {
-                        // Just `?` alone — treat as boolean true
-                        Ok((OdinValues::boolean(true), 1))
-                    }
+                    _ => Ok((OdinValues::boolean(true), 1)),
                 }
             } else {
                 Ok((OdinValues::boolean(true), 1))
             }
         }
         TokenType::QuotedString => {
-            Ok((OdinValues::string(&*token.value), 1))
+            Ok((OdinValues::string(v), 1))
+        }
+        TokenType::QuotedStringEscaped => {
+            let unescaped = unescape_string(v);
+            Ok((OdinValues::string(unescaped), 1))
         }
         TokenType::BareWord => {
-            // Check for boolean bare words
-            match token.value.as_ref() {
+            match v {
                 "true" => Ok((OdinValues::boolean(true), 1)),
                 "false" => Ok((OdinValues::boolean(false), 1)),
                 _ => {
-                    // Bare strings are not allowed in ODIN
                     Err(ParseError::with_message(
                         ParseErrorCode::BareStringNotAllowed,
                         token.line as usize, token.column as usize,
-                        &format!("Unquoted string \"{}\" - use double quotes", token.value),
+                        &format!("Unquoted string \"{v}\" - use double quotes"),
                     ))
                 }
             }
         }
         TokenType::NumberPrefix => {
-            let value = parse_number(&token.value, token.line as usize, token.column as usize)?;
+            let value = parse_number(v, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::IntegerPrefix => {
-            let value = parse_integer(&token.value, token.line as usize, token.column as usize)?;
+            let value = parse_integer(v, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::CurrencyPrefix => {
-            let value = parse_currency(&token.value, token.line as usize, token.column as usize)?;
+            let value = parse_currency(v, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::PercentPrefix => {
-            let value = parse_percent(&token.value, token.line as usize, token.column as usize)?;
+            let value = parse_percent(v, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::ReferencePrefix => {
-            Ok((OdinValues::reference(&*token.value), 1))
+            // Normalize leading-zero array indices on demand (tokenizer no
+            // longer pre-normalizes; raw text is in the token slice).
+            let normalized = normalize_reference_path(v);
+            Ok((OdinValues::reference(&*normalized), 1))
         }
         TokenType::BinaryPrefix => {
-            let value = parse_binary(&token.value, token.line as usize, token.column as usize)?;
+            let value = parse_binary(v, token.line as usize, token.column as usize)?;
             Ok((value, 1))
         }
         TokenType::DateLiteral => {
-            parse_date_value(&token.value, token.line as usize, token.column as usize)
-                .map(|v| (v, 1))
+            parse_date_value(v, token.line as usize, token.column as usize)
+                .map(|val| (val, 1))
         }
-        TokenType::TimeLiteral => {
-            Ok((OdinValues::time(&*token.value), 1))
-        }
-        TokenType::DurationLiteral => {
-            Ok((OdinValues::duration(&*token.value), 1))
-        }
-        TokenType::TimestampLiteral => {
-            Ok((OdinValues::timestamp(0, &*token.value), 1))
-        }
+        TokenType::TimeLiteral => Ok((OdinValues::time(v), 1)),
+        TokenType::DurationLiteral => Ok((OdinValues::duration(v), 1)),
+        TokenType::TimestampLiteral => Ok((OdinValues::timestamp(0, v), 1)),
         TokenType::Path => {
-            // Path tokens in value position can be temporal values
-            if is_date_like(&token.value) {
-                if let Ok(val) = parse_date_value(&token.value, token.line as usize, token.column as usize) {
+            if is_date_like(v) {
+                if let Ok(val) = parse_date_value(v, token.line as usize, token.column as usize) {
                     return Ok((val, 1));
                 }
             }
-            if token.value.starts_with('T') && token.value.contains(':') {
-                return Ok((OdinValues::time(&*token.value), 1));
+            if v.starts_with('T') && v.contains(':') {
+                return Ok((OdinValues::time(v), 1));
             }
-            if token.value.starts_with('P') && token.value.len() > 1 {
-                let second = token.value.as_bytes()[1];
+            if v.starts_with('P') && v.len() > 1 {
+                let second = v.as_bytes()[1];
                 if second.is_ascii_digit() || second == b'T' {
-                    return Ok((OdinValues::duration(&*token.value), 1));
+                    return Ok((OdinValues::duration(v), 1));
                 }
             }
-
-            // Bare string — not allowed
             Err(ParseError::with_message(
                 ParseErrorCode::BareStringNotAllowed,
                 token.line as usize, token.column as usize,
-                &format!("Unquoted string \"{}\" - use double quotes", token.value),
+                &format!("Unquoted string \"{v}\" - use double quotes"),
             ))
         }
         TokenType::VerbPrefix => {
-            // Unquoted verb expression: %verbName args... — collect rest of line
-            // as a raw string. Build into one buffer instead of allocating per token.
-            let is_custom = token.value.starts_with('&');
-            let mut raw_expr = String::with_capacity(token.value.len() + 16);
+            let is_custom = v.starts_with('&');
+            let mut raw_expr = String::with_capacity(v.len() + 16);
             raw_expr.push('%');
-            raw_expr.push_str(&token.value);
+            raw_expr.push_str(v);
             let mut consumed = 1;
             let mut i = pos + 1;
             while i < tokens.len() {
@@ -128,19 +118,24 @@ pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, u
                 if t.token_type == TokenType::Newline || t.token_type == TokenType::Comment {
                     break;
                 }
+                let tv = t.value(source);
                 raw_expr.push(' ');
                 match t.token_type {
-                    TokenType::ReferencePrefix => { raw_expr.push('@'); raw_expr.push_str(&t.value); }
-                    TokenType::IntegerPrefix => { raw_expr.push_str("##"); raw_expr.push_str(&t.value); }
-                    TokenType::NumberPrefix => { raw_expr.push('#'); raw_expr.push_str(&t.value); }
-                    TokenType::CurrencyPrefix => { raw_expr.push_str("#$"); raw_expr.push_str(&t.value); }
-                    TokenType::PercentPrefix => { raw_expr.push_str("#%"); raw_expr.push_str(&t.value); }
+                    TokenType::ReferencePrefix => { raw_expr.push('@'); raw_expr.push_str(tv); }
+                    TokenType::IntegerPrefix => { raw_expr.push_str("##"); raw_expr.push_str(tv); }
+                    TokenType::NumberPrefix => { raw_expr.push('#'); raw_expr.push_str(tv); }
+                    TokenType::CurrencyPrefix => { raw_expr.push_str("#$"); raw_expr.push_str(tv); }
+                    TokenType::PercentPrefix => { raw_expr.push_str("#%"); raw_expr.push_str(tv); }
                     TokenType::BooleanPrefix => raw_expr.push('?'),
-                    TokenType::QuotedString => { raw_expr.push('"'); raw_expr.push_str(&t.value); raw_expr.push('"'); }
+                    TokenType::QuotedString | TokenType::QuotedStringEscaped => {
+                        raw_expr.push('"');
+                        raw_expr.push_str(tv);
+                        raw_expr.push('"');
+                    }
                     TokenType::Null => raw_expr.push('~'),
-                    TokenType::Directive => { raw_expr.push(':'); raw_expr.push_str(&t.value); }
-                    TokenType::VerbPrefix => { raw_expr.push('%'); raw_expr.push_str(&t.value); }
-                    _ => raw_expr.push_str(&t.value),
+                    TokenType::Directive => { raw_expr.push(':'); raw_expr.push_str(tv); }
+                    TokenType::VerbPrefix => { raw_expr.push('%'); raw_expr.push_str(tv); }
+                    _ => raw_expr.push_str(tv),
                 }
                 consumed += 1;
                 i += 1;
@@ -164,12 +159,12 @@ pub fn parse_value<'a>(tokens: &[Token<'a>], pos: usize) -> Result<(OdinValue, u
 }
 
 /// Parse modifiers preceding a value (!required, *confidential, -deprecated).
-pub fn parse_modifiers<'a>(tokens: &[Token<'a>], pos: usize) -> (OdinModifiers, usize) {
+pub fn parse_modifiers(tokens: &[Token], pos: usize, source: &str) -> (OdinModifiers, usize) {
     let mut modifiers = OdinModifiers::default();
     let mut consumed = 0;
 
     while pos + consumed < tokens.len() && tokens[pos + consumed].token_type == TokenType::Modifier {
-        match tokens[pos + consumed].value.as_ref() {
+        match tokens[pos + consumed].value(source) {
             "!" => modifiers.required = true,
             "*" => modifiers.confidential = true,
             "-" => modifiers.deprecated = true,
@@ -181,6 +176,132 @@ pub fn parse_modifiers<'a>(tokens: &[Token<'a>], pos: usize) -> (OdinModifiers, 
     (modifiers, consumed)
 }
 
+/// Unescape a quoted-string body. Mirrors the escape processing the
+/// tokenizer used to do eagerly; called only for `QuotedStringEscaped` tokens.
+pub(super) fn unescape_string(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' && i + 1 < bytes.len() {
+            let esc = bytes[i + 1];
+            match esc {
+                b'n' => { out.push('\n'); i += 2; }
+                b'r' => { out.push('\r'); i += 2; }
+                b't' => { out.push('\t'); i += 2; }
+                b'\\' => { out.push('\\'); i += 2; }
+                b'"' => { out.push('"'); i += 2; }
+                b'/' => { out.push('/'); i += 2; }
+                b'0' => { out.push('\0'); i += 2; }
+                b'u' if i + 5 < bytes.len() => {
+                    let hex = &raw[i + 2..i + 6];
+                    if let Ok(code) = u32::from_str_radix(hex, 16) {
+                        if (0xD800..=0xDBFF).contains(&code)
+                            && i + 11 < bytes.len()
+                            && bytes[i + 6] == b'\\'
+                            && bytes[i + 7] == b'u'
+                        {
+                            let low_hex = &raw[i + 8..i + 12];
+                            if let Ok(low) = u32::from_str_radix(low_hex, 16) {
+                                if (0xDC00..=0xDFFF).contains(&low) {
+                                    let combined = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                    if let Some(c) = char::from_u32(combined) {
+                                        out.push(c);
+                                        i += 12;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(c) = char::from_u32(code) {
+                            out.push(c);
+                        }
+                        i += 6;
+                    } else {
+                        i += 2;
+                    }
+                }
+                b'U' if i + 9 < bytes.len() => {
+                    let hex = &raw[i + 2..i + 10];
+                    if let Ok(code) = u32::from_str_radix(hex, 16) {
+                        if let Some(c) = char::from_u32(code) {
+                            out.push(c);
+                        }
+                    }
+                    i += 10;
+                }
+                _ => { out.push(ch as char); i += 1; }
+            }
+        } else if ch >= 0x80 {
+            // Multi-byte UTF-8: copy the whole codepoint.
+            let n = utf8_byte_len(ch);
+            let end = (i + n).min(bytes.len());
+            out.push_str(&raw[i..end]);
+            i = end;
+        } else {
+            out.push(ch as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+#[inline]
+fn utf8_byte_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
+/// Normalize leading zeros in array indices: `path[007]` -> `path[7]`.
+/// Returns `Cow::Borrowed` when no normalization is needed (the common case).
+fn normalize_reference_path(raw: &str) -> std::borrow::Cow<'_, str> {
+    if !needs_reference_normalization(raw.as_bytes()) {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            out.push('[');
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start && i < bytes.len() && bytes[i] == b']' {
+                let idx: i64 = raw[start..i].parse().unwrap_or(0);
+                out.push_str(&idx.to_string());
+            } else {
+                out.push_str(&raw[start..i]);
+            }
+        } else {
+            let run_end = bytes[i..].iter().position(|&b| b == b'[').map(|p| i + p).unwrap_or(bytes.len());
+            out.push_str(&raw[i..run_end]);
+            i = run_end;
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[inline]
+fn needs_reference_normalization(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'0' && bytes[i + 2].is_ascii_digit() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn parse_number(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
     if raw.is_empty() {
         return Err(ParseError::with_message(
@@ -188,7 +309,6 @@ fn parse_number(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseEr
         ));
     }
 
-    // Check for double negatives
     if raw.starts_with("--") {
         return Err(ParseError::with_message(
             ParseErrorCode::InvalidTypePrefix, line, col, &format!("invalid number: {raw}"),
@@ -200,7 +320,6 @@ fn parse_number(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseEr
     })?;
 
     let decimal_places = if raw.contains('.') {
-        // Find the decimal part (before any 'e'/'E') without allocating.
         let num_part = match raw.find(|c: char| c == 'e' || c == 'E') {
             Some(e_pos) => &raw[..e_pos],
             None => raw,
@@ -226,7 +345,6 @@ fn parse_integer(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseE
         ));
     }
 
-    // Try parsing as i64 first
     match raw.parse::<i64>() {
         Ok(value) => {
             Ok(OdinValue::Integer {
@@ -237,8 +355,6 @@ fn parse_integer(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseE
             })
         }
         Err(_) => {
-            // For very large integers, store 0 but preserve raw
-            // This handles numbers beyond i64 range
             Ok(OdinValue::Integer {
                 value: 0,
                 raw: Some(raw.to_string()),
@@ -250,7 +366,6 @@ fn parse_integer(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseE
 }
 
 fn parse_currency(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
-    // Format: "100.00" or "100.00:USD"
     let (num_part, currency_code) = if let Some(colon_pos) = raw.find(':') {
         (&raw[..colon_pos], Some(raw[colon_pos + 1..].to_uppercase()))
     } else {
@@ -296,12 +411,10 @@ fn parse_percent(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseE
 }
 
 fn parse_binary(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
-    // Empty binary
     if raw.is_empty() {
         return Ok(OdinValues::binary(Vec::new()));
     }
 
-    // Format: "base64data" or "algorithm:base64data"
     if let Some(colon_pos) = raw.find(':') {
         let algorithm = &raw[..colon_pos];
         let b64_data = &raw[colon_pos + 1..];
@@ -315,7 +428,6 @@ fn parse_binary(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseEr
     }
 }
 
-/// Validate base64 content - check for invalid characters and padding.
 fn validate_base64(input: &str, line: usize, col: usize) -> Result<(), ParseError> {
     let mut padding_started = false;
     for (i, ch) in input.bytes().enumerate() {
@@ -345,7 +457,6 @@ fn validate_base64(input: &str, line: usize, col: usize) -> Result<(), ParseErro
     Ok(())
 }
 
-/// Simple base64 decoder (no external dependency).
 fn base64_decode(input: &str) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len() * 3 / 4);
     let mut buffer: u32 = 0;
@@ -372,7 +483,6 @@ fn base64_decode(input: &str) -> Vec<u8> {
     output
 }
 
-/// Parse and validate a date string (YYYY-MM-DD).
 fn parse_date_value(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
     let mut iter = raw.split('-');
     let (year_s, month_s, day_s) = match (iter.next(), iter.next(), iter.next(), iter.next()) {
@@ -395,7 +505,6 @@ fn parse_date_value(raw: &str, line: usize, col: usize) -> Result<OdinValue, Par
         ParseError::with_message(ParseErrorCode::UnexpectedCharacter, line, col, &format!("invalid date: {raw}"))
     })?;
 
-    // Validate month
     if !(1..=12).contains(&month) {
         return Err(ParseError::with_message(
             ParseErrorCode::UnexpectedCharacter,
@@ -404,7 +513,6 @@ fn parse_date_value(raw: &str, line: usize, col: usize) -> Result<OdinValue, Par
         ));
     }
 
-    // Validate day
     let max_day = days_in_month(year, month);
     if day < 1 || day > max_day {
         return Err(ParseError::with_message(
@@ -424,22 +532,27 @@ fn parse_date_value(raw: &str, line: usize, col: usize) -> Result<OdinValue, Par
     })
 }
 
-fn is_date_like(s: &str) -> bool {
-    s.len() >= 10
-        && s.as_bytes().get(4) == Some(&b'-')
-        && s.as_bytes().get(7) == Some(&b'-')
-        && s.as_bytes()[..4].iter().all(u8::is_ascii_digit)
-}
-
 fn days_in_month(year: i32, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap_year(year) { 29 } else { 28 },
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
         _ => 0,
     }
 }
 
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+fn is_date_like(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 10
+        && bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(|b| b.is_ascii_digit())
 }

@@ -9,23 +9,21 @@ use super::parse_values;
 
 /// Parser state.
 struct Parser<'a> {
-    tokens: &'a [Token<'a>],
+    tokens: &'a [Token],
+    source: &'a str,
     pos: usize,
     options: &'a ParseOptions,
-    /// Current section header path (e.g., "Policy", "Policy.Coverage").
     current_header: Option<String>,
-    /// Last absolute header path, used to resolve relative headers.
     previous_header: Option<String>,
-    /// Reused per-assignment path buffer.
     path_buf: String,
-    /// Reused buffer for index-normalized paths (only used when needed).
     norm_buf: String,
 }
 
 impl<'a> Parser<'a> {
-    fn new(tokens: &'a [Token<'a>], options: &'a ParseOptions) -> Self {
+    fn new(tokens: &'a [Token], source: &'a str, options: &'a ParseOptions) -> Self {
         Self {
             tokens,
+            source,
             pos: 0,
             options,
             current_header: None,
@@ -39,7 +37,7 @@ impl<'a> Parser<'a> {
         self.pos >= self.tokens.len() || self.tokens[self.pos].token_type == TokenType::Eof
     }
 
-    fn peek(&self) -> Option<&Token<'a>> {
+    fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
 
@@ -47,11 +45,11 @@ impl<'a> Parser<'a> {
     ///
     /// Must only be called when `!self.is_at_end()` — callers always guard
     /// with that check so the index is guaranteed in-bounds.
-    fn current_token(&self) -> &Token<'a> {
+    fn current_token(&self) -> &Token {
         &self.tokens[self.pos]
     }
 
-    fn advance(&mut self) -> &Token<'a> {
+    fn advance(&mut self) -> &Token {
         let token = &self.tokens[self.pos];
         self.pos += 1;
         token
@@ -148,7 +146,7 @@ impl<'a> Parser<'a> {
 
             match token.token_type {
                 TokenType::Header => {
-                    let header_value = token.value.to_string();
+                    let header_value = token.value(self.source).to_string();
                     self.advance();
                     self.skip_newlines();
 
@@ -227,7 +225,7 @@ impl<'a> Parser<'a> {
                 TokenType::Import => {
                     let line = token.line as usize;
                     let col = token.column as usize;
-                    let value = token.value.to_string();
+                    let value = token.value(self.source).to_string();
                     self.advance();
 
                     // Parse import: value is "path" or "path as alias"
@@ -267,7 +265,7 @@ impl<'a> Parser<'a> {
                 TokenType::Schema => {
                     let line = token.line as usize;
                     let col = token.column as usize;
-                    let value = token.value.to_string();
+                    let value = token.value(self.source).to_string();
                     self.advance();
 
                     let trimmed = value.trim();
@@ -287,7 +285,7 @@ impl<'a> Parser<'a> {
                 TokenType::Conditional => {
                     let line = token.line as usize;
                     let col = token.column as usize;
-                    let value = token.value.to_string();
+                    let value = token.value(self.source).to_string();
                     self.advance();
 
                     let trimmed = value.trim();
@@ -310,7 +308,7 @@ impl<'a> Parser<'a> {
                     build_path(
                         &mut self.path_buf,
                         self.current_header.as_deref(),
-                        &self.tokens[self.pos].value,
+                        self.tokens[self.pos].value(self.source),
                     );
 
                     if path_index_needs_normalization(self.path_buf.as_bytes()) {
@@ -447,7 +445,7 @@ impl<'a> Parser<'a> {
                         }
 
                     // Parse modifiers and value
-                    let (mods, mod_consumed) = parse_values::parse_modifiers(self.tokens, self.pos);
+                    let (mods, mod_consumed) = parse_values::parse_modifiers(self.tokens, self.pos, self.source);
                     self.pos += mod_consumed;
 
                     if self.is_at_end() || self.current_token().token_type == TokenType::Newline {
@@ -461,7 +459,7 @@ impl<'a> Parser<'a> {
                         continue;
                     }
 
-                    let (mut value, consumed) = parse_values::parse_value(self.tokens, self.pos)?;
+                    let (mut value, consumed) = parse_values::parse_value(self.tokens, self.pos, self.source)?;
                     self.pos += consumed;
 
                     // Parse trailing directives (e.g., `:type integer`, `:date`, `:pos 3 :len 8`)
@@ -472,7 +470,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                         if tt == TokenType::Directive {
-                            let dir_name = self.current_token().value.to_string();
+                            let dir_name = self.current_token().value(self.source).to_string();
                             self.advance();
                             // Check for directive value (next non-newline token)
                             let dir_value = if self.is_at_end() {
@@ -480,7 +478,7 @@ impl<'a> Parser<'a> {
                             } else {
                                 let next_tt = self.current_token().token_type;
                                 if next_tt != TokenType::Newline && next_tt != TokenType::Comment && next_tt != TokenType::Directive {
-                                    let v = self.current_token().value.to_string();
+                                    let v = self.current_token().value(self.source).to_string();
                                     self.advance();
                                     if let Ok(n) = v.parse::<f64>() {
                                         Some(crate::types::values::DirectiveValue::Number(n))
@@ -498,7 +496,7 @@ impl<'a> Parser<'a> {
                             return Err(ParseError::with_message(
                                 ParseErrorCode::UnexpectedCharacter,
                                 bad.line as usize, bad.column as usize,
-                                &format!("Unexpected content after value: {:?}", bad.value),
+                                &format!("Unexpected content after value: {:?}", bad.value(self.source)),
                             ));
                         }
                     }
@@ -526,7 +524,7 @@ impl<'a> Parser<'a> {
                 TokenType::Newline | TokenType::Comment => {
                     let was_newline = token.token_type == TokenType::Newline;
                     if token.token_type == TokenType::Comment && self.options.preserve_comments {
-                        let raw: &str = &token.value;
+                        let raw: &str = token.value(self.source);
                         let stripped = raw.strip_prefix(';').unwrap_or(raw);
                         let text = stripped.strip_prefix(' ').unwrap_or(stripped).to_string();
                         comments.push(OdinComment {
@@ -616,7 +614,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     TokenType::QuotedString => {
-                        let v = tok.value.to_string();
+                        let v = tok.value(self.source).to_string();
                         self.advance();
                         current_val = Some(v);
                         // Check for comma after
@@ -638,7 +636,7 @@ impl<'a> Parser<'a> {
                     }
                     TokenType::Path | TokenType::BareWord => {
                         // Could be a comma, comma+value, or bare value
-                        let v = tok.value.to_string();
+                        let v = tok.value(self.source).to_string();
                         self.advance();
                         if v == "," {
                             if let Some(cv) = current_val.take() {
@@ -661,7 +659,7 @@ impl<'a> Parser<'a> {
                     }
                     _ => {
                         // Skip unexpected tokens (commas come through as various types)
-                        let v = tok.value.to_string();
+                        let v = tok.value(self.source).to_string();
                         self.advance();
                         if v == "," {
                             if let Some(cv) = current_val.take() {
@@ -795,11 +793,15 @@ impl<'a> Parser<'a> {
             // is followed by assignment lines like `_loop = "@features"`.
             if self.is_assignment_line() {
                 // Parse as a regular assignment within this section
-                let field_name = self.advance().value.to_string();
+                let field_name = {
+                    let pos = self.pos;
+                    self.advance();
+                    self.tokens[pos].value(self.source).to_string()
+                };
                 // Skip the equals sign
                 self.advance(); // consume '='
                 // Parse the value
-                if let Ok((val, consumed)) = parse_values::parse_value(self.tokens, self.pos) {
+                if let Ok((val, consumed)) = parse_values::parse_value(self.tokens, self.pos, self.source) {
                     self.pos += consumed;
                     let full_key = format!("{base_name}[].{field_name}");
                     // Collect any directives
@@ -813,7 +815,7 @@ impl<'a> Parser<'a> {
                         }
                         // Check for directive tokens (e.g., `:type integer`)
                         if t.token_type == TokenType::Directive {
-                            let dir_name = t.value.to_string();
+                            let dir_name = t.value(self.source).to_string();
                             self.advance();
                             // Try to get the directive value
                             let dir_val = if self.is_at_end() {
@@ -826,7 +828,7 @@ impl<'a> Parser<'a> {
                                     && next.token_type != TokenType::Comment
                                     && next.token_type != TokenType::DocumentSeparator
                                 {
-                                    let v = next.value.to_string();
+                                    let v = next.value(self.source).to_string();
                                     self.advance();
                                     Some(v)
                                 } else {
@@ -877,7 +879,7 @@ impl<'a> Parser<'a> {
                     }
                     _ => {
                         // Try to parse a value, then skip comma
-                        if let Ok((val, consumed)) = parse_values::parse_value(self.tokens, self.pos) {
+                        if let Ok((val, consumed)) = parse_values::parse_value(self.tokens, self.pos, self.source) {
                             self.pos += consumed;
                             values.push(val);
                             // Skip remaining tokens on this line (directives, etc.) until comma or newline
@@ -991,21 +993,21 @@ fn normalize_path_indices(path: &str, out: &mut String) {
 
 /// Parse a token stream into an `OdinDocument`.
 pub fn parse_tokens<'a>(
-    tokens: &[Token<'a>],
-    _source: &'a str,
-    options: &ParseOptions,
+    tokens: &'a [Token],
+    source: &'a str,
+    options: &'a ParseOptions,
 ) -> Result<OdinDocument, ParseError> {
-    let mut parser = Parser::new(tokens, options);
+    let mut parser = Parser::new(tokens, source, options);
     parser.parse_last_document()
 }
 
 /// Parse a token stream into multiple documents (for document chaining).
 pub fn parse_tokens_multi<'a>(
-    tokens: &[Token<'a>],
-    _source: &'a str,
-    options: &ParseOptions,
+    tokens: &'a [Token],
+    source: &'a str,
+    options: &'a ParseOptions,
 ) -> Result<Vec<OdinDocument>, ParseError> {
-    let mut parser = Parser::new(tokens, options);
+    let mut parser = Parser::new(tokens, source, options);
     parser.parse_documents()
 }
 
