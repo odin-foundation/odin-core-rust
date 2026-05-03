@@ -410,7 +410,7 @@ pub(super) fn parse_percent(raw: &str, line: usize, col: usize) -> Result<OdinVa
     })
 }
 
-fn parse_binary(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
+pub(super) fn parse_binary(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
     if raw.is_empty() {
         return Ok(OdinValues::binary(Vec::new()));
     }

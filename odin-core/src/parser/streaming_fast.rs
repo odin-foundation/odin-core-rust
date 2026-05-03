@@ -51,11 +51,9 @@ pub(super) fn try_parse_fast(source: &str, options: &ParseOptions) -> Option<Res
 /// Conservative: any false positive just falls through to the regular parser.
 fn is_fast_path_eligible(bytes: &[u8]) -> bool {
     if memchr::memmem::find(bytes, b"$table").is_some() { return false; }
-    if memchr::memmem::find(bytes, b"\n---").is_some() { return false; }
     if memchr::memmem::find(bytes, b"@import").is_some() { return false; }
     if memchr::memmem::find(bytes, b"@schema").is_some() { return false; }
     if memchr::memmem::find(bytes, b"@if ").is_some() { return false; }
-    if memchr::memchr(b'^', bytes).is_some() { return false; }
     true
 }
 
@@ -137,7 +135,23 @@ impl<'a> FastParser<'a> {
                     FastResult::Bail => return None,
                     FastResult::Err(e) => return Some(Err(e)),
                 },
-                b'-' if self.peek_eq(b"---") => return None,
+                b'-' if self.peek_eq(b"---") => {
+                    // Document separator — keep only the last document
+                    // (matches parser_impl::parse_last_document semantics).
+                    self.pos += 3;
+                    while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+                        self.pos += 1;
+                    }
+                    self.metadata.clear();
+                    self.assignments.clear();
+                    self.modifiers_map.clear();
+                    self.array_indices.clear();
+                    self.current_header = None;
+                    self.previous_header = None;
+                    self.in_metadata = false;
+                    self.tabular = None;
+                    continue;
+                }
                 b'@' => return None,
                 _ => match self.parse_assignment() {
                     FastResult::Ok => {}
@@ -766,6 +780,8 @@ impl<'a> FastParser<'a> {
             b'?' => self.parse_boolean_prefix(line, col),
             b'~' => { self.pos += 1; FastValue::Ok(OdinValues::null()) }
             b'@' => self.parse_reference(line, col),
+            b'%' => self.parse_verb(line, col),
+            b'^' => self.parse_binary_value(line, col),
             b't' if self.peek_eq(b"true") && !self.is_value_continuation(4) => {
                 self.pos += 4;
                 FastValue::Ok(OdinValues::boolean(true))
@@ -777,7 +793,6 @@ impl<'a> FastParser<'a> {
             b'T' => self.parse_time(line, col),
             b'P' => self.parse_duration_or_bail(),
             b'0'..=b'9' => self.parse_date_like(line, col),
-            // Modifiers, verbs, binary, directives, etc. → bail to full parser.
             _ => FastValue::Bail,
         }
     }
@@ -1066,6 +1081,63 @@ impl<'a> FastParser<'a> {
         }
         let raw = &self.source[start..self.pos];
         FastValue::Ok(OdinValues::time(raw))
+    }
+
+    fn parse_verb(&mut self, _line: usize, _col: usize) -> FastValue {
+        debug_assert_eq!(self.bytes[self.pos], b'%');
+        let start = self.pos;
+        self.pos += 1; // skip `%`
+        let is_custom = self.bytes.get(self.pos).copied() == Some(b'&');
+        // Verb expression runs to newline or `;` comment terminator.
+        let raw_end = match memchr::memchr2(b'\n', b';', &self.bytes[self.pos..]) {
+            Some(off) => self.pos + off,
+            None => self.bytes.len(),
+        };
+        // Trim trailing whitespace.
+        let mut trimmed = raw_end;
+        while trimmed > self.pos && matches!(self.bytes[trimmed - 1], b' ' | b'\t' | b'\r') {
+            trimmed -= 1;
+        }
+        // Build the canonical raw expression: collapse runs of internal
+        // whitespace to a single space (matches parser_impl's token-by-token
+        // reconstruction so verb-string equality holds).
+        let slice = &self.source[start..trimmed];
+        let mut raw_expr = String::with_capacity(slice.len());
+        let mut last_was_space = false;
+        for ch in slice.chars() {
+            let is_space = ch == ' ' || ch == '\t';
+            if is_space {
+                if !last_was_space { raw_expr.push(' '); }
+            } else {
+                raw_expr.push(ch);
+            }
+            last_was_space = is_space;
+        }
+        self.pos = trimmed;
+        FastValue::Ok(OdinValue::Verb {
+            verb: raw_expr,
+            is_custom,
+            args: vec![],
+            modifiers: None,
+            directives: vec![],
+        })
+    }
+
+    fn parse_binary_value(&mut self, line: usize, col: usize) -> FastValue {
+        debug_assert_eq!(self.bytes[self.pos], b'^');
+        self.pos += 1; // skip `^`
+        let val_start = self.pos;
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b'\n' | b'\r' | b' ' | b'\t' | b';' | b',' => break,
+                _ => self.pos += 1,
+            }
+        }
+        let raw = &self.source[val_start..self.pos];
+        match super::parse_values::parse_binary(raw, line, col) {
+            Ok(v) => FastValue::Ok(v),
+            Err(e) => FastValue::Err(e),
+        }
     }
 
     fn parse_duration_or_bail(&mut self) -> FastValue {
