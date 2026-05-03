@@ -95,6 +95,7 @@ struct TabularContext {
     columns: Vec<String>,
     row_index: usize,
     key_buf: String,
+    is_primitive: bool,
 }
 
 impl<'a> FastParser<'a> {
@@ -245,33 +246,53 @@ impl<'a> FastParser<'a> {
             // Must end with `[]` after the name.
             let Some(name) = name_part.strip_suffix("[]") else { return FastResult::Bail; };
             if name.is_empty() { return FastResult::Bail; }
-            // Bail on relative tabular `.name[]` and primitive arrays `~`.
-            if name.starts_with('.') || cols_str.trim() == "~" {
-                return FastResult::Bail;
-            }
-            // Parse columns; bail on relative columns or anything containing `.`/`[`.
-            let mut columns = Vec::with_capacity(8);
-            for raw in cols_str.split(',') {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() || trimmed.starts_with('.') {
-                    return FastResult::Bail;
+
+            // Resolve relative base `.name` against previous absolute header.
+            let resolved_base = if let Some(rest) = name.strip_prefix('.') {
+                if rest.is_empty() { return FastResult::Bail; }
+                match &self.previous_header {
+                    Some(base) => format!("{base}.{rest}"),
+                    None => rest.to_string(),
                 }
-                if trimmed.contains('[') || trimmed.contains(']') {
-                    return FastResult::Bail;
+            } else {
+                name.to_string()
+            };
+
+            // Primitive array mode: `{name[] : ~}` — single sentinel column `~`.
+            let is_primitive = cols_str.trim() == "~";
+            let columns = if is_primitive {
+                Vec::new()
+            } else {
+                // Parse columns; bail on relative columns or anything containing `.`/`[`.
+                let mut cols = Vec::with_capacity(8);
+                for raw in cols_str.split(',') {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('.') {
+                        return FastResult::Bail;
+                    }
+                    if trimmed.contains('[') || trimmed.contains(']') {
+                        return FastResult::Bail;
+                    }
+                    cols.push(trimmed.to_string());
                 }
-                columns.push(trimmed.to_string());
-            }
-            if columns.is_empty() { return FastResult::Bail; }
+                if cols.is_empty() { return FastResult::Bail; }
+                cols
+            };
 
             self.pos = close_pos + 1;
-            self.previous_header = Some(name.to_string());
+            // For relative bases, don't overwrite previous_header — sub-blocks
+            // like `{.tags[] : ~}` should scope to their parent record.
+            if !name.starts_with('.') {
+                self.previous_header = Some(resolved_base.clone());
+            }
             self.current_header = None;
             self.in_metadata = false;
             self.tabular = Some(TabularContext {
-                base_name: name.to_string(),
+                base_name: resolved_base,
                 columns,
                 row_index: 0,
                 key_buf: String::with_capacity(64),
+                is_primitive,
             });
             return self.skip_to_line_end(start_line, start_col);
         }
@@ -691,14 +712,16 @@ impl<'a> FastParser<'a> {
             }
         }
 
-        // Build prefix `base[row].`
+        // Build prefix `base[row]` (primitive) or `base[row].` (record).
         ctx.key_buf.clear();
         ctx.key_buf.push_str(&ctx.base_name);
         ctx.key_buf.push('[');
         use std::fmt::Write as _;
         let _ = write!(ctx.key_buf, "{}", ctx.row_index);
         ctx.key_buf.push(']');
-        ctx.key_buf.push('.');
+        if !ctx.is_primitive {
+            ctx.key_buf.push('.');
+        }
         let prefix_len = ctx.key_buf.len();
 
         let mut col_idx: usize = 0;
@@ -722,7 +745,11 @@ impl<'a> FastParser<'a> {
             };
             had_value = true;
 
-            if col_idx < ctx.columns.len() {
+            if ctx.is_primitive {
+                if col_idx == 0 {
+                    self.assignments.insert(ctx.key_buf.clone(), value);
+                }
+            } else if col_idx < ctx.columns.len() {
                 ctx.key_buf.truncate(prefix_len);
                 ctx.key_buf.push_str(&ctx.columns[col_idx]);
                 self.assignments.insert(ctx.key_buf.clone(), value);
@@ -735,7 +762,10 @@ impl<'a> FastParser<'a> {
             }
             if self.pos >= self.bytes.len() { break; }
             match self.bytes[self.pos] {
-                b',' => self.pos += 1,
+                b',' => {
+                    if ctx.is_primitive { return FastResult::Bail; }
+                    self.pos += 1;
+                }
                 b'\n' | b'\r' | b';' => break,
                 _ => return FastResult::Bail,
             }
