@@ -1,3 +1,6 @@
+// No `unsafe` is permitted anywhere in this crate.
+#![forbid(unsafe_code)]
+
 // Pedantic lint allows — Cargo.toml sets pedantic=warn but individual
 // overrides require crate-level attributes to take effect.
 #![allow(

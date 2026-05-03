@@ -497,65 +497,47 @@ fn flat_set_segments(entries: &mut Vec<(String, DynValue)>, segments: &[PathSegm
     match &segments[0] {
         PathSegment::Key(key) => {
             if segments.len() == 1 {
-                // Leaf – set value
                 if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
                     entry.1 = value;
                 } else {
                     entries.push((key.clone(), value));
                 }
-            } else {
-                // Need to descend. Check what the next segment is.
-                match &segments[1] {
-                    PathSegment::Index(_) => {
-                        // Next is an array index – ensure key maps to an array
-                        let arr = if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
-                            if !matches!(&entry.1, DynValue::Array(_)) {
-                                entry.1 = DynValue::Array(Vec::new());
-                            }
-                            if let DynValue::Array(ref mut arr) = entry.1 {
-                                arr
-                            } else {
-                                unreachable!()
-                            }
-                        } else {
-                            entries.push((key.clone(), DynValue::Array(Vec::new())));
-                            match entries.last_mut() {
-                                Some(entry) if matches!(entry.1, DynValue::Array(_)) => {
-                                    if let DynValue::Array(ref mut arr) = entry.1 { arr } else { unreachable!() }
-                                }
-                                _ => return,
-                            }
-                        };
+                return;
+            }
+            // Find-or-insert by index, then mutate via index — avoids the
+            // borrow-checker conflict between find() and a follow-up mut access.
+            let idx = match entries.iter().position(|(k, _)| k == key) {
+                Some(i) => i,
+                None => {
+                    let placeholder = match &segments[1] {
+                        PathSegment::Index(_) => DynValue::Array(Vec::new()),
+                        PathSegment::Key(_) => DynValue::Object(Vec::new()),
+                    };
+                    entries.push((key.clone(), placeholder));
+                    entries.len() - 1
+                }
+            };
+            match &segments[1] {
+                PathSegment::Index(_) => {
+                    if !matches!(&entries[idx].1, DynValue::Array(_)) {
+                        entries[idx].1 = DynValue::Array(Vec::new());
+                    }
+                    if let DynValue::Array(ref mut arr) = entries[idx].1 {
                         flat_set_in_array(arr, &segments[1..], value);
                     }
-                    PathSegment::Key(_) => {
-                        // Next is a key – ensure key maps to an object
-                        let obj = if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
-                            if !matches!(&entry.1, DynValue::Object(_)) {
-                                entry.1 = DynValue::Object(Vec::new());
-                            }
-                            if let DynValue::Object(ref mut obj) = entry.1 {
-                                obj
-                            } else {
-                                unreachable!()
-                            }
-                        } else {
-                            entries.push((key.clone(), DynValue::Object(Vec::new())));
-                            match entries.last_mut() {
-                                Some(entry) if matches!(entry.1, DynValue::Object(_)) => {
-                                    if let DynValue::Object(ref mut obj) = entry.1 { obj } else { unreachable!() }
-                                }
-                                _ => return,
-                            }
-                        };
+                }
+                PathSegment::Key(_) => {
+                    if !matches!(&entries[idx].1, DynValue::Object(_)) {
+                        entries[idx].1 = DynValue::Object(Vec::new());
+                    }
+                    if let DynValue::Object(ref mut obj) = entries[idx].1 {
                         flat_set_segments(obj, &segments[1..], value);
                     }
                 }
             }
         }
         PathSegment::Index(_) => {
-            // Shouldn't happen at root level in an Object context.
-            // Just ignore.
+            // Shouldn't happen at root level in an Object context — ignore.
         }
     }
 }

@@ -825,7 +825,9 @@ impl<'a> Parser<'a> {
 
     /// Parse one tabular row → `name[row].col = val` assignments.
     fn parse_tabular_row(&mut self) -> StepResult {
-        let mut ctx = self.tabular.take().expect("must be in tabular mode");
+        let Some(mut ctx) = self.tabular.take() else {
+            return StepResult::Ok;
+        };
         let result = self.parse_tabular_row_inner(&mut ctx);
         if !matches!(result, StepResult::Bail | StepResult::Err(_)) {
             self.tabular = Some(ctx);
@@ -1144,9 +1146,9 @@ impl<'a> Parser<'a> {
         match memchr::memchr3(b'"', b'\\', b'\n', &self.bytes[self.pos..]) {
             Some(off) => {
                 let p = content_start + off;
+                // memchr3 returns a position whose byte is `"`, `\\`, or `\n`.
                 match self.bytes[p] {
                     b'"' => {
-                        // No escapes — slice directly.
                         let s = &self.source[content_start..p];
                         self.pos = p + 1;
                         ValueStep::Ok(OdinValues::string(s))
@@ -1155,11 +1157,11 @@ impl<'a> Parser<'a> {
                         ParseErrorCode::UnterminatedString,
                         start_line as usize, start_col as usize,
                     )),
-                    b'\\' => {
+                    // Otherwise the byte is `\\` — escape sequence path.
+                    _ => {
                         self.pos = p;
                         self.parse_quoted_string_escaped(content_start, line, col, start_line, start_col)
                     }
-                    _ => unreachable!(),
                 }
             }
             None => ValueStep::Err(ParseError::new(
