@@ -352,6 +352,7 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
     let mut required = false;
     let mut confidential = false;
     let mut deprecated = false;
+    let mut immutable = false;
     let mut constraints = Vec::new();
     let mut field_type = SchemaFieldType::String;
     let default_value = None;
@@ -467,6 +468,7 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
                 continue;
             }
             if let Some(rest) = after.strip_prefix("immutable") {
+                immutable = true;
                 remaining = rest.trim_start();
                 continue;
             }
@@ -584,6 +586,7 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
         required,
         confidential,
         deprecated,
+        immutable,
         description: None,
         constraints,
         default_value,
@@ -908,6 +911,26 @@ dep = -"old"
     fn test_confidential_field() {
         let schema = parse_schema("{data}\nssn = *").unwrap();
         assert!(schema.fields["data.ssn"].confidential);
+    }
+
+    #[test]
+    fn test_immutable_directive_records_flag() {
+        // `:immutable` after a field type — flag must round-trip.
+        let schema = parse_schema("{user}\nid = !:format uuid :immutable\n").unwrap();
+        assert!(schema.fields["user.id"].immutable);
+    }
+
+    #[test]
+    fn test_immutable_with_currency_prefix() {
+        // `!#$:immutable` — currency type with attached :immutable directive.
+        let schema = parse_schema("{transaction}\namount = !#$:immutable\n").unwrap();
+        assert!(schema.fields["transaction.amount"].immutable);
+    }
+
+    #[test]
+    fn test_field_without_immutable_defaults_false() {
+        let schema = parse_schema("{user}\nemail = !:format email\n").unwrap();
+        assert!(!schema.fields["user.email"].immutable);
     }
 
     #[test]

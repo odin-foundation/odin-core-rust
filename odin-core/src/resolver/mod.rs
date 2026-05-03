@@ -1143,7 +1143,7 @@ mod tests {
             fields: vec![crate::types::schema::SchemaField {
                 name: "f1".to_string(),
                 field_type: crate::types::schema::SchemaFieldType::String,
-                required: true, confidential: false, deprecated: false,
+                required: true, confidential: false, deprecated: false, immutable: false,
                 description: None, constraints: vec![], default_value: None, conditionals: vec![],
             }],
             parents: vec![],

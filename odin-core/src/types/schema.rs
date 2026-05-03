@@ -67,6 +67,11 @@ pub struct SchemaField {
     pub confidential: bool,
     /// Whether this field is deprecated.
     pub deprecated: bool,
+    /// Whether this field is immutable — once a value is set, it cannot
+    /// be changed or deleted. The SDK records this flag; enforcement is
+    /// the responsibility of the storage layer (e.g. andvari-engine
+    /// rejects writes that would mutate or delete a prior value).
+    pub immutable: bool,
     /// Optional description.
     pub description: Option<String>,
     /// Validation constraints.
