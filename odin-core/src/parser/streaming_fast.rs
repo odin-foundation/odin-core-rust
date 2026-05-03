@@ -55,7 +55,6 @@ fn is_fast_path_eligible(bytes: &[u8]) -> bool {
     if memchr::memmem::find(bytes, b"@import").is_some() { return false; }
     if memchr::memmem::find(bytes, b"@schema").is_some() { return false; }
     if memchr::memmem::find(bytes, b"@if ").is_some() { return false; }
-    if memchr::memchr(b'\\', bytes).is_some() { return false; }
     if memchr::memchr(b'^', bytes).is_some() { return false; }
     true
 }
@@ -683,23 +682,142 @@ impl<'a> FastParser<'a> {
         }
     }
 
-    fn parse_quoted_string(&mut self, _line: usize, _col: usize) -> FastValue {
+    fn parse_quoted_string(&mut self, line: usize, col: usize) -> FastValue {
         debug_assert_eq!(self.bytes[self.pos], b'"');
+        let start_line = self.line;
+        let start_col = self.col();
         self.pos += 1;
         let content_start = self.pos;
+
         match memchr::memchr3(b'"', b'\\', b'\n', &self.bytes[self.pos..]) {
             Some(off) => {
                 let p = content_start + off;
-                if self.bytes[p] != b'"' {
-                    // Escapes or newlines — bail to full parser.
-                    return FastValue::Bail;
+                match self.bytes[p] {
+                    b'"' => {
+                        // No escapes — slice directly.
+                        let s = &self.source[content_start..p];
+                        self.pos = p + 1;
+                        FastValue::Ok(OdinValues::string(s))
+                    }
+                    b'\n' => FastValue::Err(ParseError::new(
+                        ParseErrorCode::UnterminatedString,
+                        start_line as usize, start_col as usize,
+                    )),
+                    b'\\' => {
+                        self.pos = p;
+                        self.parse_quoted_string_escaped(content_start, line, col, start_line, start_col)
+                    }
+                    _ => unreachable!(),
                 }
-                let s = &self.source[content_start..p];
-                self.pos = p + 1;
-                FastValue::Ok(OdinValues::string(s))
             }
-            None => FastValue::Bail, // unterminated; let full parser produce the error
+            None => FastValue::Err(ParseError::new(
+                ParseErrorCode::UnterminatedString,
+                start_line as usize, start_col as usize,
+            )),
         }
+    }
+
+    /// Slow path: walk to the closing quote validating each escape. Captures
+    /// the raw content range and unescapes via parse_values::unescape_string.
+    fn parse_quoted_string_escaped(
+        &mut self,
+        content_start: usize,
+        _line: usize,
+        _col: usize,
+        start_line: u32,
+        start_col: u32,
+    ) -> FastValue {
+        while self.pos < self.bytes.len() {
+            let ch = self.bytes[self.pos];
+            if ch == b'"' {
+                let raw = &self.source[content_start..self.pos];
+                self.pos += 1;
+                return FastValue::Ok(OdinValues::string(super::parse_values::unescape_string(raw)));
+            }
+            if ch == b'\n' {
+                return FastValue::Err(ParseError::new(
+                    ParseErrorCode::UnterminatedString,
+                    start_line as usize, start_col as usize,
+                ));
+            }
+            if ch == b'\\' {
+                self.pos += 1;
+                if self.pos >= self.bytes.len() {
+                    return FastValue::Err(ParseError::new(
+                        ParseErrorCode::UnterminatedString,
+                        start_line as usize, start_col as usize,
+                    ));
+                }
+                let esc = self.bytes[self.pos];
+                self.pos += 1;
+                match esc {
+                    b'n' | b'r' | b't' | b'\\' | b'"' | b'/' | b'0' => {}
+                    b'u' => {
+                        if let Err(e) = self.consume_unicode_hex(4, start_line, start_col) {
+                            return FastValue::Err(e);
+                        }
+                        // Optional surrogate continuation: \uXXXX (low surrogate)
+                        if self.pos + 1 < self.bytes.len()
+                            && self.bytes[self.pos] == b'\\'
+                            && self.bytes[self.pos + 1] == b'u'
+                        {
+                            self.pos += 2;
+                            if let Err(e) = self.consume_unicode_hex(4, start_line, start_col) {
+                                return FastValue::Err(e);
+                            }
+                        }
+                    }
+                    b'U' => {
+                        if let Err(e) = self.consume_unicode_hex(8, start_line, start_col) {
+                            return FastValue::Err(e);
+                        }
+                    }
+                    _ => {
+                        return FastValue::Err(ParseError::with_message(
+                            ParseErrorCode::InvalidEscapeSequence,
+                            self.line as usize, self.col() as usize,
+                            &format!("unknown escape: \\{}", esc as char),
+                        ));
+                    }
+                }
+            } else {
+                self.pos += 1;
+            }
+        }
+        FastValue::Err(ParseError::new(
+            ParseErrorCode::UnterminatedString,
+            start_line as usize, start_col as usize,
+        ))
+    }
+
+    fn consume_unicode_hex(&mut self, digits: usize, start_line: u32, start_col: u32) -> Result<(), ParseError> {
+        let hex_start = self.pos;
+        for _ in 0..digits {
+            if self.pos >= self.bytes.len() {
+                return Err(ParseError::with_message(
+                    ParseErrorCode::InvalidEscapeSequence,
+                    start_line as usize, start_col as usize,
+                    "incomplete unicode escape",
+                ));
+            }
+            self.pos += 1;
+        }
+        let hex = &self.source[hex_start..self.pos];
+        let code = u32::from_str_radix(hex, 16).map_err(|_| {
+            ParseError::with_message(
+                ParseErrorCode::InvalidEscapeSequence,
+                start_line as usize, start_col as usize,
+                &format!("invalid hex in unicode escape: \\u{hex}"),
+            )
+        })?;
+        if char::from_u32(code).is_none() && !(0xD800..=0xDFFF).contains(&code) {
+            return Err(ParseError::with_message(
+                ParseErrorCode::InvalidEscapeSequence,
+                start_line as usize, start_col as usize,
+                &format!("invalid unicode code point: U+{code:04X}"),
+            ));
+        }
+        Ok(())
     }
 
     fn parse_hash_value(&mut self, line: usize, col: usize) -> FastValue {
