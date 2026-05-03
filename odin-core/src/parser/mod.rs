@@ -2,9 +2,17 @@
 //!
 //! Converts ODIN text into an `OdinDocument`.
 //!
-//! The parser operates in two phases:
-//! 1. **Tokenization** — single-pass character scanner produces token stream
-//! 2. **Parsing** — token stream is consumed to build the document
+//! The primary path is `streaming_fast` — a single-pass byte walker that
+//! never materializes a token stream. It handles scalars, sections,
+//! tabular shapes (including primitive arrays and relative dotted
+//! sub-blocks), modifiers, trailing directives, verbs, binary,
+//! document separators, `@import` / `@schema` / `@if` directives,
+//! and (when enabled) comment preservation.
+//!
+//! When the streaming parser sees a feature it doesn't implement
+//! (`{$table.NAME[...]}` headers, multi-line headers, type-ref
+//! header shapes), it bails and the tokenize+parse fallback in
+//! `tokenizer` + `parser_impl` takes over.
 //!
 //! # Example
 //!
@@ -27,7 +35,6 @@ mod tests;
 
 pub use crate::types::options::ParseOptions;
 pub use tokens::{Token, TokenType};
-// Token<'a> uses Cow<'a, str> — most values are zero-copy borrows from source text.
 
 use crate::types::document::OdinDocument;
 use crate::types::errors::ParseError;

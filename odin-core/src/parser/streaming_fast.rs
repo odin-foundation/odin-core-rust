@@ -22,7 +22,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::types::document::{OdinDocument, OdinImport, OdinSchema};
+use crate::types::document::{OdinComment, OdinDocument, OdinImport, OdinSchema};
 use crate::types::errors::{ParseError, ParseErrorCode};
 use crate::types::ordered_map::OrderedMap;
 use crate::types::options::ParseOptions;
@@ -78,6 +78,7 @@ struct FastParser<'a> {
     modifiers_map: OrderedMap<String, OdinModifiers>,
     imports: Vec<OdinImport>,
     schemas: Vec<OdinSchema>,
+    comments: Vec<OdinComment>,
     array_indices: FxHashMap<String, usize>,
     current_header: Option<String>,
     previous_header: Option<String>,
@@ -113,6 +114,7 @@ impl<'a> FastParser<'a> {
             modifiers_map: OrderedMap::new(),
             imports: Vec::new(),
             schemas: Vec::new(),
+            comments: Vec::new(),
             array_indices: FxHashMap::default(),
             current_header: None,
             previous_header: None,
@@ -185,7 +187,7 @@ impl<'a> FastParser<'a> {
             imports: self.imports,
             schemas: self.schemas,
             conditionals: Vec::new(),
-            comments: Vec::new(),
+            comments: self.comments,
         }))
     }
 
@@ -206,12 +208,7 @@ impl<'a> FastParser<'a> {
                         self.in_metadata = false;
                     }
                 }
-                b';' => {
-                    self.pos = match memchr::memchr(b'\n', &self.bytes[self.pos..]) {
-                        Some(off) => self.pos + off,
-                        None => self.bytes.len(),
-                    };
-                }
+                b';' => self.skip_comment(),
                 _ => return true,
             }
         }
@@ -221,6 +218,27 @@ impl<'a> FastParser<'a> {
     #[inline]
     fn peek_eq(&self, needle: &[u8]) -> bool {
         self.bytes[self.pos..].starts_with(needle)
+    }
+
+    /// Skip past a `;` line comment. When `preserve_comments` is enabled,
+    /// capture it. Position must be on `;`; advances to (but not past) `\n`.
+    fn skip_comment(&mut self) {
+        debug_assert_eq!(self.bytes[self.pos], b';');
+        let end = match memchr::memchr(b'\n', &self.bytes[self.pos..]) {
+            Some(off) => self.pos + off,
+            None => self.bytes.len(),
+        };
+        if self.options.preserve_comments {
+            let raw = &self.source[self.pos..end];
+            let stripped = raw.strip_prefix(';').unwrap_or(raw);
+            let text = stripped.strip_prefix(' ').unwrap_or(stripped).to_string();
+            self.comments.push(OdinComment {
+                text,
+                associated_path: None,
+                line: self.line as usize,
+            });
+        }
+        self.pos = end;
     }
 
     fn parse_header(&mut self) -> FastResult {
@@ -349,12 +367,7 @@ impl<'a> FastParser<'a> {
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
-                b';' => {
-                    self.pos = match memchr::memchr(b'\n', &self.bytes[self.pos..]) {
-                        Some(off) => self.pos + off,
-                        None => self.bytes.len(),
-                    };
-                }
+                b';' => self.skip_comment(),
                 b'\n' => return FastResult::Ok,
                 _ => return FastResult::Bail,
             }
@@ -474,12 +487,7 @@ impl<'a> FastParser<'a> {
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
-                b';' => {
-                    self.pos = match memchr::memchr(b'\n', &self.bytes[self.pos..]) {
-                        Some(off) => self.pos + off,
-                        None => self.bytes.len(),
-                    };
-                }
+                b';' => self.skip_comment(),
                 b'\n' => break,
                 _ => return FastResult::Bail,
             }
@@ -775,12 +783,7 @@ impl<'a> FastParser<'a> {
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
-                b';' => {
-                    self.pos = match memchr::memchr(b'\n', &self.bytes[self.pos..]) {
-                        Some(off) => self.pos + off,
-                        None => self.bytes.len(),
-                    };
-                }
+                b';' => self.skip_comment(),
                 b'\n' => break,
                 _ => return FastResult::Bail,
             }

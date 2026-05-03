@@ -260,3 +260,23 @@ use crate::Odin;
 #[test] fn parse_last_doc() { let d = Odin::parse("a = ##1\n---\nb = ##2\n---\nc = ##3\n").unwrap(); assert_eq!(d.get_integer("c"), Some(3)); }
 #[test] fn docs_with_sections() { let docs = Odin::parse_documents("{A}\nf = ##1\n---\n{B}\nf = ##2\n").unwrap(); assert_eq!(docs.len(), 2); }
 #[test] fn docs_independent() { let docs = Odin::parse_documents("x = ##1\n---\ny = ##2\n").unwrap(); assert!(docs[1].get("x").is_none()); }
+
+// ─── Comment Preservation ──────────────────────────────────────────────────
+
+#[test]
+fn preserve_comments_collects_standalone_and_trailing() {
+    let src = "; leading note\nx = ##1 ; trailing\n; between\ny = ##2\n";
+    let opts = crate::parser::ParseOptions { preserve_comments: true, ..Default::default() };
+    let d = Odin::parse_with_options(src, &opts).unwrap();
+    assert_eq!(d.comments.len(), 3);
+    assert_eq!(d.comments[0].text, "leading note");
+    assert_eq!(d.comments[1].text, "trailing");
+    assert_eq!(d.comments[2].text, "between");
+}
+
+#[test]
+fn preserve_comments_off_by_default() {
+    let src = "; ignored\nx = ##1\n";
+    let d = Odin::parse(src).unwrap();
+    assert_eq!(d.comments.len(), 0);
+}
