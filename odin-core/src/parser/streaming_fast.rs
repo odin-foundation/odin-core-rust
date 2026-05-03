@@ -50,7 +50,6 @@ pub(super) fn try_parse_fast(source: &str, options: &ParseOptions) -> Option<Res
 /// Quick byte-pattern scan for features that the fast path doesn't handle.
 /// Conservative: any false positive just falls through to the regular parser.
 fn is_fast_path_eligible(bytes: &[u8]) -> bool {
-    if memchr::memmem::find(bytes, b"[]").is_some() { return false; }
     if memchr::memmem::find(bytes, b"$table").is_some() { return false; }
     if memchr::memmem::find(bytes, b"\n---").is_some() { return false; }
     if memchr::memmem::find(bytes, b"@import").is_some() { return false; }
@@ -76,6 +75,17 @@ struct FastParser<'a> {
     in_metadata: bool,
     path_buf: String,
     norm_buf: String,
+    tabular: Option<TabularContext>,
+}
+
+/// Active tabular section state. Set by `parse_header` when it encounters
+/// `{name[] : col1, col2, ...}`; cleared when the next `{header}` or EOF
+/// is reached.
+struct TabularContext {
+    base_name: String,
+    columns: Vec<String>,
+    row_index: usize,
+    key_buf: String,
 }
 
 impl<'a> FastParser<'a> {
@@ -96,6 +106,7 @@ impl<'a> FastParser<'a> {
             in_metadata: false,
             path_buf: String::with_capacity(64),
             norm_buf: String::with_capacity(64),
+            tabular: None,
         }
     }
 
@@ -108,6 +119,17 @@ impl<'a> FastParser<'a> {
         loop {
             if !self.skip_blanks_and_comments() { break; }
             let b = self.bytes[self.pos];
+            // A new header (or EOF) closes any active tabular section.
+            if self.tabular.is_some() && b == b'{' {
+                self.tabular = None;
+            }
+            if self.tabular.is_some() {
+                match self.parse_tabular_row() {
+                    FastResult::Ok => continue,
+                    FastResult::Bail => return None,
+                    FastResult::Err(e) => return Some(Err(e)),
+                }
+            }
             match b {
                 b'{' => match self.parse_header() {
                     FastResult::Ok => {}
@@ -184,11 +206,49 @@ impl<'a> FastParser<'a> {
         if self.bytes[close_pos] != b'}' { return FastResult::Bail; }
         let header = &self.source[content_start..close_pos];
 
-        // Bail on tabular / table-definition headers — too complex for fast path.
+        // Tabular header `{name[] : col1, col2, ...}` (absolute or relative).
+        if let Some(colon_pos) = header.find(" : ") {
+            let name_part = &header[..colon_pos];
+            let cols_str = &header[colon_pos + 3..];
+            // Must end with `[]` after the name.
+            let Some(name) = name_part.strip_suffix("[]") else { return FastResult::Bail; };
+            if name.is_empty() { return FastResult::Bail; }
+            // Bail on relative tabular `.name[]` and primitive arrays `~`.
+            if name.starts_with('.') || cols_str.trim() == "~" {
+                return FastResult::Bail;
+            }
+            // Parse columns; bail on relative columns or anything containing `.`/`[`.
+            let mut columns = Vec::with_capacity(8);
+            for raw in cols_str.split(',') {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.starts_with('.') {
+                    return FastResult::Bail;
+                }
+                if trimmed.contains('[') || trimmed.contains(']') {
+                    return FastResult::Bail;
+                }
+                columns.push(trimmed.to_string());
+            }
+            if columns.is_empty() { return FastResult::Bail; }
+
+            self.pos = close_pos + 1;
+            self.previous_header = Some(name.to_string());
+            self.current_header = None;
+            self.in_metadata = false;
+            self.tabular = Some(TabularContext {
+                base_name: name.to_string(),
+                columns,
+                row_index: 0,
+                key_buf: String::with_capacity(64),
+            });
+            return self.skip_to_line_end(start_line, start_col);
+        }
+
+        // Other bracket / colon shapes: bail.
         if header.starts_with("$table.") || header.starts_with("$.table.") {
             return FastResult::Bail;
         }
-        if header.contains("[]") || header.contains(" : ") {
+        if header.contains("[]") {
             return FastResult::Bail;
         }
         if header.contains('[') || header.contains(']') {
@@ -373,6 +433,113 @@ impl<'a> FastParser<'a> {
         FastResult::Ok
     }
 
+    /// Parse one comma-separated tabular row, generating `name[row].col = val`
+    /// assignments. Bails on assignment-style lines (`_loop = "@x"`) or any
+    /// non-value content.
+    fn parse_tabular_row(&mut self) -> FastResult {
+        let mut ctx = self.tabular.take().expect("must be in tabular mode");
+        let result = self.parse_tabular_row_inner(&mut ctx);
+        if !matches!(result, FastResult::Bail | FastResult::Err(_)) {
+            self.tabular = Some(ctx);
+        }
+        result
+    }
+
+    fn parse_tabular_row_inner(&mut self, ctx: &mut TabularContext) -> FastResult {
+        let line = self.line as usize;
+        let col = self.col() as usize;
+
+        // Bail if this looks like an assignment line (transform docs use this
+        // shape for `_loop = "@..."` mixed in with tabular data).
+        if let Some(eq_off) = memchr::memchr2(b'=', b'\n', &self.bytes[self.pos..]) {
+            if self.bytes[self.pos + eq_off] == b'=' {
+                let prefix = &self.bytes[self.pos..self.pos + eq_off];
+                let mut p = 0;
+                while p < prefix.len() && (prefix[p] == b' ' || prefix[p] == b'\t') { p += 1; }
+                let id_start = p;
+                while p < prefix.len() && is_path_byte(prefix[p]) { p += 1; }
+                if p > id_start {
+                    let mut q = p;
+                    while q < prefix.len() && (prefix[q] == b' ' || prefix[q] == b'\t') { q += 1; }
+                    if q == prefix.len() {
+                        // Looks like `<ident>=` — assignment. Bail.
+                        return FastResult::Bail;
+                    }
+                }
+            }
+        }
+
+        // Build prefix `base[row].`
+        ctx.key_buf.clear();
+        ctx.key_buf.push_str(&ctx.base_name);
+        ctx.key_buf.push('[');
+        use std::fmt::Write as _;
+        let _ = write!(ctx.key_buf, "{}", ctx.row_index);
+        ctx.key_buf.push(']');
+        ctx.key_buf.push('.');
+        let prefix_len = ctx.key_buf.len();
+
+        let mut col_idx: usize = 0;
+        let mut had_value = false;
+
+        loop {
+            // Whitespace before value
+            while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
+                self.pos += 1;
+            }
+            if self.pos >= self.bytes.len() { break; }
+            match self.bytes[self.pos] {
+                b'\n' | b'\r' | b';' => break,
+                _ => {}
+            }
+
+            let value = match self.parse_value(line, col) {
+                FastValue::Ok(v) => v,
+                FastValue::Bail => return FastResult::Bail,
+                FastValue::Err(e) => return FastResult::Err(e),
+            };
+            had_value = true;
+
+            if col_idx < ctx.columns.len() {
+                ctx.key_buf.truncate(prefix_len);
+                ctx.key_buf.push_str(&ctx.columns[col_idx]);
+                self.assignments.insert(ctx.key_buf.clone(), value);
+            }
+            col_idx += 1;
+
+            // Optional whitespace, then `,` or end of row
+            while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
+                self.pos += 1;
+            }
+            if self.pos >= self.bytes.len() { break; }
+            match self.bytes[self.pos] {
+                b',' => self.pos += 1,
+                b'\n' | b'\r' | b';' => break,
+                _ => return FastResult::Bail,
+            }
+        }
+
+        // Trailing comment / newline.
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b' ' | b'\t' | b'\r' => self.pos += 1,
+                b';' => {
+                    self.pos = match memchr::memchr(b'\n', &self.bytes[self.pos..]) {
+                        Some(off) => self.pos + off,
+                        None => self.bytes.len(),
+                    };
+                }
+                b'\n' => break,
+                _ => return FastResult::Bail,
+            }
+        }
+
+        if had_value {
+            ctx.row_index += 1;
+        }
+        FastResult::Ok
+    }
+
     fn validate_path(&mut self, line: usize, col: usize) -> FastResult {
         let bytes = self.path_buf.as_bytes();
         let mut depth: usize = 1;
@@ -512,7 +679,7 @@ impl<'a> FastParser<'a> {
         let p = self.pos + offset;
         p < self.bytes.len() && {
             let b = self.bytes[p];
-            !(b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' || b == b';')
+            !(b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' || b == b';' || b == b',')
         }
     }
 
@@ -648,7 +815,7 @@ impl<'a> FastParser<'a> {
         let start = self.pos;
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
-                b'\n' | b'\r' | b' ' | b'\t' | b';' => break,
+                b'\n' | b'\r' | b' ' | b'\t' | b';' | b',' => break,
                 _ => self.pos += 1,
             }
         }
@@ -684,7 +851,7 @@ impl<'a> FastParser<'a> {
         let start = self.pos;
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
-                b'\n' | b'\r' | b' ' | b'\t' | b';' => break,
+                b'\n' | b'\r' | b' ' | b'\t' | b';' | b',' => break,
                 _ => self.pos += 1,
             }
         }
