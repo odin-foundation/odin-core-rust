@@ -41,6 +41,41 @@ pub(super) fn try_parse_fast(source: &str, options: &ParseOptions) -> Option<Res
     p.run()
 }
 
+pub(super) fn parse_documents(source: &str, options: &ParseOptions) -> Result<Vec<OdinDocument>, ParseError> {
+    if source.len() > options.max_size {
+        return Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1));
+    }
+    if source.len() > u32::MAX as usize {
+        return Err(ParseError::new(ParseErrorCode::MaximumDocumentSizeExceeded, 1, 1));
+    }
+    let p = FastParser::new(source, options);
+    p.run_documents()
+}
+
+fn empty_doc() -> OdinDocument {
+    OdinDocument {
+        metadata: OrderedMap::new(),
+        assignments: OrderedMap::new(),
+        modifiers: OrderedMap::new(),
+        imports: Vec::new(),
+        schemas: Vec::new(),
+        conditionals: Vec::new(),
+        comments: Vec::new(),
+    }
+}
+
+/// Generic fallback when an internal Bail reaches the top-level run loop.
+/// Most bail conditions should produce a more specific error closer to the
+/// failure point — this is the catch-all for anything that hasn't been
+/// converted yet.
+fn bail_to_err(line: usize, col: usize) -> ParseError {
+    ParseError::with_message(
+        ParseErrorCode::UnexpectedCharacter,
+        line, col,
+        "Unexpected input",
+    )
+}
+
 fn find_comment_start_quote_aware(s: &str) -> Option<usize> {
     let mut in_quotes = false;
     for (i, ch) in s.char_indices() {
@@ -121,10 +156,25 @@ impl<'a> FastParser<'a> {
         (self.pos - self.line_start) as u32 + 1
     }
 
-    fn run(mut self) -> Option<Result<OdinDocument, ParseError>> {
+    fn run(self) -> Option<Result<OdinDocument, ParseError>> {
+        match self.run_loop(false) {
+            Ok(mut docs) => Some(Ok(docs.pop().unwrap_or_else(empty_doc))),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn run_documents(self) -> Result<Vec<OdinDocument>, ParseError> {
+        let docs = self.run_loop(true)?;
+        Ok(if docs.is_empty() { vec![empty_doc()] } else { docs })
+    }
+
+    fn run_loop(mut self, keep_all: bool) -> Result<Vec<OdinDocument>, ParseError> {
+        let mut docs: Vec<OdinDocument> = Vec::new();
         loop {
             if !self.skip_blanks_and_comments() { break; }
             let b = self.bytes[self.pos];
+            let line = self.line as usize;
+            let col = self.col() as usize;
             // A new header (or EOF) closes any active tabular section.
             if self.tabular.is_some() && b == b'{' {
                 self.tabular = None;
@@ -132,46 +182,57 @@ impl<'a> FastParser<'a> {
             if self.tabular.is_some() {
                 match self.parse_tabular_row() {
                     FastResult::Ok => continue,
-                    FastResult::Bail => return None,
-                    FastResult::Err(e) => return Some(Err(e)),
+                    FastResult::Bail => return Err(bail_to_err(line, col)),
+                    FastResult::Err(e) => return Err(e),
                 }
             }
             match b {
                 b'{' => match self.parse_header() {
                     FastResult::Ok => {}
-                    FastResult::Bail => return None,
-                    FastResult::Err(e) => return Some(Err(e)),
+                    FastResult::Bail => return Err(bail_to_err(line, col)),
+                    FastResult::Err(e) => return Err(e),
                 },
                 b'-' if self.peek_eq(b"---") => {
-                    // Document separator — keep only the last document
-                    // (matches parser_impl::parse_last_document semantics).
                     self.pos += 3;
                     while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
                         self.pos += 1;
                     }
-                    self.metadata.clear();
-                    self.assignments.clear();
-                    self.modifiers_map.clear();
-                    self.array_indices.clear();
-                    self.current_header = None;
-                    self.previous_header = None;
-                    self.in_metadata = false;
-                    self.tabular = None;
+                    if keep_all {
+                        docs.push(self.snapshot_doc());
+                    }
+                    self.reset_doc_state();
                     continue;
                 }
                 b'@' => match self.parse_top_directive() {
                     FastResult::Ok => {}
-                    FastResult::Bail => return None,
-                    FastResult::Err(e) => return Some(Err(e)),
+                    FastResult::Bail => return Err(bail_to_err(line, col)),
+                    FastResult::Err(e) => return Err(e),
                 },
                 _ => match self.parse_assignment() {
                     FastResult::Ok => {}
-                    FastResult::Bail => return None,
-                    FastResult::Err(e) => return Some(Err(e)),
+                    FastResult::Bail => return Err(bail_to_err(line, col)),
+                    FastResult::Err(e) => return Err(e),
                 },
             }
         }
-        Some(Ok(OdinDocument {
+        docs.push(self.into_doc());
+        Ok(docs)
+    }
+
+    fn snapshot_doc(&mut self) -> OdinDocument {
+        OdinDocument {
+            metadata: std::mem::take(&mut self.metadata),
+            assignments: std::mem::take(&mut self.assignments),
+            modifiers: std::mem::take(&mut self.modifiers_map),
+            imports: std::mem::take(&mut self.imports),
+            schemas: std::mem::take(&mut self.schemas),
+            conditionals: Vec::new(),
+            comments: std::mem::take(&mut self.comments),
+        }
+    }
+
+    fn into_doc(self) -> OdinDocument {
+        OdinDocument {
             metadata: self.metadata,
             assignments: self.assignments,
             modifiers: self.modifiers_map,
@@ -179,7 +240,21 @@ impl<'a> FastParser<'a> {
             schemas: self.schemas,
             conditionals: Vec::new(),
             comments: self.comments,
-        }))
+        }
+    }
+
+    fn reset_doc_state(&mut self) {
+        self.metadata.clear();
+        self.assignments.clear();
+        self.modifiers_map.clear();
+        self.array_indices.clear();
+        self.imports.clear();
+        self.schemas.clear();
+        self.comments.clear();
+        self.current_header = None;
+        self.previous_header = None;
+        self.in_metadata = false;
+        self.tabular = None;
     }
 
     /// Advance through whitespace, blank lines, and `;` line comments.
@@ -284,19 +359,41 @@ impl<'a> FastParser<'a> {
             let columns = if is_primitive {
                 Vec::new()
             } else {
-                // Parse columns; bail on relative columns or anything containing `.`/`[`.
+                // Columns may include `name[N]` (uniform sub-array) and
+                // `.name` (relative — inherits parent from prior dotted col).
                 let mut cols = Vec::with_capacity(8);
+                let mut last_parent = String::new();
                 for raw in cols_str.split(',') {
                     let trimmed = raw.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('.') {
-                        return FastResult::Bail;
+                    if trimmed.is_empty() {
+                        return FastResult::Err(ParseError::with_message(
+                            ParseErrorCode::InvalidHeaderSyntax,
+                            start_line as usize, start_col as usize,
+                            "Empty column name in tabular header",
+                        ));
                     }
-                    if trimmed.contains('[') || trimmed.contains(']') {
-                        return FastResult::Bail;
+                    if let Some(rest) = trimmed.strip_prefix('.') {
+                        if last_parent.is_empty() {
+                            cols.push(rest.to_string());
+                        } else {
+                            cols.push(format!("{last_parent}.{rest}"));
+                        }
+                    } else {
+                        if let Some(dot) = trimmed.find('.') {
+                            last_parent = trimmed[..dot].to_string();
+                        } else {
+                            last_parent.clear();
+                        }
+                        cols.push(trimmed.to_string());
                     }
-                    cols.push(trimmed.to_string());
                 }
-                if cols.is_empty() { return FastResult::Bail; }
+                if cols.is_empty() {
+                    return FastResult::Err(ParseError::with_message(
+                        ParseErrorCode::InvalidHeaderSyntax,
+                        start_line as usize, start_col as usize,
+                        "Tabular header must have at least one column",
+                    ));
+                }
                 cols
             };
 
@@ -765,12 +862,48 @@ impl<'a> FastParser<'a> {
         result
     }
 
+    /// Handle `field = value` lines mixed into a tabular section. Stores at
+    /// `{base_name}[].{field}` and consumes the rest of the line (directives
+    /// included). Position must be just past the `=`.
+    fn parse_tabular_assignment(
+        &mut self,
+        ctx: &TabularContext,
+        field: &str,
+        line: usize,
+        col: usize,
+    ) -> FastResult {
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
+            self.pos += 1;
+        }
+        let value = match self.parse_value(line, col) {
+            FastValue::Ok(v) => v,
+            FastValue::Bail => return FastResult::Err(bail_to_err(line, col)),
+            FastValue::Err(e) => return FastResult::Err(e),
+        };
+        // Skip any trailing directives or whitespace until end of line.
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b'\n' => break,
+                b';' => { self.skip_comment(); break; }
+                _ => self.pos += 1,
+            }
+        }
+        let key = format!("{}[].{}", ctx.base_name, field);
+        if ctx.is_metadata_table {
+            self.metadata.insert(key, value);
+        } else {
+            self.assignments.insert(key, value);
+        }
+        FastResult::Ok
+    }
+
     fn parse_tabular_row_inner(&mut self, ctx: &mut TabularContext) -> FastResult {
         let line = self.line as usize;
         let col = self.col() as usize;
 
-        // Bail if this looks like an assignment line (transform docs use this
-        // shape for `_loop = "@..."` mixed in with tabular data).
+        // Detect assignment-style lines mixed into tabular data, e.g.
+        // `_loop = "@features"` inside `{features[] : name, enabled}`. These
+        // store at `{base_name}[].{field}` and don't advance the row index.
         if let Some(eq_off) = memchr::memchr2(b'=', b'\n', &self.bytes[self.pos..]) {
             if self.bytes[self.pos + eq_off] == b'=' {
                 let prefix = &self.bytes[self.pos..self.pos + eq_off];
@@ -782,8 +915,11 @@ impl<'a> FastParser<'a> {
                     let mut q = p;
                     while q < prefix.len() && (prefix[q] == b' ' || prefix[q] == b'\t') { q += 1; }
                     if q == prefix.len() {
-                        // Looks like `<ident>=` — assignment. Bail.
-                        return FastResult::Bail;
+                        let field_start = self.pos + id_start;
+                        let field_end = self.pos + p;
+                        let field = self.source[field_start..field_end].to_string();
+                        self.pos += eq_off + 1;
+                        return self.parse_tabular_assignment(ctx, &field, line, col);
                     }
                 }
             }
@@ -812,6 +948,14 @@ impl<'a> FastParser<'a> {
             if self.pos >= self.bytes.len() { break; }
             match self.bytes[self.pos] {
                 b'\n' | b'\r' | b';' => break,
+                // Empty cell: `,,` or `, ,` — skip this column without writing
+                // an assignment. Matches parser_impl semantics for absent cells.
+                b',' if !ctx.is_primitive => {
+                    self.pos += 1;
+                    col_idx += 1;
+                    had_value = true;
+                    continue;
+                }
                 _ => {}
             }
 
@@ -1000,7 +1144,19 @@ impl<'a> FastParser<'a> {
             b'T' => self.parse_time(line, col),
             b'P' => self.parse_duration_or_bail(),
             b'0'..=b'9' => self.parse_date_like(line, col),
-            _ => FastValue::Bail,
+            // Letters or other identifier bytes here mean a bare unquoted
+            // string was supplied as a value (`name = John`). ODIN requires
+            // strings to be quoted.
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => FastValue::Err(ParseError::with_message(
+                ParseErrorCode::BareStringNotAllowed,
+                line, col,
+                "Strings must be quoted",
+            )),
+            _ => FastValue::Err(ParseError::with_message(
+                ParseErrorCode::UnexpectedCharacter,
+                line, col,
+                &format!("Unexpected character '{}'", b as char),
+            )),
         }
     }
 
@@ -1348,10 +1504,16 @@ impl<'a> FastParser<'a> {
     }
 
     fn parse_duration_or_bail(&mut self) -> FastValue {
-        // Only handle simple `P…` durations (`P1Y6M`, `PT4H`, …). Bail if it
-        // doesn't look like a duration.
+        // ISO-8601 durations start with `P` followed by a digit or `T`.
+        // Anything else (`P` alone, `Pfoo`) is malformed.
+        let line = self.line as usize;
+        let col = self.col() as usize;
         if self.bytes.get(self.pos + 1).copied().is_none_or(|b| !(b.is_ascii_digit() || b == b'T')) {
-            return FastValue::Bail;
+            return FastValue::Err(ParseError::with_message(
+                ParseErrorCode::BareStringNotAllowed,
+                line, col,
+                "Invalid duration format",
+            ));
         }
         let start = self.pos;
         while self.pos < self.bytes.len() {
@@ -1375,13 +1537,13 @@ enum NumKind { Integer, Number, Currency, Percent }
 
 #[inline]
 fn is_path_start(b: u8) -> bool {
-    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$')
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' | b'&')
 }
 
 #[inline]
 fn is_path_byte(b: u8) -> bool {
     matches!(b,
-        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' | b'[' | b']' | b'$' | b'-')
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' | b'[' | b']' | b'$' | b'-' | b'&')
 }
 
 #[inline]

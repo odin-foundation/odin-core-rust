@@ -23,9 +23,6 @@
 //! assert_eq!(doc.get_string("name"), Some("Alice"));
 //! ```
 
-mod tokenizer;
-mod tokens;
-mod parser_impl;
 mod parse_values;
 mod streaming_fast;
 pub mod streaming;
@@ -34,7 +31,6 @@ pub mod streaming;
 mod tests;
 
 pub use crate::types::options::ParseOptions;
-pub use tokens::{Token, TokenType};
 
 use crate::types::document::OdinDocument;
 use crate::types::errors::ParseError;
@@ -53,11 +49,8 @@ pub fn parse(input: &str, options: Option<&ParseOptions>) -> Result<OdinDocument
         None => { default_opts = ParseOptions::default(); &default_opts }
     };
     let source = input.strip_prefix('\u{FEFF}').unwrap_or(input);
-    if let Some(result) = streaming_fast::try_parse_fast(source, opts) {
-        return result;
-    }
-    let tokens = tokenizer::tokenize(source, opts)?;
-    parser_impl::parse_tokens(&tokens, source, opts)
+    streaming_fast::try_parse_fast(source, opts)
+        .expect("streaming parser always returns a result")
 }
 
 /// Parse ODIN text into a chain of documents.
@@ -74,6 +67,5 @@ pub fn parse_documents(input: &str, options: Option<&ParseOptions>) -> Result<Ve
         None => { default_opts = ParseOptions::default(); &default_opts }
     };
     let source = input.strip_prefix('\u{FEFF}').unwrap_or(input);
-    let tokens = tokenizer::tokenize(source, opts)?;
-    parser_impl::parse_tokens_multi(&tokens, source, opts)
+    streaming_fast::parse_documents(source, opts)
 }
