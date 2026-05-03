@@ -24,18 +24,15 @@ use std::sync::OnceLock;
 use crate::types::transform::DynValue;
 
 /// A verb function signature.
-pub type VerbFn = fn(&[DynValue], &VerbContext) -> Result<DynValue, String>;
+pub type VerbFn = for<'a> fn(&[DynValue], &VerbContext<'a>) -> Result<DynValue, String>;
 
-/// Context available to verbs during execution.
-pub struct VerbContext {
-    /// Source data for the current record.
-    pub source: DynValue,
-    /// Loop variables (current item, index, etc.).
-    pub loop_vars: HashMap<String, DynValue>,
-    /// Accumulators for aggregation.
-    pub accumulators: HashMap<String, DynValue>,
-    /// Lookup tables.
-    pub tables: HashMap<String, crate::types::transform::LookupTable>,
+/// Context available to verbs during execution. Fields borrow from the
+/// caller's `ExecContext` to avoid deep clones per verb invocation.
+pub struct VerbContext<'a> {
+    pub source: &'a DynValue,
+    pub loop_vars: &'a HashMap<String, DynValue>,
+    pub accumulators: &'a HashMap<String, DynValue>,
+    pub tables: &'a HashMap<String, crate::types::transform::LookupTable>,
 }
 
 /// Global singleton for built-in verbs (initialized once, shared across all executions).
@@ -1782,12 +1779,16 @@ mod extended_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn ctx() -> VerbContext {
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
         VerbContext {
-            source: DynValue::Null,
-            loop_vars: HashMap::new(),
-            accumulators: HashMap::new(),
-            tables: HashMap::new(),
+            source: &NULL,
+            loop_vars: LV.get_or_init(HashMap::new),
+            accumulators: ACC.get_or_init(HashMap::new),
+            tables: TBL.get_or_init(HashMap::new),
         }
     }
 
@@ -2428,12 +2429,16 @@ mod extended_tests_2 {
     use super::*;
     use std::collections::HashMap;
 
-    fn ctx() -> VerbContext {
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
         VerbContext {
-            source: DynValue::Null,
-            loop_vars: HashMap::new(),
-            accumulators: HashMap::new(),
-            tables: HashMap::new(),
+            source: &NULL,
+            loop_vars: LV.get_or_init(HashMap::new),
+            accumulators: ACC.get_or_init(HashMap::new),
+            tables: TBL.get_or_init(HashMap::new),
         }
     }
 

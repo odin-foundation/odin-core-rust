@@ -921,12 +921,12 @@ fn execute_verb_call(
         None => return Err(format!("unknown verb: '{}'", call.verb)),
     };
 
-    // Build verb context
+    // Build verb context (borrowed — see VerbContext docs)
     let verb_ctx = VerbContext {
-        source: current_source.clone(),
-        loop_vars: ctx.loop_vars.clone(),
-        accumulators: ctx.accumulators.clone(),
-        tables: ctx.tables.clone(),
+        source: current_source,
+        loop_vars: &ctx.loop_vars,
+        accumulators: &ctx.accumulators,
+        tables: &ctx.tables,
     };
 
     let result = verb_fn(&evaluated_args, &verb_ctx)?;

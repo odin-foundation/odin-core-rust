@@ -1891,12 +1891,16 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn ctx() -> VerbContext {
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
         VerbContext {
-            source: DynValue::Null,
-            loop_vars: HashMap::new(),
-            accumulators: HashMap::new(),
-            tables: HashMap::new(),
+            source: &NULL,
+            loop_vars: LV.get_or_init(HashMap::new),
+            accumulators: ACC.get_or_init(HashMap::new),
+            tables: TBL.get_or_init(HashMap::new),
         }
     }
 
@@ -2826,12 +2830,16 @@ mod extended_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn ctx() -> VerbContext {
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
         VerbContext {
-            source: DynValue::Null,
-            loop_vars: HashMap::new(),
-            accumulators: HashMap::new(),
-            tables: HashMap::new(),
+            source: &NULL,
+            loop_vars: LV.get_or_init(HashMap::new),
+            accumulators: ACC.get_or_init(HashMap::new),
+            tables: TBL.get_or_init(HashMap::new),
         }
     }
     fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }

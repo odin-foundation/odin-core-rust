@@ -1504,12 +1504,31 @@ mod tests {
     fn obj(pairs: Vec<(&str, DynValue)>) -> DynValue {
         DynValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
     }
-    fn ctx() -> VerbContext {
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
         VerbContext {
-            source: DynValue::Null,
-            loop_vars: HashMap::new(),
-            accumulators: HashMap::new(),
-            tables: HashMap::new(),
+            source: &NULL,
+            loop_vars: LV.get_or_init(HashMap::new),
+            accumulators: ACC.get_or_init(HashMap::new),
+            tables: TBL.get_or_init(HashMap::new),
+        }
+    }
+
+    /// Test helper: holds owned maps so a test can mutate them and then
+    /// borrow a `VerbContext` from them via `.ctx()`.
+    struct OwnedCtx {
+        null: DynValue,
+        lv: HashMap<String, DynValue>,
+        acc: HashMap<String, DynValue>,
+        tbl: HashMap<String, crate::types::transform::LookupTable>,
+    }
+    impl OwnedCtx {
+        fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
+        fn ctx(&self) -> VerbContext<'_> {
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl }
         }
     }
 
@@ -2555,9 +2574,9 @@ mod tests {
 
     #[test]
     fn accumulate_adds_to_existing() {
-        let mut c = ctx();
-        c.accumulators.insert("total".to_string(), i(10));
-        let result = accumulate(&[s("total"), i(5)], &c).unwrap();
+        let mut h = OwnedCtx::new();
+        h.acc.insert("total".to_string(), i(10));
+        let result = accumulate(&[s("total"), i(5)], &h.ctx()).unwrap();
         assert_eq!(result, i(15));
     }
 
@@ -2572,9 +2591,9 @@ mod tests {
 
     #[test]
     fn row_number_from_context() {
-        let mut c = ctx();
-        c.loop_vars.insert("$index".to_string(), i(7));
-        assert_eq!(row_number(&[], &c).unwrap(), i(7));
+        let mut h = OwnedCtx::new();
+        h.lv.insert("$index".to_string(), i(7));
+        assert_eq!(row_number(&[], &h.ctx()).unwrap(), i(7));
     }
 
     #[test]
@@ -2588,12 +2607,29 @@ mod extended_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn ctx() -> VerbContext {
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
         VerbContext {
-            source: DynValue::Null,
-            loop_vars: HashMap::new(),
-            accumulators: HashMap::new(),
-            tables: HashMap::new(),
+            source: &NULL,
+            loop_vars: LV.get_or_init(HashMap::new),
+            accumulators: ACC.get_or_init(HashMap::new),
+            tables: TBL.get_or_init(HashMap::new),
+        }
+    }
+
+    struct OwnedCtx {
+        null: DynValue,
+        lv: HashMap<String, DynValue>,
+        acc: HashMap<String, DynValue>,
+        tbl: HashMap<String, crate::types::transform::LookupTable>,
+    }
+    impl OwnedCtx {
+        fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
+        fn ctx(&self) -> VerbContext<'_> {
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl }
         }
     }
 
@@ -4123,17 +4159,17 @@ mod extended_tests {
 
     #[test]
     fn accumulate_float_addition() {
-        let mut c = ctx();
-        c.accumulators.insert("total".to_string(), f(10.5));
-        let result = accumulate(&[s("total"), f(5.5)], &c).unwrap();
+        let mut h = OwnedCtx::new();
+        h.acc.insert("total".to_string(), f(10.5));
+        let result = accumulate(&[s("total"), f(5.5)], &h.ctx()).unwrap();
         assert_eq!(result, f(16.0));
     }
 
     #[test]
     fn accumulate_int_float_cross() {
-        let mut c = ctx();
-        c.accumulators.insert("total".to_string(), i(10));
-        let result = accumulate(&[s("total"), f(5.5)], &c).unwrap();
+        let mut h = OwnedCtx::new();
+        h.acc.insert("total".to_string(), i(10));
+        let result = accumulate(&[s("total"), f(5.5)], &h.ctx()).unwrap();
         assert_eq!(result, f(15.5));
     }
 
@@ -4285,9 +4321,9 @@ mod extended_tests {
 
     #[test]
     fn sequence_with_existing_counter() {
-        let mut c = ctx();
-        c.accumulators.insert("__seq_counter".to_string(), i(5));
-        assert_eq!(sequence(&[s("counter")], &c).unwrap(), i(5));
+        let mut h = OwnedCtx::new();
+        h.acc.insert("__seq_counter".to_string(), i(5));
+        assert_eq!(sequence(&[s("counter")], &h.ctx()).unwrap(), i(5));
     }
 
     #[test]
@@ -4306,9 +4342,9 @@ mod extended_tests {
 
     #[test]
     fn row_number_large_index() {
-        let mut c = ctx();
-        c.loop_vars.insert("$index".to_string(), i(999));
-        assert_eq!(row_number(&[], &c).unwrap(), i(999));
+        let mut h = OwnedCtx::new();
+        h.lv.insert("$index".to_string(), i(999));
+        assert_eq!(row_number(&[], &h.ctx()).unwrap(), i(999));
     }
 
     // =========================================================================
@@ -4408,16 +4444,34 @@ mod extended_tests {
         if let DynValue::Array(items) = result { assert_eq!(items.len(), 1); } else { panic!(); }
     }
 }
+#[cfg(test)]
 mod extended_tests_2 {
     use super::*;
     use std::collections::HashMap;
 
-    fn ctx() -> VerbContext {
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
         VerbContext {
-            source: DynValue::Null,
-            loop_vars: HashMap::new(),
-            accumulators: HashMap::new(),
-            tables: HashMap::new(),
+            source: &NULL,
+            loop_vars: LV.get_or_init(HashMap::new),
+            accumulators: ACC.get_or_init(HashMap::new),
+            tables: TBL.get_or_init(HashMap::new),
+        }
+    }
+
+    struct OwnedCtx {
+        null: DynValue,
+        lv: HashMap<String, DynValue>,
+        acc: HashMap<String, DynValue>,
+        tbl: HashMap<String, crate::types::transform::LookupTable>,
+    }
+    impl OwnedCtx {
+        fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
+        fn ctx(&self) -> VerbContext<'_> {
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl }
         }
     }
     fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }
@@ -5535,9 +5589,9 @@ mod extended_tests_2 {
 
     #[test]
     fn row_number_from_context() {
-        let mut c = ctx();
-        c.loop_vars.insert("$index".to_string(), i(42));
-        assert_eq!(row_number(&[], &c).unwrap(), i(42));
+        let mut h = OwnedCtx::new();
+        h.lv.insert("$index".to_string(), i(42));
+        assert_eq!(row_number(&[], &h.ctx()).unwrap(), i(42));
     }
 
     #[test]
