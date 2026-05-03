@@ -348,17 +348,10 @@ fn execute_multi_record(
         }
     }
 
-    // Collect records to process (to avoid borrow issues)
-    let records: Vec<(String, &TransformSegment)> = raw_input.lines()
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| {
-            let disc_value = extract_discriminator_value(line, &disc_mode, delimiter);
-            segment_map.get(&disc_value).map(|seg| (line.to_string(), *seg))
-        })
-        .collect();
-
-    // Process each record
-    for (line, segment) in &records {
+    // Stream records directly from raw_input — no intermediate Vec.
+    for line in raw_input.lines().filter(|l| !l.is_empty()) {
+        let disc_value = extract_discriminator_value(line, &disc_mode, delimiter);
+        let Some(segment) = segment_map.get(&disc_value).copied() else { continue; };
         let record_source = parse_record(line, source_format, delimiter);
         ctx.source = &DynValue::Null; // Not used for multi-record — process_mapping gets source directly
 
