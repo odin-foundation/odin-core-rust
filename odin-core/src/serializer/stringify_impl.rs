@@ -140,39 +140,36 @@ fn write_value(output: &mut String, value: &OdinValue, canonical: bool) {
             if let Some(r) = raw {
                 output.push_str(r);
             } else {
-                output.push_str(&value.to_string());
+                let mut buf = itoa::Buffer::new();
+                output.push_str(buf.format(*value));
             }
         }
         OdinValue::Number { value, raw, decimal_places, .. } => {
             output.push('#');
             if canonical {
-                // Canonical: strip trailing zeros, don't use raw
                 write_canonical_number(output, *value);
             } else if let Some(r) = raw {
                 output.push_str(r);
             } else if let Some(dp) = decimal_places {
                 let _ = write!(output, "{value:.prec$}", prec = *dp as usize);
             } else {
-                output.push_str(&value.to_string());
+                let _ = write!(output, "{value}");
             }
         }
         OdinValue::Currency { value, raw, decimal_places, currency_code, .. } => {
             output.push_str("#$");
             if canonical {
-                // Canonical: always at least 2 decimal places, don't use raw
                 let dp = (*decimal_places as usize).max(2);
                 let _ = write!(output, "{value:.prec$}", prec = dp);
                 if let Some(code) = currency_code {
                     output.push(':');
-                    output.push_str(&code.to_uppercase());
+                    push_ascii_uppercase(output, code);
                 }
             } else if let Some(r) = raw {
-                // Raw already contains numeric part and currency code if present,
-                // but we need to uppercase the currency code in canonical form
                 if let Some(colon_pos) = r.find(':') {
                     output.push_str(&r[..colon_pos]);
                     output.push(':');
-                    output.push_str(&r[colon_pos + 1..].to_uppercase());
+                    push_ascii_uppercase(output, &r[colon_pos + 1..]);
                 } else {
                     output.push_str(r);
                     if let Some(code) = currency_code {
@@ -193,7 +190,7 @@ fn write_value(output: &mut String, value: &OdinValue, canonical: bool) {
             if let Some(r) = raw {
                 output.push_str(r);
             } else {
-                output.push_str(&value.to_string());
+                let _ = write!(output, "{value}");
             }
         }
         OdinValue::Date { raw, .. } | OdinValue::Timestamp { raw, .. } => output.push_str(raw),
@@ -252,8 +249,19 @@ fn write_directive(output: &mut String, directive: &OdinDirective) {
         output.push(' ');
         match val {
             crate::types::values::DirectiveValue::String(s) => output.push_str(s),
-            crate::types::values::DirectiveValue::Number(n) => output.push_str(&n.to_string()),
+            crate::types::values::DirectiveValue::Number(n) => {
+                let _ = write!(output, "{n}");
+            }
         }
+    }
+}
+
+/// Push `s` uppercased into `output` without an intermediate String.
+fn push_ascii_uppercase(output: &mut String, s: &str) {
+    output.reserve(s.len());
+    for b in s.bytes() {
+        let c = if b.is_ascii_lowercase() { b - 32 } else { b };
+        output.push(c as char);
     }
 }
 
@@ -345,87 +353,59 @@ fn write_canonical_number(output: &mut String, value: f64) {
     }
 }
 
-/// Sort key for a path; numeric for `[N]` segments, lexicographic otherwise.
-fn canonical_sort_key(path: &str) -> Vec<SegmentKey<'_>> {
-    PathSegmentIter::new(path)
-        .map(|seg| {
-            let numeric = if seg.starts_with('[') && seg.ends_with(']') {
-                seg[1..seg.len() - 1].parse::<usize>().ok()
+/// Build a single byte key whose lexicographic order matches canonical sort
+/// order. Each segment is prefixed with a marker so numeric segments (`[N]`)
+/// sort before any text segment, and within numeric segments the index is
+/// compared numerically (8-byte big-endian — fits any usize on 64-bit).
+fn canonical_sort_key(path: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(path.len() + 8);
+    let bytes = path.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'.' {
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b'[' {
+            let start = pos + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b']' {
+                end += 1;
+            }
+            let inner = &bytes[start..end];
+            let close = if end < bytes.len() { end + 1 } else { end };
+            // Try to parse as u64 — succeeds for normal `[N]` indices.
+            if let Some(n) = parse_usize_bytes(inner) {
+                key.push(0x00);
+                key.extend_from_slice(&n.to_be_bytes());
             } else {
-                None
-            };
-            SegmentKey { text: seg, numeric }
-        })
-        .collect()
-}
-
-#[derive(Eq, PartialEq)]
-struct SegmentKey<'a> {
-    text: &'a str,
-    numeric: Option<usize>,
-}
-
-impl<'a> Ord for SegmentKey<'a> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self.numeric, other.numeric) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            _ => self.text.cmp(other.text),
-        }
-    }
-}
-
-impl<'a> PartialOrd for SegmentKey<'a> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Zero-allocation path segment iterator.
-/// "items[2].name" yields "items", "[2]", "name" as &str slices.
-struct PathSegmentIter<'a> {
-    path: &'a str,
-    pos: usize,
-}
-
-impl<'a> PathSegmentIter<'a> {
-    fn new(path: &'a str) -> Self {
-        Self { path, pos: 0 }
-    }
-}
-
-impl<'a> Iterator for PathSegmentIter<'a> {
-    type Item = &'a str;
-
-    fn next(&mut self) -> Option<&'a str> {
-        let bytes = self.path.as_bytes();
-        if self.pos >= bytes.len() {
-            return None;
-        }
-        // Skip leading dot
-        if bytes[self.pos] == b'.' {
-            self.pos += 1;
-            if self.pos >= bytes.len() {
-                return None;
+                // Fallback: encode the whole `[…]` segment as text, matching the
+                // legacy `else` branch where SegmentKey.numeric was None.
+                key.push(0x01);
+                key.extend_from_slice(&bytes[pos..close]);
             }
-        }
-        let start = self.pos;
-        if bytes[start] == b'[' {
-            // Array index segment: consume until ']'
-            while self.pos < bytes.len() && bytes[self.pos] != b']' {
-                self.pos += 1;
-            }
-            if self.pos < bytes.len() {
-                self.pos += 1; // consume ']'
-            }
-            Some(&self.path[start..self.pos])
+            pos = close;
         } else {
-            // Regular segment: consume until '.' or '['
-            while self.pos < bytes.len() && bytes[self.pos] != b'.' && bytes[self.pos] != b'[' {
-                self.pos += 1;
+            key.push(0x01);
+            let start = pos;
+            while pos < bytes.len() && bytes[pos] != b'.' && bytes[pos] != b'[' {
+                pos += 1;
             }
-            Some(&self.path[start..self.pos])
+            key.extend_from_slice(&bytes[start..pos]);
         }
     }
+    key
+}
+
+#[inline]
+fn parse_usize_bytes(s: &[u8]) -> Option<u64> {
+    if s.is_empty() { return None; }
+    let mut n: u64 = 0;
+    for &b in s {
+        if !b.is_ascii_digit() { return None; }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(n)
 }
 
 #[cfg(test)]

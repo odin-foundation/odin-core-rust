@@ -273,6 +273,33 @@ mod tests {
         }
     }
 
+    // ── Numeric vs lexicographic ordering of `[N]` segments ────────────────
+
+    #[test]
+    fn array_indices_sort_numerically_not_lexicographically() {
+        let mut doc = OdinDocument::empty();
+        doc.assignments.insert("items[10].name".to_string(), OdinValues::string("ten"));
+        doc.assignments.insert("items[2].name".to_string(), OdinValues::string("two"));
+        let out = String::from_utf8(canonicalize(&doc)).unwrap();
+        let p2 = out.find("items[2]").unwrap();
+        let p10 = out.find("items[10]").unwrap();
+        assert!(p2 < p10, "expected items[2] before items[10], got:\n{out}");
+    }
+
+    #[test]
+    fn numeric_segments_sort_before_text_in_brackets() {
+        let mut doc = OdinDocument::empty();
+        doc.assignments.insert("x[2]".to_string(), OdinValues::string("two"));
+        doc.assignments.insert("x[abc]".to_string(), OdinValues::string("abc"));
+        doc.assignments.insert("x[10]".to_string(), OdinValues::string("ten"));
+        let out = String::from_utf8(canonicalize(&doc)).unwrap();
+        let p2 = out.find("x[2]").unwrap();
+        let p10 = out.find("x[10]").unwrap();
+        let pabc = out.find("x[abc]").unwrap();
+        assert!(p2 < p10);
+        assert!(p10 < pabc);
+    }
+
     // ── Multiple fields stability ───────────────────────────────────────────
 
     #[test]
