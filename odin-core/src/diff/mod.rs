@@ -9,12 +9,14 @@ use crate::types::errors::PatchError;
 
 /// Compare two documents and produce a diff.
 pub fn diff(a: &OdinDocument, b: &OdinDocument) -> OdinDiff {
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut changed = Vec::new();
-    let mut moved = Vec::new();
+    // Heuristic capacity: most diffs touch a fraction of total fields. Sizing
+    // for ~1/4 of a covers typical change rates without large overshoot.
+    let cap = (a.assignments.len() / 4).max(4);
+    let mut added = Vec::with_capacity(cap);
+    let mut removed = Vec::with_capacity(cap);
+    let mut changed = Vec::with_capacity(cap);
+    let mut moved: Vec<PathMove> = Vec::new();
 
-    // Find removed and changed
     for (path, value_a) in &a.assignments {
         if let Some(value_b) = b.assignments.get(path) {
             if value_a != value_b {
@@ -32,7 +34,6 @@ pub fn diff(a: &OdinDocument, b: &OdinDocument) -> OdinDiff {
         }
     }
 
-    // Find added
     for (path, value_b) in &b.assignments {
         if !a.assignments.contains_key(path) {
             added.push(PathValue {
@@ -42,42 +43,42 @@ pub fn diff(a: &OdinDocument, b: &OdinDocument) -> OdinDiff {
         }
     }
 
-    // Detect moves: a removed value that appears as an added value
-    // Use HashSet for O(1) contains checks instead of Vec O(n)
-    let mut move_removed_indices = Vec::new();
-    let mut move_added_set = std::collections::HashSet::new();
-    for (ri, rem) in removed.iter().enumerate() {
-        for (ai, add) in added.iter().enumerate() {
-            if !move_added_set.contains(&ai) && rem.value == add.value {
-                moved.push(PathMove {
-                    from: rem.path.clone(),
-                    to: add.path.clone(),
-                    value: rem.value.clone(),
-                });
-                move_removed_indices.push(ri);
-                move_added_set.insert(ai);
-                break;
+    // Move detection: only runs when both sides are non-empty (the common
+    // case is changes, not moves). When it does run, swap-remove matched
+    // entries in reverse order to preserve unmatched indices.
+    if !removed.is_empty() && !added.is_empty() {
+        let mut taken = vec![false; added.len()];
+        let mut keep_removed = Vec::with_capacity(removed.len());
+        for rem in removed.drain(..) {
+            let mut matched = None;
+            for (ai, add) in added.iter().enumerate() {
+                if !taken[ai] && rem.value == add.value {
+                    matched = Some(ai);
+                    break;
+                }
+            }
+            match matched {
+                Some(ai) => {
+                    taken[ai] = true;
+                    moved.push(PathMove {
+                        from: rem.path,
+                        to: added[ai].path.clone(),
+                        value: rem.value,
+                    });
+                }
+                None => keep_removed.push(rem),
+            }
+        }
+        removed = keep_removed;
+        // Drop matched added entries in reverse order.
+        for ai in (0..taken.len()).rev() {
+            if taken[ai] {
+                added.swap_remove(ai);
             }
         }
     }
 
-    // Remove matched items from added/removed (in reverse order to preserve indices)
-    move_removed_indices.sort_unstable_by(|a, b| b.cmp(a));
-    for i in &move_removed_indices {
-        removed.swap_remove(*i);
-    }
-    let mut move_added_indices: Vec<usize> = move_added_set.into_iter().collect();
-    move_added_indices.sort_unstable_by(|a, b| b.cmp(a));
-    for i in &move_added_indices {
-        added.swap_remove(*i);
-    }
-
-    OdinDiff {
-        added,
-        removed,
-        changed,
-        moved,
-    }
+    OdinDiff { added, removed, changed, moved }
 }
 
 /// Apply a diff to a document, producing a new document.
