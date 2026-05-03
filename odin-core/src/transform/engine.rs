@@ -128,7 +128,8 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
 
     let mut is_first_pass = true;
     let mut current_pass: Option<usize> = None;
-    for seg in &ordered {
+    let last_idx = ordered.len().saturating_sub(1);
+    for (idx, seg) in ordered.iter().enumerate() {
         // Reset non-persist accumulators at each pass transition (matching TS behavior).
         // The first pass never resets. All subsequent pass transitions do.
         let seg_pass = seg.pass;
@@ -146,8 +147,11 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
         }
 
         process_segment(seg, &mut ctx, &mut output, "");
-        // Update global output snapshot for cross-segment references
-        ctx.global_output = output.clone();
+        // Snapshot for cross-segment refs in later segments. The clone after
+        // the last segment is never read.
+        if idx < last_idx {
+            ctx.global_output = output.clone();
+        }
     }
 
     // 4. Apply confidential enforcement to the entire output tree
