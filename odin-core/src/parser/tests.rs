@@ -134,6 +134,18 @@ use crate::Odin;
 #[test] fn bare_string_error() { assert!(Odin::parse("x = bareword\n").is_err()); }
 #[test] fn negative_array_index() { assert!(Odin::parse("x[-1] = \"bad\"\n").is_err()); }
 #[test] fn non_contiguous_array() { assert!(Odin::parse("x[0] = \"a\"\nx[2] = \"c\"\n").is_err()); }
+// Index that overflows i64 must error, not silently collide at [0].
+#[test] fn array_index_overflow_errors() { assert!(Odin::parse("x[99999999999999999999] = \"bad\"\n").is_err()); }
+// Same overflow but with leading zeros — normalization path must not mask it.
+#[test] fn array_index_overflow_with_leading_zeros_errors() { assert!(Odin::parse("x[0099999999999999999999] = \"bad\"\n").is_err()); }
+// Tabular section header parses cleanly (regression guard for dedupe of the
+// `contains("[] :") || contains("[] :")` dead-code condition).
+#[test] fn tabular_section_header_parses() {
+    let d = Odin::parse("{rows[] : id, name}\n##0, \"Alice\"\n##1, \"Bob\"\n").unwrap();
+    assert_eq!(d.get_string("rows[0].name"), Some("Alice"));
+    assert_eq!(d.get_string("rows[1].name"), Some("Bob"));
+    assert_eq!(d.get_integer("rows[0].id"), Some(0));
+}
 #[test] fn multiple_newlines() { let d = Odin::parse("x = ##1\n\n\n\ny = ##2\n").unwrap(); assert_eq!(d.get_integer("x"), Some(1)); assert_eq!(d.get_integer("y"), Some(2)); }
 #[test] fn trailing_whitespace() { let d = Odin::parse("x = ##42   \n").unwrap(); assert_eq!(d.get_integer("x"), Some(42)); }
 #[test] fn leading_whitespace() { let d = Odin::parse("  x = ##42\n").unwrap(); assert_eq!(d.get_integer("x"), Some(42)); }

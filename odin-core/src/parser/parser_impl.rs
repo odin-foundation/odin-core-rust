@@ -171,7 +171,7 @@ impl<'a> Parser<'a> {
                     } else if header_value.starts_with('@') {
                         in_metadata = false;
                         self.current_header = Some(header_value.strip_prefix('@').unwrap_or(&header_value).to_string());
-                    } else if header_value.contains("[] :") || header_value.contains("[] :") {
+                    } else if header_value.contains("[] :") {
                         // Tabular section `{name[] : col, ...}`. A leading `.` makes
                         // it relative to the last absolute header.
                         in_metadata = false;
@@ -325,16 +325,29 @@ impl<'a> Parser<'a> {
                                     i += 1;
                                 }
                                 if i > start && i < bytes.len() && bytes[i] == b']' {
-                                    // Parse and re-emit to strip leading zeros
-                                    let idx: i64 = full_path[start..i].parse().unwrap_or(0);
-                                    normalized.push_str(&idx.to_string());
+                                    // Parse and re-emit to strip leading zeros. On
+                                    // overflow, preserve the original digits so the
+                                    // validation pass can surface a real error
+                                    // instead of silently collapsing to [0].
+                                    match full_path[start..i].parse::<i64>() {
+                                        Ok(idx) => normalized.push_str(&idx.to_string()),
+                                        Err(_) => normalized.push_str(&full_path[start..i]),
+                                    }
                                 } else {
                                     // Not a pure-digit index, preserve as-is
                                     normalized.push_str(&full_path[start..i]);
                                 }
                             } else {
-                                normalized.push(bytes[i] as char);
-                                i += 1;
+                                // Copy the run of non-`[` bytes as a single slice —
+                                // preserves UTF-8 and avoids per-byte push.
+                                let run_end = full_path[i..]
+                                    .as_bytes()
+                                    .iter()
+                                    .position(|&b| b == b'[')
+                                    .map(|p| i + p)
+                                    .unwrap_or(bytes.len());
+                                normalized.push_str(&full_path[i..run_end]);
+                                i = run_end;
                             }
                         }
                         full_path = normalized;
@@ -362,28 +375,39 @@ impl<'a> Parser<'a> {
                             let abs_bp = search_start + bp;
                             if let Some(cp) = full_path[abs_bp..].find(']') {
                                 let idx_str = &full_path[abs_bp + 1..abs_bp + cp];
-                                if !idx_str.is_empty() {
-                                    if let Ok(idx) = idx_str.parse::<i64>() {
-                                        if idx < 0 {
-                                            return Err(ParseError::with_message(
-                                                ParseErrorCode::InvalidArrayIndex,
-                                                path_line, path_col,
-                                                &format!("Negative array index: {idx}"),
-                                            ));
+                                if !idx_str.is_empty() && idx_str.bytes().all(|b| b.is_ascii_digit()) {
+                                    match idx_str.parse::<i64>() {
+                                        Ok(idx) => {
+                                            if idx < 0 {
+                                                return Err(ParseError::with_message(
+                                                    ParseErrorCode::InvalidArrayIndex,
+                                                    path_line, path_col,
+                                                    &format!("Negative array index: {idx}"),
+                                                ));
+                                            }
+                                            if idx > MAX_ARRAY_INDEX {
+                                                return Err(ParseError::with_message(
+                                                    ParseErrorCode::ArrayIndexOutOfRange,
+                                                    path_line, path_col,
+                                                    &format!("Array index {idx} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
+                                                ));
+                                            }
+                                            cumulative += idx;
+                                            if cumulative > MAX_ARRAY_INDEX {
+                                                return Err(ParseError::with_message(
+                                                    ParseErrorCode::ArrayIndexOutOfRange,
+                                                    path_line, path_col,
+                                                    &format!("Cumulative array indices exceed maximum allowed value of {MAX_ARRAY_INDEX}"),
+                                                ));
+                                            }
                                         }
-                                        if idx > MAX_ARRAY_INDEX {
+                                        Err(_) => {
+                                            // All-digit but doesn't fit in i64 — must
+                                            // be larger than MAX_ARRAY_INDEX.
                                             return Err(ParseError::with_message(
                                                 ParseErrorCode::ArrayIndexOutOfRange,
                                                 path_line, path_col,
-                                                &format!("Array index {idx} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
-                                            ));
-                                        }
-                                        cumulative += idx;
-                                        if cumulative > MAX_ARRAY_INDEX {
-                                            return Err(ParseError::with_message(
-                                                ParseErrorCode::ArrayIndexOutOfRange,
-                                                path_line, path_col,
-                                                &format!("Cumulative array indices exceed maximum allowed value of {MAX_ARRAY_INDEX}"),
+                                                &format!("Array index {idx_str} exceeds maximum allowed value of {MAX_ARRAY_INDEX}"),
                                             ));
                                         }
                                     }
