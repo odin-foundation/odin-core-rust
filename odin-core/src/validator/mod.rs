@@ -8,6 +8,8 @@ pub mod schema_parser;
 pub mod schema_serializer;
 pub mod validate_redos;
 
+use std::borrow::Cow;
+
 use crate::types::document::OdinDocument;
 use crate::types::schema::{
     OdinSchemaDefinition, SchemaConstraint, SchemaField,
@@ -658,10 +660,14 @@ fn validate_cardinality(
 ///
 /// For `@Child : @Parent`, the child type inherits all fields from the parent
 /// that it doesn't already define (child fields take precedence).
-fn expand_type_composition(schema: &OdinSchemaDefinition) -> OdinSchemaDefinition {
+fn expand_type_composition(schema: &OdinSchemaDefinition) -> Cow<'_, OdinSchemaDefinition> {
+    // Skip the schema clone when no types declare parents.
+    if schema.types.values().all(|t| t.parents.is_empty()) {
+        return Cow::Borrowed(schema);
+    }
+
     let mut expanded = schema.clone();
 
-    // Iterate types and merge parent fields
     let type_names: Vec<String> = expanded.types.keys().cloned().collect();
     for type_name in &type_names {
         let parents = {
@@ -674,7 +680,6 @@ fn expand_type_composition(schema: &OdinSchemaDefinition) -> OdinSchemaDefinitio
 
         let mut inherited_fields = Vec::new();
         for parent_name in &parents {
-            // Strip leading @ if present
             let clean_name = parent_name.strip_prefix('@').unwrap_or(parent_name);
             if let Some(parent_type) = schema.types.get(clean_name) {
                 for field in &parent_type.fields {
@@ -683,7 +688,6 @@ fn expand_type_composition(schema: &OdinSchemaDefinition) -> OdinSchemaDefinitio
             }
         }
 
-        // Merge: add inherited fields that don't conflict with existing child fields
         let Some(child_type) = expanded.types.get_mut(type_name) else { continue; };
         let existing_names: Vec<String> = child_type.fields.iter().map(|f| f.name.clone()).collect();
         for field in inherited_fields {
@@ -693,7 +697,7 @@ fn expand_type_composition(schema: &OdinSchemaDefinition) -> OdinSchemaDefinitio
         }
     }
 
-    expanded
+    Cow::Owned(expanded)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -816,23 +820,23 @@ fn validate_strict(
     schema: &OdinSchemaDefinition,
     errors: &mut Vec<ValidationError>,
 ) {
+    // Pre-compute prefixes/suffixes once instead of allocating inside the
+    // per-path loop.
+    let array_prefixes: Vec<String> = schema.arrays.keys()
+        .map(|p| format!("{p}["))
+        .collect();
+    let type_field_suffixes: Vec<String> = schema.types.values()
+        .flat_map(|t| t.fields.iter().map(|f| format!(".{}", f.name)))
+        .collect();
+
     for path in doc.assignments.keys() {
-        // Check if path is known in schema fields
         if schema.fields.contains_key(path) {
             continue;
         }
-        // Check if path is part of an array
-        let is_array_item = schema.arrays.keys().any(|arr_path| {
-            path.starts_with(&format!("{arr_path}["))
-        });
-        if is_array_item {
+        if array_prefixes.iter().any(|p| path.starts_with(p)) {
             continue;
         }
-        // Check if path matches a type field
-        let is_type_field = schema.types.values().any(|t| {
-            t.fields.iter().any(|f| path.ends_with(&format!(".{}", f.name)))
-        });
-        if is_type_field {
+        if type_field_suffixes.iter().any(|s| path.ends_with(s)) {
             continue;
         }
 
