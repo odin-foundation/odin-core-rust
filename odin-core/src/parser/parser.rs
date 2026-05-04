@@ -23,6 +23,12 @@ use crate::types::options::ParseOptions;
 use crate::types::values::{DirectiveValue, OdinDirective, OdinModifiers, OdinValue, OdinValues};
 
 const MAX_ARRAY_INDEX: i64 = 1_000_000;
+/// Per-tabular-section column-count cap. Bounds attacker-influenced
+/// allocations from headers like `{x[] : a, b, c, ...}` with very many
+/// comma-separated columns.
+const MAX_TABULAR_COLUMNS: usize = 1024;
+/// Per-tabular-section row-count cap.
+const MAX_TABULAR_ROWS: usize = 1_000_000;
 
 pub(super) fn parse(source: &str, options: &ParseOptions) -> Result<OdinDocument, ParseError> {
     if source.len() > options.max_size {
@@ -346,6 +352,13 @@ impl<'a> Parser<'a> {
                 let mut cols = Vec::with_capacity(8);
                 let mut last_parent = String::new();
                 for raw in cols_str.split(',') {
+                    if cols.len() >= MAX_TABULAR_COLUMNS {
+                        return StepResult::Err(ParseError::with_message(
+                            ParseErrorCode::InvalidHeaderSyntax,
+                            start_line as usize, start_col as usize,
+                            &format!("Tabular column count exceeds maximum {MAX_TABULAR_COLUMNS}"),
+                        ));
+                    }
                     let trimmed = raw.trim();
                     if trimmed.is_empty() {
                         return StepResult::Err(ParseError::with_message(
@@ -414,6 +427,13 @@ impl<'a> Parser<'a> {
             let cols_str = &rest[bracket_pos + 1..close_idx];
             let mut columns = Vec::with_capacity(8);
             for raw in cols_str.split(',') {
+                if columns.len() >= MAX_TABULAR_COLUMNS {
+                    return StepResult::Err(ParseError::with_message(
+                        ParseErrorCode::InvalidHeaderSyntax,
+                        start_line as usize, start_col as usize,
+                        &format!("Tabular column count exceeds maximum {MAX_TABULAR_COLUMNS}"),
+                    ));
+                }
                 let trimmed = raw.trim();
                 if trimmed.is_empty() { return StepResult::Bail; }
                 columns.push(trimmed.to_string());
@@ -847,10 +867,19 @@ impl<'a> Parser<'a> {
         while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
             self.pos += 1;
         }
-        let value = match self.parse_value(line, col) {
-            ValueStep::Ok(v) => v,
-            ValueStep::Bail => return StepResult::Err(bail_to_err(line, col)),
-            ValueStep::Err(e) => return StepResult::Err(e),
+        // Empty value at EOF or end-of-line — match parse_assignment semantics.
+        let value = if self.pos >= self.bytes.len()
+            || self.bytes[self.pos] == b'\n'
+            || self.bytes[self.pos] == b'\r'
+            || self.bytes[self.pos] == b';'
+        {
+            OdinValues::string("")
+        } else {
+            match self.parse_value(line, col) {
+                ValueStep::Ok(v) => v,
+                ValueStep::Bail => return StepResult::Err(bail_to_err(line, col)),
+                ValueStep::Err(e) => return StepResult::Err(e),
+            }
         };
         // Skip any trailing directives or whitespace until end of line.
         while self.pos < self.bytes.len() {
@@ -978,6 +1007,13 @@ impl<'a> Parser<'a> {
 
         if had_value {
             ctx.row_index += 1;
+            if ctx.row_index > MAX_TABULAR_ROWS {
+                return StepResult::Err(ParseError::with_message(
+                    ParseErrorCode::ArrayIndexOutOfRange,
+                    line, col,
+                    &format!("Tabular row count exceeds maximum {MAX_TABULAR_ROWS}"),
+                ));
+            }
         }
         StepResult::Ok
     }
@@ -985,16 +1021,27 @@ impl<'a> Parser<'a> {
     fn validate_path(&mut self, line: usize, col: usize) -> StepResult {
         let bytes = self.path_buf.as_bytes();
         let mut depth: usize = 1;
-        if memchr::memchr(b'[', bytes).is_none() {
-            depth += memchr::memchr_iter(b'.', bytes).count();
-            if depth > self.options.max_depth {
+        // Locate the first `[` or `]` in one scan; absent → no-bracket fast path.
+        match memchr::memchr2(b'[', b']', bytes) {
+            None => {
+                depth += memchr::memchr_iter(b'.', bytes).count();
+                if depth > self.options.max_depth {
+                    return StepResult::Err(ParseError::with_message(
+                        ParseErrorCode::MaximumDepthExceeded,
+                        line, col,
+                        &format!("Maximum nesting depth exceeded: {depth} > {}", self.options.max_depth),
+                    ));
+                }
+                return StepResult::Ok;
+            }
+            Some(pos) if bytes[pos] == b']' => {
                 return StepResult::Err(ParseError::with_message(
-                    ParseErrorCode::MaximumDepthExceeded,
+                    ParseErrorCode::InvalidArrayIndex,
                     line, col,
-                    &format!("Maximum nesting depth exceeded: {depth} > {}", self.options.max_depth),
+                    "Stray ']' in path",
                 ));
             }
-            return StepResult::Ok;
+            Some(_) => {}
         }
         let mut cumulative: i64 = 0;
         let mut first_bracket: Option<(usize, usize, usize)> = None;
@@ -1002,13 +1049,24 @@ impl<'a> Parser<'a> {
         while i < bytes.len() {
             let b = bytes[i];
             if b == b'.' { depth += 1; i += 1; }
+            else if b == b']' {
+                return StepResult::Err(ParseError::with_message(
+                    ParseErrorCode::InvalidArrayIndex,
+                    line, col,
+                    "Stray ']' in path",
+                ));
+            }
             else if b == b'[' {
                 depth += 1;
                 let bracket_start = i;
                 let idx_start = i + 1;
                 let close = bytes[idx_start..].iter().position(|&c| c == b']');
                 match close {
-                    None => break,
+                    None => return StepResult::Err(ParseError::with_message(
+                        ParseErrorCode::InvalidArrayIndex,
+                        line, col,
+                        "Unclosed '[' in path",
+                    )),
                     Some(off) => {
                         let idx_end = idx_start + off;
                         let idx_slice = &self.path_buf[idx_start..idx_end];

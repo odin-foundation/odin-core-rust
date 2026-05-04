@@ -314,4 +314,42 @@ fn lookup_table_dot_prefix_form() {
     }
 }
 
+// ─── Malformed-input safety (no panics on truncated input) ─────────────────
+
+#[test]
+fn no_panic_on_tabular_assignment_eof_after_equals() {
+    // Truncated tabular assignment ending exactly at `=`.
+    let _ = Odin::parse("{features[] : name, enabled}\n_loop =");
+}
+
+#[test]
+fn no_panic_on_tabular_assignment_whitespace_then_eof() {
+    let _ = Odin::parse("{features[] : name, enabled}\n_loop = ");
+}
+
+#[test]
+fn unclosed_bracket_in_path_is_rejected() {
+    let r = Odin::parse("a[ = ##1\n");
+    assert!(r.is_err(), "expected error for unclosed bracket, got {r:?}");
+}
+
+#[test]
+fn stray_close_bracket_in_path_is_rejected() {
+    let r = Odin::parse("a] = ##1\n");
+    assert!(r.is_err(), "expected error for stray close bracket, got {r:?}");
+}
+
+#[test]
+fn tabular_columns_capped() {
+    let mut header = String::from("{x[] : ");
+    for i in 0..2000 {
+        if i > 0 { header.push_str(", "); }
+        header.push_str(&format!("c{i}"));
+    }
+    header.push('}');
+    header.push('\n');
+    let r = Odin::parse(&header);
+    assert!(r.is_err(), "expected error for excessive tabular columns");
+}
+
 
