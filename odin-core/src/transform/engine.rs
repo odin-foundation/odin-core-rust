@@ -1233,181 +1233,150 @@ impl<'a> Iterator for PathSegmentIter<'a> {
 /// Set a value at the given dotted path in an output `DynValue` tree.
 ///
 /// Creates intermediate objects as needed. Handles `items[]` syntax to push
-/// onto arrays.
+/// onto arrays. Walks the path string in a single pass without allocating an
+/// intermediate parts vector — segments are borrowed back into the path slice
+/// and only cloned when a new key is inserted into a `DynValue::Object`.
 fn set_path(output: &mut DynValue, path: &str, value: DynValue) {
-    let parts = split_set_path(path);
-
-    if parts.is_empty() {
+    let path = path.strip_prefix('.').unwrap_or(path);
+    if path.is_empty() {
         *output = value;
         return;
     }
 
-    if parts.len() == 1 {
-        set_single_field(output, &parts[0], value);
-        return;
+    // Find the first segment boundary, respecting [] depth.
+    let bytes = path.as_bytes();
+    let mut depth = 0i32;
+    let mut end = path.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b'.' if depth == 0 && i > 0 => { end = i; break; }
+            _ => {}
+        }
     }
 
-    // Navigate to the parent, creating intermediate objects
-    let mut current = output;
-    for part in &parts[..parts.len() - 1] {
-        current = ensure_and_descend(current, part);
-    }
+    let seg = &path[..end];
+    let rest_with_dot = &path[end..];
+    let rest = rest_with_dot.strip_prefix('.').unwrap_or(rest_with_dot);
 
-    set_single_field(current, &parts[parts.len() - 1], value);
+    if rest.is_empty() {
+        set_single_field_seg(output, seg, value);
+    } else {
+        let next = ensure_and_descend_seg(output, seg);
+        set_path(next, rest, value);
+    }
 }
 
-/// Split a set-path string into parts, respecting array bracket notation.
-fn split_set_path(path: &str) -> Vec<SetPathPart> {
-    let mut parts = Vec::new();
-    let mut remaining = path;
+/// Classified path segment, borrowed from the input path.
+#[derive(Debug)]
+enum SegKind<'a> {
+    Field(&'a str),
+    ArrayIndex(&'a str, usize),
+    ArrayPush(&'a str),
+}
 
-    while !remaining.is_empty() {
-        remaining = remaining.strip_prefix('.').unwrap_or(remaining);
-        if remaining.is_empty() {
-            break;
-        }
-
-        // Find next dot (that is not inside brackets)
-        let mut end = remaining.len();
-        let mut depth = 0;
-        for (i, ch) in remaining.char_indices() {
-            match ch {
-                '[' => depth += 1,
-                ']' => depth -= 1,
-                '.' if depth == 0 && i > 0 => {
-                    end = i;
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        let seg = &remaining[..end];
-        remaining = &remaining[end..];
-
-        // Parse the segment
-        if let Some(name) = seg.strip_suffix("[]") {
-            // Array push notation: `items[]`
-            parts.push(SetPathPart::ArrayPush(name.to_string()));
-        } else if let Some(bracket_start) = seg.find('[') {
-            if let Some(bracket_end) = seg.find(']') {
-                let name = &seg[..bracket_start];
-                let idx_str = &seg[bracket_start + 1..bracket_end];
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    parts.push(SetPathPart::ArrayIndex(name.to_string(), idx));
-                } else {
-                    parts.push(SetPathPart::Field(seg.to_string()));
-                }
+/// Classify a single path segment without allocating.
+fn classify_seg(seg: &str) -> SegKind<'_> {
+    if let Some(name) = seg.strip_suffix("[]") {
+        SegKind::ArrayPush(name)
+    } else if let Some(bracket_start) = seg.find('[') {
+        if let Some(bracket_end) = seg[bracket_start..].find(']').map(|p| p + bracket_start) {
+            let name = &seg[..bracket_start];
+            let idx_str = &seg[bracket_start + 1..bracket_end];
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                SegKind::ArrayIndex(name, idx)
             } else {
-                parts.push(SetPathPart::Field(seg.to_string()));
+                SegKind::Field(seg)
             }
         } else {
-            parts.push(SetPathPart::Field(seg.to_string()));
+            SegKind::Field(seg)
         }
+    } else {
+        SegKind::Field(seg)
     }
-
-    parts
 }
 
-#[derive(Debug)]
-enum SetPathPart {
-    Field(String),
-    ArrayIndex(String, usize),
-    ArrayPush(String),
-}
-
-/// Set a single field/array-push on the current `DynValue` object.
-fn set_single_field(obj: &mut DynValue, part: &SetPathPart, value: DynValue) {
-    match part {
-        SetPathPart::Field(name) => {
+/// Set a single field/array-push at a borrowed segment. Allocates a `String`
+/// only when actually inserting a new entry.
+fn set_single_field_seg(obj: &mut DynValue, seg: &str, value: DynValue) {
+    match classify_seg(seg) {
+        SegKind::Field(name) => {
             if let DynValue::Object(ref mut entries) = obj {
-                // Update existing or append
                 if let Some(existing) = entries.iter_mut().find(|(k, _)| k == name) {
                     existing.1 = value;
                 } else {
-                    entries.push((name.clone(), value));
+                    entries.push((name.to_string(), value));
                 }
             }
         }
-        SetPathPart::ArrayIndex(name, idx) => {
+        SegKind::ArrayIndex(name, idx) => {
             if !name.is_empty() {
-                // Ensure the field exists as an array
                 if let DynValue::Object(ref mut entries) = obj {
-                    let arr = entries.iter_mut().find(|(k, _)| k == name);
-                    if let Some((_, ref mut arr_val)) = arr {
-                        if let DynValue::Array(ref mut items) = arr_val {
-                            while items.len() <= *idx {
-                                items.push(DynValue::Null);
-                            }
-                            items[*idx] = value;
+                    let pos = entries.iter_mut().position(|(k, _)| k == name);
+                    if let Some(p) = pos {
+                        if let DynValue::Array(ref mut items) = &mut entries[p].1 {
+                            while items.len() <= idx { items.push(DynValue::Null); }
+                            items[idx] = value;
                         }
                     } else {
                         let mut items = Vec::new();
-                        while items.len() <= *idx {
-                            items.push(DynValue::Null);
-                        }
-                        items[*idx] = value;
-                        entries.push((name.clone(), DynValue::Array(items)));
+                        while items.len() <= idx { items.push(DynValue::Null); }
+                        items[idx] = value;
+                        entries.push((name.to_string(), DynValue::Array(items)));
                     }
                 }
             } else if let DynValue::Array(ref mut items) = obj {
-                while items.len() <= *idx {
-                    items.push(DynValue::Null);
-                }
-                items[*idx] = value;
+                while items.len() <= idx { items.push(DynValue::Null); }
+                items[idx] = value;
             }
         }
-        SetPathPart::ArrayPush(name) => {
+        SegKind::ArrayPush(name) => {
             if let DynValue::Object(ref mut entries) = obj {
-                let arr = entries.iter_mut().find(|(k, _)| k == name);
-                if let Some((_, ref mut arr_val)) = arr {
-                    if let DynValue::Array(ref mut items) = arr_val {
+                let pos = entries.iter_mut().position(|(k, _)| k == name);
+                if let Some(p) = pos {
+                    if let DynValue::Array(ref mut items) = &mut entries[p].1 {
                         items.push(value);
                     }
                 } else {
-                    entries.push((name.clone(), DynValue::Array(vec![value])));
+                    entries.push((name.to_string(), DynValue::Array(vec![value])));
                 }
             }
         }
     }
 }
 
-/// Ensure an intermediate path node exists and return a mutable reference to it.
-fn ensure_and_descend<'a>(current: &'a mut DynValue, part: &SetPathPart) -> &'a mut DynValue {
-    match part {
-        SetPathPart::Field(name) => {
+/// Ensure an intermediate path node exists at a borrowed segment. Allocates a
+/// `String` only when creating a missing entry.
+fn ensure_and_descend_seg<'a>(current: &'a mut DynValue, seg: &str) -> &'a mut DynValue {
+    match classify_seg(seg) {
+        SegKind::Field(name) => {
             if let DynValue::Object(ref mut entries) = current {
-                // Find or create the field
                 let idx = entries.iter().position(|(k, _)| k == name);
                 if let Some(i) = idx {
                     &mut entries[i].1
                 } else {
-                    entries.push((name.clone(), DynValue::Object(Vec::new())));
+                    entries.push((name.to_string(), DynValue::Object(Vec::new())));
                     let len = entries.len();
                     &mut entries[len - 1].1
                 }
             } else {
-                // Can't descend into a non-object; return current as fallback
                 current
             }
         }
-        SetPathPart::ArrayIndex(name, idx) => {
+        SegKind::ArrayIndex(name, idx) => {
             if let DynValue::Object(ref mut entries) = current {
-                // Ensure the field exists as an array
                 let pos = entries.iter().position(|(k, _)| k == name);
                 let arr_ref = if let Some(p) = pos {
                     &mut entries[p].1
                 } else {
-                    entries.push((name.clone(), DynValue::Array(Vec::new())));
+                    entries.push((name.to_string(), DynValue::Array(Vec::new())));
                     let len = entries.len();
                     &mut entries[len - 1].1
                 };
-
                 if let DynValue::Array(ref mut items) = arr_ref {
-                    while items.len() <= *idx {
-                        items.push(DynValue::Object(Vec::new()));
-                    }
-                    &mut items[*idx]
+                    while items.len() <= idx { items.push(DynValue::Object(Vec::new())); }
+                    &mut items[idx]
                 } else {
                     arr_ref
                 }
@@ -1415,17 +1384,16 @@ fn ensure_and_descend<'a>(current: &'a mut DynValue, part: &SetPathPart) -> &'a 
                 current
             }
         }
-        SetPathPart::ArrayPush(name) => {
+        SegKind::ArrayPush(name) => {
             if let DynValue::Object(ref mut entries) = current {
                 let pos = entries.iter().position(|(k, _)| k == name);
                 let arr_ref = if let Some(p) = pos {
                     &mut entries[p].1
                 } else {
-                    entries.push((name.clone(), DynValue::Array(Vec::new())));
+                    entries.push((name.to_string(), DynValue::Array(Vec::new())));
                     let len = entries.len();
                     &mut entries[len - 1].1
                 };
-
                 if let DynValue::Array(ref mut items) = arr_ref {
                     items.push(DynValue::Object(Vec::new()));
                     let len = items.len();

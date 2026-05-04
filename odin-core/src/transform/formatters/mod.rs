@@ -1277,9 +1277,22 @@ pub fn format_odin_with_modifiers(
     output
 }
 
+/// Estimate output capacity for ODIN formatting — rough heuristic based on
+/// leaf count to avoid repeated `String` reallocation during the format walk.
+fn estimate_odin_capacity(value: &DynValue) -> usize {
+    fn count_leaves(v: &DynValue) -> usize {
+        match v {
+            DynValue::Object(entries) => entries.iter().map(|(_, c)| count_leaves(c)).sum::<usize>().max(1),
+            DynValue::Array(items) => items.iter().map(count_leaves).sum::<usize>().max(items.len()),
+            _ => 1,
+        }
+    }
+    (count_leaves(value) * 32).max(64)
+}
+
 /// Format a `DynValue` as ODIN text, optionally including the `{$}` header.
 pub fn format_odin(value: &DynValue, include_header: bool) -> String {
-    let mut output = String::new();
+    let mut output = String::with_capacity(estimate_odin_capacity(value));
     if include_header {
         output.push_str("{$}\nodin = \"1.0.0\"\n");
     }
@@ -1370,17 +1383,28 @@ fn collect_leaf_paths(output: &mut String, prefix: &str, val: &DynValue) {
 }
 
 fn collect_leaf_paths_inner(output: &mut String, prefix: &str, val: &DynValue) {
+    let mut path = String::with_capacity(prefix.len() + 32);
+    path.push_str(prefix);
+    collect_leaf_paths_buf(output, &mut path, val);
+}
+
+/// Walk a leaf chain pushing/truncating a single path buffer rather than
+/// allocating a fresh String per nested key.
+fn collect_leaf_paths_buf(output: &mut String, path: &mut String, val: &DynValue) {
     match val {
         DynValue::Object(fields) => {
             for (key, child) in fields {
-                let path = format!("{prefix}.{key}");
+                let saved = path.len();
+                path.push('.');
+                path.push_str(key);
                 match child {
-                    DynValue::Object(_) => collect_leaf_paths_inner(output, &path, child),
-                    _ => write_odin_assignment(output, &path, child),
+                    DynValue::Object(_) => collect_leaf_paths_buf(output, path, child),
+                    _ => write_odin_assignment(output, path, child),
                 }
+                path.truncate(saved);
             }
         }
-        _ => write_odin_assignment(output, prefix, val),
+        _ => write_odin_assignment(output, path, val),
     }
 }
 
@@ -1789,6 +1813,9 @@ fn write_odin_section(output: &mut String, name: &str, fields: &[(String, DynVal
     output.push_str(name);
     output.push_str("}\n");
 
+    let mut path_buf = String::with_capacity(scope_path.len() + 32);
+    path_buf.push_str(scope_path);
+
     // Phase 1: Output inline items (scalars + leaf chains) in original field order
     for (key, val) in fields {
         match val {
@@ -1803,16 +1830,19 @@ fn write_odin_section(output: &mut String, name: &str, fields: &[(String, DynVal
     // Phase 2: Array subsections first, then object subsections (matches TS behavior)
     for (key, val) in fields {
         if let DynValue::Array(items) = val {
-            write_odin_array_subsection_with_parent(output, key, items, Some(scope_path));
+            write_odin_array_subsection_with_parent(output, key, items, Some(&path_buf));
         }
     }
     // Each child is a direct child of this absolute section, so each gets evaluated
     // against the section scope independently (inside_relative = false).
+    let scope_len = path_buf.len();
     for (key, val) in fields {
         match val {
             DynValue::Object(sub_fields) if !is_pure_leaf_chain(val) => {
-                let sub_path = format!("{scope_path}.{key}");
-                write_odin_subsection_inner(output, &sub_path, key, sub_fields, scope_path, false);
+                path_buf.push('.');
+                path_buf.push_str(key);
+                write_odin_subsection_buf(output, &mut path_buf, key, sub_fields, scope_len, false);
+                path_buf.truncate(scope_len);
             }
             _ => {}
         }
@@ -1823,31 +1853,42 @@ fn write_odin_section(output: &mut String, name: &str, fields: &[(String, DynVal
 ///
 /// `full_path` is the absolute path to this section (e.g., `"nested.person"`).
 /// `current_scope` is where the ODIN reader's "cursor" currently is.
+#[allow(dead_code)]
 fn write_odin_subsection(output: &mut String, full_path: &str, name: &str, fields: &[(String, DynValue)], current_scope: &str) {
-    write_odin_subsection_inner(output, full_path, name, fields, current_scope, false);
+    let mut path_buf = String::with_capacity(full_path.len() + 32);
+    path_buf.push_str(full_path);
+    write_odin_subsection_buf(output, &mut path_buf, name, fields, current_scope.len(), false);
 }
 
-fn write_odin_subsection_inner(output: &mut String, full_path: &str, name: &str, fields: &[(String, DynValue)], current_scope: &str, inside_relative: bool) {
-    // Determine if we should use relative {.name} or absolute {parent.name} notation
-    // Rule: only direct children of absolute headers can use relative notation
-    let parent_of_full = full_path.rsplit_once('.').map_or("", |(p, _)| p);
-    let can_use_relative = parent_of_full == current_scope && !inside_relative;
+/// Buffer-based subsection writer. `path_buf` holds the absolute path to this
+/// section; `scope_len` is the byte length within `path_buf` that represents
+/// the parent scope (the cursor position before this section's header).
+fn write_odin_subsection_buf(
+    output: &mut String,
+    path_buf: &mut String,
+    name: &str,
+    fields: &[(String, DynValue)],
+    scope_len: usize,
+    inside_relative: bool,
+) {
+    // Determine if we should use relative {.name} or absolute {parent.name} notation.
+    // Relative is allowed only when the parent of full_path equals the current scope.
+    let parent_of_full = path_buf.rsplit_once('.').map_or("", |(p, _)| p);
+    let can_use_relative = parent_of_full == &path_buf[..scope_len] && !inside_relative;
     let this_is_relative;
     if can_use_relative {
-        // Relative notation: parent matches current scope exactly
         output.push_str("{.");
         output.push_str(name);
         output.push_str("}\n");
         this_is_relative = true;
     } else {
-        // Absolute notation: scope has diverged or inside relative header
         output.push('{');
-        output.push_str(full_path);
+        output.push_str(path_buf);
         output.push_str("}\n");
         this_is_relative = false;
     }
 
-    // Phase 1: Output inline items (scalars + leaf chains) in original field order
+    // Phase 1: scalars + leaf chains
     for (key, val) in fields {
         match val {
             DynValue::Object(_) if is_pure_leaf_chain(val) => {
@@ -1858,18 +1899,21 @@ fn write_odin_subsection_inner(output: &mut String, full_path: &str, name: &str,
         }
     }
 
-    // Phase 2: Array subsections first, then object subsections (matches TS behavior)
+    // Phase 2a: array subsections under this section's full_path
     for (key, val) in fields {
         if let DynValue::Array(items) = val {
-            write_odin_array_subsection_with_parent(output, key, items, Some(full_path));
+            write_odin_array_subsection_with_parent(output, key, items, Some(path_buf));
         }
     }
-    // Each child is evaluated against this section's scope
+    // Phase 2b: nested object subsections — each evaluated against this section's scope
+    let new_scope_len = path_buf.len();
     for (key, val) in fields {
         match val {
             DynValue::Object(sub_fields) if !is_pure_leaf_chain(val) => {
-                let sub_path = format!("{full_path}.{key}");
-                write_odin_subsection_inner(output, &sub_path, key, sub_fields, full_path, this_is_relative);
+                path_buf.push('.');
+                path_buf.push_str(key);
+                write_odin_subsection_buf(output, path_buf, key, sub_fields, new_scope_len, this_is_relative);
+                path_buf.truncate(new_scope_len);
             }
             _ => {}
         }
@@ -2148,18 +2192,23 @@ fn write_odin_record_blocks(output: &mut String, absolute_key: &str, items: &[Dy
         }
 
         // Phase 3: nested non-leaf-chain objects as `{.child}` subsections.
+        let scope_len = record_path.len();
+        let mut path_buf = String::with_capacity(record_path.len() + 32);
+        path_buf.push_str(&record_path);
         for (child_key, child_val) in fields {
             if let DynValue::Object(sub_fields) = child_val {
                 if !is_pure_leaf_chain(child_val) {
-                    let full_path = format!("{record_path}.{child_key}");
-                    write_odin_subsection_inner(
+                    path_buf.push('.');
+                    path_buf.push_str(child_key);
+                    write_odin_subsection_buf(
                         output,
-                        &full_path,
+                        &mut path_buf,
                         child_key,
                         sub_fields,
-                        &record_path,
+                        scope_len,
                         false,
                     );
+                    path_buf.truncate(scope_len);
                 }
             }
         }
