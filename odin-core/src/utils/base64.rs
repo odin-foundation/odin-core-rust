@@ -5,36 +5,41 @@ const ENCODE_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 /// Encode bytes to base64 string.
 pub fn encode(data: &[u8]) -> String {
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    encode_into(data, &mut result);
+    result
+}
+
+/// Encode bytes to base64 directly into the caller's buffer.
+pub fn encode_into(data: &[u8], output: &mut String) {
+    output.reserve(data.len().div_ceil(3) * 4);
     let mut i = 0;
 
     while i + 2 < data.len() {
         let n = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8) | u32::from(data[i + 2]);
-        result.push(ENCODE_TABLE[(n >> 18) as usize & 0x3F] as char);
-        result.push(ENCODE_TABLE[(n >> 12) as usize & 0x3F] as char);
-        result.push(ENCODE_TABLE[(n >> 6) as usize & 0x3F] as char);
-        result.push(ENCODE_TABLE[n as usize & 0x3F] as char);
+        output.push(ENCODE_TABLE[(n >> 18) as usize & 0x3F] as char);
+        output.push(ENCODE_TABLE[(n >> 12) as usize & 0x3F] as char);
+        output.push(ENCODE_TABLE[(n >> 6) as usize & 0x3F] as char);
+        output.push(ENCODE_TABLE[n as usize & 0x3F] as char);
         i += 3;
     }
 
     match data.len() - i {
         1 => {
             let n = u32::from(data[i]) << 16;
-            result.push(ENCODE_TABLE[(n >> 18) as usize & 0x3F] as char);
-            result.push(ENCODE_TABLE[(n >> 12) as usize & 0x3F] as char);
-            result.push('=');
-            result.push('=');
+            output.push(ENCODE_TABLE[(n >> 18) as usize & 0x3F] as char);
+            output.push(ENCODE_TABLE[(n >> 12) as usize & 0x3F] as char);
+            output.push('=');
+            output.push('=');
         }
         2 => {
             let n = (u32::from(data[i]) << 16) | (u32::from(data[i + 1]) << 8);
-            result.push(ENCODE_TABLE[(n >> 18) as usize & 0x3F] as char);
-            result.push(ENCODE_TABLE[(n >> 12) as usize & 0x3F] as char);
-            result.push(ENCODE_TABLE[(n >> 6) as usize & 0x3F] as char);
-            result.push('=');
+            output.push(ENCODE_TABLE[(n >> 18) as usize & 0x3F] as char);
+            output.push(ENCODE_TABLE[(n >> 12) as usize & 0x3F] as char);
+            output.push(ENCODE_TABLE[(n >> 6) as usize & 0x3F] as char);
+            output.push('=');
         }
         _ => {}
     }
-
-    result
 }
 
 /// Decode base64 string to bytes.

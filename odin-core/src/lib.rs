@@ -465,10 +465,10 @@ mod export {
 
         for (section_name, fields) in &sections {
             let mut section_map = serde_json::Map::new();
-            for (field_name, value) in fields {
-                section_map.insert(field_name.clone(), odin_value_to_json(value));
+            for (field_name, _full_path, value) in fields {
+                section_map.insert((*field_name).to_string(), odin_value_to_json(value));
             }
-            map.insert(section_name.clone(), serde_json::Value::Object(section_map));
+            map.insert((*section_name).to_string(), serde_json::Value::Object(section_map));
         }
 
         if !doc.metadata.is_empty() {
@@ -548,23 +548,26 @@ mod export {
         }
     }
 
-    fn collect_sections<'a>(doc: &'a OdinDocument) -> Vec<(String, Vec<(String, &'a OdinValue)>)> {
-        let mut sections: Vec<(String, Vec<(String, &'a OdinValue)>)> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
+    fn collect_sections<'a>(
+        doc: &'a OdinDocument,
+    ) -> Vec<(&'a str, Vec<(&'a str, &'a str, &'a OdinValue)>)> {
+        // Returns (section, [(field, full_path, value), ...]) — full_path is
+        // borrowed from doc so modifier lookups don't allocate.
+        let mut sections: Vec<(&'a str, Vec<(&'a str, &'a str, &'a OdinValue)>)> = Vec::new();
 
         for (path, value) in doc.assignments.iter() {
-            if let Some(dot_pos) = path.find('.') {
-                let section = &path[..dot_pos];
+            let path_str = path.as_str();
+            if let Some(dot_pos) = path_str.find('.') {
+                let section = &path_str[..dot_pos];
                 if section == "$" {
                     continue;
                 }
-                let field = &path[dot_pos + 1..];
+                let field = &path_str[dot_pos + 1..];
 
-                if let Some(idx) = seen.iter().position(|s| s == section) {
-                    sections[idx].1.push((field.to_string(), value));
+                if let Some(slot) = sections.iter_mut().find(|(s, _)| *s == section) {
+                    slot.1.push((field, path_str, value));
                 } else {
-                    seen.push(section.to_string());
-                    sections.push((section.to_string(), vec![(field.to_string(), value)]));
+                    sections.push((section, vec![(field, path_str, value)]));
                 }
             }
         }
@@ -576,11 +579,19 @@ mod export {
     /// Type and modifier attributes are always included in XML output since
     /// XML has no native type system — the attributes are the only way to
     /// preserve ODIN type information.
-    pub fn odin_doc_to_xml(doc: &OdinDocument, _preserve_types: bool, _preserve_modifiers: bool) -> String {
-        // Use hand-written output for precise formatting control matching golden tests.
-        // quick-xml::Writer is used for the XML declaration only.
-        let mut output = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        output.push_str("<root xmlns:odin=\"https://odin.foundation/ns\">\n");
+    pub fn odin_doc_to_xml(doc: &OdinDocument, preserve_types: bool, preserve_modifiers: bool) -> String {
+        // Modifiers imply types — emitting modifier attributes without the
+        // odin namespace would be malformed. Matches .NET/Java behavior.
+        let preserve_types = preserve_types || preserve_modifiers;
+
+        let est = doc.assignments.len() * 96 + 160;
+        let mut output = String::with_capacity(est);
+        output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        output.push_str("<root");
+        if preserve_types {
+            output.push_str(" xmlns:odin=\"https://odin.foundation/ns\"");
+        }
+        output.push_str(">\n");
 
         let sections = collect_sections(doc);
 
@@ -589,44 +600,43 @@ mod export {
             output.push_str(section_name);
             output.push_str(">\n");
 
-            for (field_name, value) in fields {
+            for (field_name, full_path, value) in fields {
                 if matches!(value, OdinValue::Null { .. }) {
                     continue;
                 }
 
-                let full_path = format!("{section_name}.{field_name}");
-
                 output.push_str("    <");
                 output.push_str(field_name);
 
-                if let Some(type_name) = odin_value_xml_type(value) {
-                    output.push_str(" odin:type=\"");
-                    output.push_str(type_name);
-                    output.push('"');
-                }
-                if let OdinValue::Currency { currency_code: Some(code), .. } = value {
-                    output.push_str(" odin:currencyCode=\"");
-                    output.push_str(code);
-                    output.push('"');
+                if preserve_types {
+                    if let Some(type_name) = odin_value_xml_type(value) {
+                        output.push_str(" odin:type=\"");
+                        output.push_str(type_name);
+                        output.push('"');
+                    }
+                    if let OdinValue::Currency { currency_code: Some(code), .. } = value {
+                        output.push_str(" odin:currencyCode=\"");
+                        output.push_str(code);
+                        output.push('"');
+                    }
                 }
 
-                if let Some(mods) = doc.modifiers.get(&full_path) {
-                    if mods.required {
-                        output.push_str(" odin:required=\"true\"");
-                    }
-                    if mods.confidential {
-                        output.push_str(" odin:confidential=\"true\"");
-                    }
-                    if mods.deprecated {
-                        output.push_str(" odin:deprecated=\"true\"");
+                if preserve_modifiers {
+                    if let Some(mods) = doc.modifiers.get(*full_path) {
+                        if mods.required {
+                            output.push_str(" odin:required=\"true\"");
+                        }
+                        if mods.confidential {
+                            output.push_str(" odin:confidential=\"true\"");
+                        }
+                        if mods.deprecated {
+                            output.push_str(" odin:deprecated=\"true\"");
+                        }
                     }
                 }
 
                 output.push('>');
-
-                let text_content = odin_value_to_xml_text(value);
-                output.push_str(&quick_xml::escape::escape(&text_content));
-
+                write_xml_text_escaped(&mut output, value);
                 output.push_str("</");
                 output.push_str(field_name);
                 output.push_str(">\n");
@@ -641,38 +651,78 @@ mod export {
         output
     }
 
-    fn odin_value_to_xml_text(value: &OdinValue) -> String {
+    /// Write the XML-escaped text representation of `value` directly into `output`.
+    fn write_xml_text_escaped(output: &mut String, value: &OdinValue) {
         match value {
-            OdinValue::Boolean { value: b, .. } => if *b { "true" } else { "false" }.to_string(),
+            OdinValue::Boolean { value: b, .. } => {
+                output.push_str(if *b { "true" } else { "false" });
+            }
             OdinValue::String { value: s, .. }
             | OdinValue::Time { value: s, .. }
-            | OdinValue::Duration { value: s, .. } => s.clone(),
+            | OdinValue::Duration { value: s, .. } => push_xml_escaped(output, s),
             OdinValue::Integer { value: n, .. } => {
                 let mut buf = itoa::Buffer::new();
-                buf.format(*n).to_string()
+                output.push_str(buf.format(*n));
             }
             OdinValue::Number { raw: Some(r), .. } | OdinValue::Percent { raw: Some(r), .. } => {
-                r.clone()
+                output.push_str(r);
             }
             OdinValue::Currency { raw: Some(r), .. } => {
-                r.split(':').next().unwrap_or(r).to_string()
+                let n = r.split(':').next().unwrap_or(r);
+                output.push_str(n);
             }
-            OdinValue::Date { raw, .. } | OdinValue::Timestamp { raw, .. } => raw.clone(),
-            OdinValue::Reference { path, .. } => format!("@{path}"),
+            OdinValue::Date { raw, .. } | OdinValue::Timestamp { raw, .. } => output.push_str(raw),
+            OdinValue::Reference { path, .. } => {
+                output.push('@');
+                push_xml_escaped(output, path);
+            }
             OdinValue::Binary { data, algorithm, .. } => {
+                output.push('^');
                 if let Some(algo) = algorithm {
-                    let mut hex = String::with_capacity(data.len() * 2);
-                    for b in data {
-                        use std::fmt::Write;
-                        let _ = write!(hex, "{b:02x}");
+                    output.push_str(algo);
+                    output.push(':');
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    output.reserve(data.len() * 2);
+                    for &b in data {
+                        output.push(HEX[(b >> 4) as usize] as char);
+                        output.push(HEX[(b & 0x0f) as usize] as char);
                     }
-                    format!("^{algo}:{hex}")
                 } else {
-                    format!("^{}", crate::utils::base64::encode(data))
+                    crate::utils::base64::encode_into(data, output);
                 }
             }
-            _ => String::new(),
+            _ => {}
         }
+    }
+
+    fn push_xml_escaped(output: &mut String, s: &str) {
+        let bytes = s.as_bytes();
+        let Some(first) = bytes.iter().position(|&b| matches!(b, b'<' | b'>' | b'&' | b'"' | b'\'')) else {
+            output.push_str(s);
+            return;
+        };
+        // Run-copy: emit untouched runs in bulk; only escape on hit.
+        let mut last = 0;
+        let mut i = first;
+        while i < bytes.len() {
+            let esc = match bytes[i] {
+                b'<' => Some("&lt;"),
+                b'>' => Some("&gt;"),
+                b'&' => Some("&amp;"),
+                b'"' => Some("&quot;"),
+                b'\'' => Some("&apos;"),
+                _ => None,
+            };
+            if let Some(e) = esc {
+                output.push_str(&s[last..i]);
+                output.push_str(e);
+                i += 1;
+                last = i;
+            } else {
+                i += 1;
+            }
+        }
+        output.push_str(&s[last..]);
     }
 
     fn odin_value_xml_type(value: &OdinValue) -> Option<&'static str> {
@@ -805,7 +855,7 @@ mod export {
         // Flatten all fields
         let mut fields: Vec<(String, &OdinValue)> = Vec::new();
         for (section, section_fields) in &sections {
-            for (field, value) in section_fields {
+            for (field, _full_path, value) in section_fields {
                 fields.push((format!("{section}.{field}"), value));
             }
         }
