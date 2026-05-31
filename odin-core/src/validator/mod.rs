@@ -19,6 +19,7 @@ use crate::types::schema::{
 use crate::types::options::ValidateOptions;
 use crate::types::errors::{ValidationError, ValidationErrorCode};
 use crate::types::values::OdinValue;
+use crate::resolver::TypeRegistry;
 
 /// Validate a document against a schema.
 pub fn validate(
@@ -26,11 +27,29 @@ pub fn validate(
     schema: &OdinSchemaDefinition,
     options: Option<&ValidateOptions>,
 ) -> ValidationResult {
+    validate_with_registry(doc, schema, options, None)
+}
+
+/// Validate a document against a schema, resolving `@alias.typename` references via `registry`.
+///
+/// Pass `None` for the registry to get the same behavior as [`validate`].
+pub fn validate_with_registry(
+    doc: &OdinDocument,
+    schema: &OdinSchemaDefinition,
+    options: Option<&ValidateOptions>,
+    registry: Option<&TypeRegistry>,
+) -> ValidationResult {
     let opts = options.cloned().unwrap_or_default();
     let mut errors = Vec::new();
 
     // 0. Expand type composition (merge base type fields into derived types)
     let schema = expand_type_composition(schema);
+
+    // Schema-level type references (V013): imported types resolve via registry.
+    validate_schema_type_references(&schema, registry, &mut errors);
+    if opts.fail_fast && !errors.is_empty() {
+        return ValidationResult::invalid(errors);
+    }
 
     // 1. Validate fields defined in schema
     for (path, field) in &schema.fields {
@@ -749,6 +768,43 @@ fn matches_condition_value(
                 }
             } else {
                 false
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema Type Reference Validation (V013)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Look up a named type, checking the import registry first then local types.
+fn lookup_type<'a>(
+    schema: &'a OdinSchemaDefinition,
+    registry: Option<&'a TypeRegistry>,
+    name: &str,
+) -> Option<&'a crate::types::schema::SchemaType> {
+    if let Some(reg) = registry {
+        if let Some(t) = reg.lookup(name) {
+            return Some(t);
+        }
+    }
+    schema.types.get(name)
+}
+
+/// Validate that top-level `@typeRef` fields resolve to a defined type (V013).
+fn validate_schema_type_references(
+    schema: &OdinSchemaDefinition,
+    registry: Option<&TypeRegistry>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (path, field) in &schema.fields {
+        if let SchemaFieldType::TypeRef(name) = &field.field_type {
+            if lookup_type(schema, registry, name).is_none() {
+                errors.push(ValidationError::new(
+                    ValidationErrorCode::UnresolvedReference,
+                    path,
+                    format!("Unresolved type reference: @{name}"),
+                ));
             }
         }
     }
@@ -2074,17 +2130,38 @@ mod tests {
         assert!(result.valid);
     }
 
-    // ── TypeRef always passes type check ────────────────────────────────
+    // ── TypeRef value-type check + schema type reference (V013) ──────────
 
     #[test]
     fn test_typeref_accepts_any_value() {
+        use crate::types::schema::SchemaType;
+        // A defined type ref passes both the value type check and the V013
+        // schema-type-reference check.
         let doc = OdinDocumentBuilder::new()
             .set("val", OdinValues::string("anything"))
             .build().unwrap();
         let mut schema = make_empty_schema();
+        schema.types.insert("SomeType".to_string(), SchemaType {
+            name: "SomeType".to_string(), description: None, fields: vec![], parents: vec![],
+        });
         schema.fields.insert("val".to_string(), make_field("val", SchemaFieldType::TypeRef("SomeType".to_string()), false));
         let result = validate(&doc, &schema, None);
         assert!(result.valid);
+    }
+
+    #[test]
+    fn test_typeref_unresolved_is_v013() {
+        // An undefined type reference yields V013 (unresolved type).
+        let doc = OdinDocumentBuilder::new()
+            .set("val", OdinValues::string("anything"))
+            .build().unwrap();
+        let mut schema = make_empty_schema();
+        schema.fields.insert("val".to_string(), make_field("val", SchemaFieldType::TypeRef("Undefined".to_string()), false));
+        let result = validate(&doc, &schema, None);
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e|
+            e.error_code == ValidationErrorCode::UnresolvedReference && e.path == "val"
+        ), "expected V013 for unresolved type reference");
     }
 
     // ── validate_formats additional tests ───────────────────────────────
@@ -2147,5 +2224,177 @@ mod tests {
         let result = ValidationResult::invalid(errors);
         assert!(!result.valid);
         assert_eq!(result.errors.len(), 1);
+    }
+
+    // ── Registry-aware schema type references (V013) ─────────────────────
+
+    use crate::resolver::{FileReader, ImportResolver, ResolverOptions};
+
+    struct DiskReader;
+    impl FileReader for DiskReader {
+        fn read_file(&self, path: &str) -> Result<String, String> {
+            std::fs::read_to_string(path).map_err(|e| e.to_string())
+        }
+        fn resolve_path(&self, base: &str, import: &str) -> Result<String, String> {
+            let base_dir = std::path::Path::new(base)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::path::Path::new(base_dir)
+                .join(import)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    const CANONICAL_SCHEMA: &str =
+        "../../../schemas/insurance/personal/auto/policy.schema.odin";
+
+    fn typeref_field(name: &str, tref: &str) -> SchemaField {
+        SchemaField {
+            name: name.to_string(),
+            field_type: SchemaFieldType::TypeRef(tref.to_string()),
+            required: false,
+            confidential: false,
+            deprecated: false,
+            immutable: false,
+            description: None,
+            constraints: vec![],
+            default_value: None,
+            conditionals: vec![],
+        }
+    }
+
+    /// Resolving the canonical auto-policy schema's imports into a registry and
+    /// validating must not emit spurious V013 unresolved-type errors for the
+    /// imported types it references (e.g. `@types.policy_status`).
+    #[test]
+    fn test_canonical_schema_no_spurious_v013_with_registry() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(CANONICAL_SCHEMA);
+        let path = path.to_string_lossy().to_string();
+
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let mut schema = schema_parser::parse_schema(&content).unwrap();
+
+        // Inject a top-level field referencing an imported type that DOES exist
+        // in the resolved registry (mirrors `status = !@types.policy_status`).
+        schema.fields.insert(
+            "status_ref".to_string(),
+            typeref_field("status_ref", "types.policy_status"),
+        );
+
+        let empty = crate::Odin::parse("").unwrap();
+
+        // Baseline: without a registry, the imported type reference is unresolved.
+        let baseline = validate(&empty, &schema, None);
+        let v013_baseline = baseline
+            .errors
+            .iter()
+            .filter(|e| e.error_code == ValidationErrorCode::UnresolvedReference)
+            .count();
+        assert!(
+            v013_baseline >= 1,
+            "expected >=1 V013 without registry, got {v013_baseline}"
+        );
+
+        // Resolve imports into a registry, then validate.
+        let mut resolver =
+            ImportResolver::new(Box::new(DiskReader), ResolverOptions::default());
+        let resolved = resolver.resolve_schema(&path).unwrap();
+        assert!(
+            resolved.type_registry.lookup("types.policy_status").is_some(),
+            "registry should resolve types.policy_status"
+        );
+
+        let result = validate_with_registry(
+            &empty,
+            &resolved.schema,
+            None,
+            Some(&resolved.type_registry),
+        );
+
+        // The injected imported type reference must no longer be V013.
+        let injected_v013 = result.errors.iter().any(|e| {
+            e.error_code == ValidationErrorCode::UnresolvedReference
+                && e.path == "status_ref"
+        });
+        assert!(
+            !injected_v013,
+            "registry must resolve @types.policy_status (no V013 for status_ref)"
+        );
+
+        // After the relative-header fix, term.* lives inside the @policy type,
+        // not the schema root — so the canonical schema has no root-required
+        // term.* fields and an empty doc yields no root required errors.
+        let policy = schema
+            .types
+            .get("policy")
+            .expect("canonical schema should define the policy type");
+        let has_field = |name: &str| policy.fields.iter().any(|f| f.name == name);
+        assert!(
+            has_field("term.effective"),
+            "policy type should contain term.effective"
+        );
+        assert!(
+            has_field("term.expiration"),
+            "policy type should contain term.expiration"
+        );
+
+        let root_required = result
+            .errors
+            .iter()
+            .filter(|e| e.error_code == ValidationErrorCode::RequiredFieldMissing)
+            .filter(|e| e.path.contains("term."))
+            .count();
+        let v013_total = result
+            .errors
+            .iter()
+            .filter(|e| e.error_code == ValidationErrorCode::UnresolvedReference)
+            .count();
+        assert_eq!(v013_total, 0, "no V013 errors expected with registry");
+        assert_eq!(
+            root_required, 0,
+            "no root-required term.* errors expected after the relative-header fix, got: {:?}",
+            result.errors.iter().map(|e| (e.error_code.code(), &e.path)).collect::<Vec<_>>()
+        );
+    }
+
+    /// A minimal satisfying document validates clean against the resolved
+    /// canonical schema (no V013, no required-field errors).
+    #[test]
+    fn test_canonical_schema_minimal_doc_valid_with_registry() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(CANONICAL_SCHEMA);
+        let path = path.to_string_lossy().to_string();
+
+        let mut resolver =
+            ImportResolver::new(Box::new(DiskReader), ResolverOptions::default());
+        let resolved = resolver.resolve_schema(&path).unwrap();
+
+        // The canonical schema reports the required term.* fields at the
+        // un-prefixed `term.*` path (matching TS), so set them there.
+        let min_text = "number = \"P1\"\n\
+                         state_province = \"CA\"\n\
+                         status = \"active\"\n\
+                         term.effective = 2024-01-01\n\
+                         term.expiration = 2025-01-01\n";
+        let doc = crate::Odin::parse(min_text).unwrap();
+
+        let result = validate_with_registry(
+            &doc,
+            &resolved.schema,
+            None,
+            Some(&resolved.type_registry),
+        );
+
+        let v013 = result
+            .errors
+            .iter()
+            .filter(|e| e.error_code == ValidationErrorCode::UnresolvedReference)
+            .count();
+        assert_eq!(v013, 0, "no spurious V013, got: {:?}",
+            result.errors.iter().map(|e| (e.error_code.code(), &e.path)).collect::<Vec<_>>());
     }
 }

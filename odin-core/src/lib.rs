@@ -166,6 +166,39 @@ impl Odin {
         validator::validate(doc, schema, options)
     }
 
+    /// Validate a document against a schema, resolving imported type references via a `TypeRegistry`.
+    pub fn validate_with_registry(
+        doc: &OdinDocument,
+        schema: &types::schema::OdinSchemaDefinition,
+        options: Option<&types::options::ValidateOptions>,
+        registry: Option<&resolver::TypeRegistry>,
+    ) -> types::schema::ValidationResult {
+        validator::validate_with_registry(doc, schema, options, registry)
+    }
+
+    /// Resolve a schema file's imports, then validate `doc` against it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the schema or any import fails to read/parse.
+    pub fn validate_with_imports(
+        doc: &OdinDocument,
+        schema_path: &str,
+        reader: Box<dyn resolver::FileReader>,
+        options: Option<&types::options::ValidateOptions>,
+        resolver_options: Option<resolver::ResolverOptions>,
+    ) -> Result<types::schema::ValidationResult, ParseError> {
+        let opts = resolver_options.unwrap_or_default();
+        let mut import_resolver = resolver::ImportResolver::new(reader, opts);
+        let resolved = import_resolver.resolve_schema(schema_path)?;
+        Ok(validator::validate_with_registry(
+            doc,
+            &resolved.schema,
+            options,
+            Some(&resolved.type_registry),
+        ))
+    }
+
     /// Parse ODIN transform text into a transform definition.
     ///
     /// This is useful when you want to parse a transform once and execute it

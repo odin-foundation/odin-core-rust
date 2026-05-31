@@ -34,6 +34,12 @@ struct SchemaParserState {
     current_type_parents: Vec<String>,
     current_type_fields: Vec<SchemaField>,
     current_section_path: String,
+
+    // Relative-header context: last absolute object path, last absolute type,
+    // and the sub-path of the current `{.sub}` block within that context.
+    previous_header_path: String,
+    previous_header_type: String,
+    current_type_sub_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +65,9 @@ impl SchemaParserState {
             current_type_parents: Vec::new(),
             current_type_fields: Vec::new(),
             current_section_path: String::new(),
+            previous_header_path: String::new(),
+            previous_header_type: String::new(),
+            current_type_sub_path: String::new(),
         }
     }
 
@@ -162,25 +171,57 @@ impl SchemaParserState {
             return;
         }
 
+        // Relative header `{.sub}`: nest under the last absolute context.
+        if let Some(rel) = inner.strip_prefix('.') {
+            let sub = rel.trim();
+            if !self.previous_header_type.is_empty() {
+                // Re-open the parent type; fields route under the sub-path.
+                self.current_context = ParserContext::TypeDef;
+                self.current_type_name = self.previous_header_type.clone();
+                self.current_type_parents.clear();
+                self.current_type_fields.clear();
+                self.current_type_sub_path = sub.to_string();
+            } else {
+                // Object context: relative sub-blocks scope to the last path.
+                self.current_context = ParserContext::Section;
+                self.current_section_path = if self.previous_header_path.is_empty() {
+                    sub.to_string()
+                } else {
+                    format!("{}.{}", self.previous_header_path, sub)
+                };
+                self.current_type_sub_path.clear();
+            }
+            return;
+        }
+
+        // Absolute header resets the relative sub-path.
+        self.current_type_sub_path.clear();
+
         if let Some(type_rest) = inner.strip_prefix('@') {
             // Type definition: {@TypeName}
             let type_name = type_rest.trim().to_string();
             self.current_context = ParserContext::TypeDef;
-            self.current_type_name = type_name;
+            self.current_type_name = type_name.clone();
             self.current_type_fields.clear();
+            self.previous_header_type = type_name;
+            self.previous_header_path.clear();
             return;
         }
 
         if let Some(array_inner) = inner.strip_suffix("[]") {
             let path = array_inner.trim().to_string();
             self.current_context = ParserContext::ArrayDef;
-            self.current_section_path = path;
+            self.current_section_path = path.clone();
+            self.previous_header_path = path;
+            self.previous_header_type.clear();
             return;
         }
 
         // Regular section: {path}
         self.current_context = ParserContext::Section;
         self.current_section_path = inner.to_string();
+        self.previous_header_path = inner.to_string();
+        self.previous_header_type.clear();
     }
 
     /// Parse standalone `@TypeName` or `@TypeName : @Parent [& @Other]`
@@ -298,14 +339,15 @@ impl SchemaParserState {
             }
             ParserContext::TypeDef => {
                 // Check for array field: items[] = @Type
-                if let Some(field_name) = key.strip_suffix("[]") {
-                    let field_name = field_name.trim();
-                    let field = parse_field_def(field_name, value);
-                    self.current_type_fields.push(field);
+                let clean_key = key.strip_suffix("[]").map(str::trim).unwrap_or(key);
+                // Prefix the field name when inside a relative sub-block (e.g. term.effective).
+                let field_name = if self.current_type_sub_path.is_empty() {
+                    clean_key.to_string()
                 } else {
-                    let field = parse_field_def(key, value);
-                    self.current_type_fields.push(field);
-                }
+                    format!("{}.{}", self.current_type_sub_path, clean_key)
+                };
+                let field = parse_field_def(&field_name, value);
+                self.current_type_fields.push(field);
             }
             ParserContext::Section => {
                 let full_path = if self.current_section_path.is_empty() {

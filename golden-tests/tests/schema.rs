@@ -18,6 +18,8 @@ struct TestCase {
     description: String,
     schema: String,
     expected: Value,
+    #[serde(default)]
+    structural: bool,
 }
 
 fn golden_dir() -> PathBuf {
@@ -109,6 +111,46 @@ fn run_schema_suite(file: &str) {
                                     "constraint scope '{}' not found (found: {:?})",
                                     scope,
                                     schema.constraints.keys().collect::<Vec<_>>()
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Structural cases: also assert each type's internal fields exist.
+                if test.structural {
+                    if let Some(types_obj) =
+                        test.expected.get("types").and_then(Value::as_object)
+                    {
+                        for (type_name, type_def) in types_obj {
+                            if let Some(fields_obj) =
+                                type_def.get("fields").and_then(Value::as_object)
+                            {
+                                let parsed_names: Vec<&str> = schema
+                                    .types
+                                    .get(type_name)
+                                    .map(|t| t.fields.iter().map(|f| f.name.as_str()).collect())
+                                    .unwrap_or_default();
+                                for field_key in fields_obj.keys() {
+                                    if !parsed_names.contains(&field_key.as_str()) {
+                                        test_failures.push(format!(
+                                            "type '{}' missing field '{}' (found: {:?})",
+                                            type_name, field_key, parsed_names
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(fields_obj) =
+                        test.expected.get("fields").and_then(Value::as_object)
+                    {
+                        for field_path in fields_obj.keys() {
+                            if !schema.fields.contains_key(field_path) {
+                                test_failures.push(format!(
+                                    "root field '{}' not found (found: {:?})",
+                                    field_path,
+                                    schema.fields.keys().collect::<Vec<_>>()
                                 ));
                             }
                         }
