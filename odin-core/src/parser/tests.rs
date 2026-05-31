@@ -502,3 +502,84 @@ fn parse_header_inline_loop_counter_from() {
     let d3 = Odin::parse("{out :from data.records}\nv = \"x\"\n").unwrap();
     assert_eq!(d3.get_string("out._from"), Some("data.records"));
 }
+
+// ─── Prefixed reference coercion (##@path, #$@path) ──────────────────────────
+
+#[test]
+fn prefixed_integer_reference_carries_type_directive() {
+    let d = Odin::parse("year = ##@.year\n").unwrap();
+    match d.get("year") {
+        Some(crate::OdinValue::Reference { path, directives, .. }) => {
+            assert_eq!(path, ".year");
+            assert_eq!(directives.len(), 1);
+            assert_eq!(directives[0].name, "type");
+        }
+        other => panic!("expected reference with type directive, got {other:?}"),
+    }
+}
+
+#[test]
+fn prefixed_currency_reference_carries_type_directive() {
+    let d = Odin::parse("premium = #$@.premium\n").unwrap();
+    match d.get("premium") {
+        Some(crate::OdinValue::Reference { path, directives, .. }) => {
+            assert_eq!(path, ".premium");
+            assert_eq!(directives[0].name, "type");
+            match &directives[0].value {
+                Some(crate::types::values::DirectiveValue::String(s)) => assert_eq!(s, "currency"),
+                other => panic!("expected currency type value, got {other:?}"),
+            }
+        }
+        other => panic!("expected reference with type directive, got {other:?}"),
+    }
+}
+
+#[test]
+fn prefixed_number_reference_carries_type_directive() {
+    let d = Odin::parse("v = #@.x\n").unwrap();
+    match d.get("v") {
+        Some(crate::OdinValue::Reference { directives, .. }) => {
+            match &directives[0].value {
+                Some(crate::types::values::DirectiveValue::String(s)) => assert_eq!(s, "number"),
+                other => panic!("expected number type value, got {other:?}"),
+            }
+        }
+        other => panic!("expected reference, got {other:?}"),
+    }
+}
+
+#[test]
+fn bare_integer_prefix_still_parses_number() {
+    let d = Odin::parse("year = ##2021\n").unwrap();
+    match d.get("year") {
+        Some(crate::OdinValue::Integer { value, .. }) => assert_eq!(*value, 2021),
+        other => panic!("expected integer 2021, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_integer_prefix_still_errors() {
+    assert!(Odin::parse("year = ##\n").is_err());
+}
+
+// ─── \$ / \${ escapes ────────────────────────────────────────────────────────
+
+#[test]
+fn dollar_escape_emits_literal_dollar() {
+    let d = Odin::parse("x = \"price \\$5\"\n").unwrap();
+    assert_eq!(d.get_string("x"), Some("price $5"));
+}
+
+#[test]
+fn dollar_brace_escape_preserves_marker() {
+    let d = Odin::parse("x = \"use \\${name}\"\n").unwrap();
+    // The backslash is preserved before `${` so interpolation treats it as literal.
+    assert_eq!(d.get_string("x"), Some("use \\${name}"));
+}
+
+#[test]
+fn dollar_escape_before_interpolation_marker_drops_backslash() {
+    // `\$` followed by a real `${...}` yields a literal `$` then the live marker.
+    let d = Odin::parse("x = \"total \\$${amount}\"\n").unwrap();
+    assert_eq!(d.get_string("x"), Some("total $${amount}"));
+}
