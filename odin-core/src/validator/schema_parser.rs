@@ -9,7 +9,7 @@
 //!
 //! Type inheritance: `@Child : @Parent` or `@Child : @Parent & @Other`
 
-use crate::types::schema::{OdinSchemaDefinition, SchemaMetadata, SchemaImport, SchemaType, SchemaField, SchemaArray, SchemaObjectConstraint, SchemaFieldType, SchemaConstraint};
+use crate::types::schema::{OdinSchemaDefinition, SchemaMetadata, SchemaImport, SchemaType, SchemaField, SchemaArray, SchemaObjectConstraint, SchemaFieldType, SchemaConstraint, SchemaConditional, SchemaDefault, ConditionalOperator, ConditionalValue};
 use crate::types::errors::ParseError;
 use std::collections::HashMap;
 
@@ -109,10 +109,16 @@ impl SchemaParserState {
                 let key = trimmed[..eq_pos].trim();
                 let value = trimmed[eq_pos + 1..].trim();
 
-                // Type-level value definition: `= constraints` (empty key)
-                if key.is_empty() && self.current_context == ParserContext::TypeDef {
-                    self.parse_type_value(value);
-                    continue;
+                // Type/section composition: `= @a & @b` (empty key).
+                if key.is_empty() {
+                    if self.current_context == ParserContext::TypeDef {
+                        self.parse_type_value(value);
+                        continue;
+                    }
+                    if self.current_context == ParserContext::Section {
+                        self.parse_section_composition(value);
+                        continue;
+                    }
                 }
 
                 self.parse_assignment(key, value, line_num + 1)?;
@@ -259,10 +265,45 @@ impl SchemaParserState {
         //   = #|""  (union)
         //   = @TypeA & @TypeB (intersection)
         //   = :(20)  (exact length/value)
-        let _value = value.trim();
-        // Type-level constraints are stored in SchemaType.fields as a
-        // pseudo-field. We'll skip them for now since the golden tests
-        // primarily verify type existence and field structure.
+        let value = value.trim();
+        // Capture a type-level intersection (`= @A & @B`) as parent references
+        // so type-composition expansion merges both members.
+        if let Some(refs) = parse_type_intersection(value) {
+            for r in refs {
+                if !self.current_type_parents.contains(&r) {
+                    self.current_type_parents.push(r);
+                }
+            }
+        }
+    }
+
+    /// Parse a section-level composition `= @A & @B`, recording a `_composition`
+    /// field whose `TypeRef` name carries every `&`-joined member.
+    fn parse_section_composition(&mut self, value: &str) {
+        let Some(refs) = parse_type_intersection(value.trim()) else { return };
+        if refs.is_empty() {
+            return;
+        }
+        let name = refs.join("&");
+        let path = if self.current_section_path.is_empty() {
+            "_composition".to_string()
+        } else {
+            format!("{}._composition", self.current_section_path)
+        };
+        let field = SchemaField {
+            name: "_composition".to_string(),
+            field_type: SchemaFieldType::TypeRef(name),
+            required: false,
+            confidential: false,
+            deprecated: false,
+            immutable: false,
+            computed: false,
+            description: None,
+            constraints: Vec::new(),
+            default_value: None,
+            conditionals: Vec::new(),
+        };
+        self.fields.insert(path, field);
     }
 
     fn parse_object_constraint(&mut self, line: &str) {
@@ -395,9 +436,11 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
     let mut confidential = false;
     let mut deprecated = false;
     let mut immutable = false;
+    let mut computed = false;
     let mut constraints = Vec::new();
+    let mut conditionals = Vec::new();
     let mut field_type = SchemaFieldType::String;
-    let default_value = None;
+    let mut default_value: Option<SchemaDefault> = None;
 
     let name = name.trim();
     let value = value.trim();
@@ -428,22 +471,67 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
         }
     }
 
-    // Detect type from prefix: ## (integer), #$ (currency), # (number), ? (boolean), ~ (null)
-    if rest.starts_with("##") {
+    // Detect type from prefix. A trailing default value (e.g. `##3`, `#$5.00`)
+    // is captured here; union members (e.g. `#|~`) extend the base type.
+    let mut parsed_default: Option<SchemaDefault> = None;
+    if rest.starts_with("#%") {
+        let after = rest[2..].trim_start();
+        let (def, after) = take_numeric_default(after, "percent");
+        parsed_default = def;
+        field_type = SchemaFieldType::Percent;
+        rest = after;
+    } else if rest.starts_with("##") {
+        let after = rest[2..].trim_start();
+        let (def, after) = take_numeric_default(after, "integer");
+        parsed_default = def;
         field_type = SchemaFieldType::Integer;
-        rest = rest[2..].trim_start();
+        rest = after;
     } else if rest.starts_with("#$") {
+        let after = rest[2..].trim_start();
+        let (def, after) = take_numeric_default(after, "currency");
+        parsed_default = def;
         field_type = SchemaFieldType::Currency { decimal_places: None };
-        rest = rest[2..].trim_start();
+        rest = after;
     } else if rest.starts_with('#') && !rest.starts_with("#(") {
+        let after = rest[1..].trim_start();
+        let (def, after) = take_numeric_default(after, "number");
+        parsed_default = def;
         field_type = SchemaFieldType::Number { decimal_places: None };
-        rest = rest[1..].trim_start();
+        rest = after;
     } else if rest.starts_with('?') {
         field_type = SchemaFieldType::Boolean;
         rest = rest[1..].trim_start();
     } else if rest == "~" {
         field_type = SchemaFieldType::Null;
         rest = "";
+    }
+
+    if parsed_default.is_some() {
+        default_value = parsed_default;
+    }
+
+    // Bare temporal base type (e.g. `date`, `timestamp:immutable`, `date:(min..max)`).
+    // A glued `:immutable`/`:computed` directive is applied; other suffixes (`:(...)`,
+    // `:format`, ...) are left for the constraint loop.
+    if let Some((temporal, after)) = take_temporal(rest) {
+        field_type = temporal;
+        rest = apply_glued_directives(after, &mut immutable, &mut computed);
+    }
+
+    // Union: a `|`-joined member list extends the base type (e.g. `#|~`).
+    if rest.starts_with('|') {
+        if let Some((ty, after)) = parse_union(rest, &field_type) {
+            field_type = ty;
+            rest = after;
+        }
+    } else if let Some((first, after_first)) = take_union_member(rest) {
+        // Bare-word leading member (e.g. `date|timestamp`).
+        if after_first.trim_start().starts_with('|') {
+            if let Some((ty, after)) = parse_union(after_first.trim_start(), &first) {
+                field_type = ty;
+                rest = after;
+            }
+        }
     }
 
     // Check for @TypeRef
@@ -505,7 +593,7 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
                 }
             }
             if let Some(rest) = after.strip_prefix("computed") {
-                // Computed fields — skip for now, just record
+                computed = true;
                 remaining = rest.trim_start();
                 continue;
             }
@@ -529,24 +617,20 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
                 remaining = rest.trim_start();
                 continue;
             }
-            if after.starts_with("if ") || after.starts_with("unless ") {
-                // Conditional — skip parsing the rest of the line
+            // Conditional: `:if field op value` / `:unless field op value`
+            if let Some(cond_rest) = after.strip_prefix("if ").or_else(|| after.strip_prefix("unless ")) {
+                let unless = after.starts_with("unless ");
+                if let Some(cond) = parse_conditional(cond_rest, unless) {
+                    conditionals.push(cond);
+                }
                 remaining = "";
                 continue;
             }
-            if let Some(rest) = after.strip_prefix("timestamp") {
-                field_type = SchemaFieldType::Timestamp;
-                remaining = rest.trim_start();
-                continue;
-            }
-            if let Some(rest) = after.strip_prefix("date") {
-                field_type = SchemaFieldType::Date;
-                remaining = rest.trim_start();
-                continue;
-            }
-            if let Some(rest) = after.strip_prefix("time") {
-                field_type = SchemaFieldType::Time;
-                remaining = rest.trim_start();
+            // Temporal type with an optionally-glued directive (e.g. `timestamp:immutable`).
+            if let Some((temporal, after_temporal)) = take_temporal(after) {
+                field_type = temporal;
+                let after_glue = apply_glued_directives(after_temporal, &mut immutable, &mut computed);
+                remaining = after_glue.trim_start();
                 continue;
             }
             // Bounds/enum: :(...)
@@ -554,10 +638,10 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
                 if let Some(paren_end) = after.find(')') {
                     let inner = &after[1..paren_end];
                     if inner.contains("..") {
-                        let (min, max) = parse_range(inner);
+                        let (min, max) = parse_bounds_pair(inner);
                         constraints.push(SchemaConstraint::Bounds {
-                            min: min.map(|v| v.to_string()),
-                            max: max.map(|v| v.to_string()),
+                            min,
+                            max,
                             min_exclusive: false,
                             max_exclusive: false,
                         });
@@ -569,11 +653,12 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
                             .collect();
                         constraints.push(SchemaConstraint::Enum(values));
                     } else {
-                        // Single value — exact length
-                        if let Ok(n) = inner.trim().parse::<usize>() {
+                        // Single value — exact length/value
+                        let v = inner.trim();
+                        if !v.is_empty() {
                             constraints.push(SchemaConstraint::Bounds {
-                                min: Some(n.to_string()),
-                                max: Some(n.to_string()),
+                                min: Some(v.to_string()),
+                                max: Some(v.to_string()),
                                 min_exclusive: false,
                                 max_exclusive: false,
                             });
@@ -583,7 +668,7 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
                     continue;
                 }
             }
-            // Pattern: :/regex/
+            // Pattern: :/regex/ — a trailing :if/:unless may follow the closer.
             if let Some(after_slash) = after.strip_prefix('/') {
                 if let Some(end) = after_slash.find('/') {
                     let pattern = after_slash[..end].to_string();
@@ -598,10 +683,8 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
             continue;
         }
 
-        // Non-directive remaining text
-        // Could be a default value or type name
+        // Non-directive remaining text: a type-name word, or a default value.
         if !remaining.is_empty() {
-            // Check for type name in remaining
             let word = remaining.split_whitespace().next().unwrap_or(remaining);
             match word.trim_matches('"') {
                 "string" => field_type = SchemaFieldType::String,
@@ -616,7 +699,14 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
                 "percent" => field_type = SchemaFieldType::Percent,
                 "binary" => field_type = SchemaFieldType::Binary,
                 "null" => field_type = SchemaFieldType::Null,
-                _ => {}
+                // A trailing literal default value (e.g. `= ##:(1..5) ##3` -> "##3").
+                _ => {
+                    if default_value.is_none() {
+                        if let Some(def) = parse_default_literal(word, &field_type) {
+                            default_value = Some(def);
+                        }
+                    }
+                }
             }
         }
         break;
@@ -629,10 +719,242 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
         confidential,
         deprecated,
         immutable,
+        computed,
         description: None,
         constraints,
         default_value,
-        conditionals: Vec::new(),
+        conditionals,
+    }
+}
+
+/// Recognized temporal base-type words and their `SchemaFieldType`.
+fn temporal_type(word: &str) -> Option<SchemaFieldType> {
+    match word {
+        "date" => Some(SchemaFieldType::Date),
+        "timestamp" => Some(SchemaFieldType::Timestamp),
+        "time" => Some(SchemaFieldType::Time),
+        "duration" => Some(SchemaFieldType::Duration),
+        _ => None,
+    }
+}
+
+/// Match a leading temporal type word in a `:directive` body, returning the type
+/// and the text after the base word (which may carry glued `:immutable` etc.).
+fn take_temporal(after: &str) -> Option<(SchemaFieldType, &str)> {
+    for kw in ["timestamp", "duration", "date", "time"] {
+        if let Some(rest) = after.strip_prefix(kw) {
+            // The base word must end here or be followed by `:`/whitespace, not
+            // be a longer identifier (avoid matching e.g. "datetime").
+            if rest.is_empty() || rest.starts_with(':') || rest.starts_with(char::is_whitespace) {
+                return temporal_type(kw).map(|t| (t, rest));
+            }
+        }
+    }
+    None
+}
+
+/// Apply directives glued onto a type suffix (`:immutable`, `:computed`),
+/// returning the remaining text after the consumed directives.
+fn apply_glued_directives<'a>(mut suffix: &'a str, immutable: &mut bool, computed: &mut bool) -> &'a str {
+    while let Some(after) = suffix.strip_prefix(':') {
+        if let Some(rest) = after.strip_prefix("immutable") {
+            *immutable = true;
+            suffix = rest;
+        } else if let Some(rest) = after.strip_prefix("computed") {
+            *computed = true;
+            suffix = rest;
+        } else {
+            break;
+        }
+    }
+    suffix
+}
+
+/// Parse a union member list following a base type (e.g. `|~`, `|timestamp`).
+/// `head` is the text immediately after the base type prefix. Returns the
+/// resulting union type and the unconsumed remainder, or `None` if not a union.
+fn parse_union<'a>(head: &'a str, base: &SchemaFieldType) -> Option<(SchemaFieldType, &'a str)> {
+    // A union begins with `|` directly after the base, or the base itself was a
+    // bare temporal word followed by `|` (handled by the caller passing `head`).
+    if !head.starts_with('|') {
+        return None;
+    }
+    let mut members = vec![base.clone()];
+    let mut s = head;
+    while let Some(after_bar) = s.strip_prefix('|') {
+        let after_bar = after_bar.trim_start();
+        let (member, rest) = take_union_member(after_bar)?;
+        members.push(member);
+        s = rest.trim_start();
+        if !s.starts_with('|') {
+            break;
+        }
+    }
+    Some((SchemaFieldType::Union(members), s))
+}
+
+/// Take a single union member from the start of `s`, returning the member and
+/// the unconsumed remainder.
+fn take_union_member(s: &str) -> Option<(SchemaFieldType, &str)> {
+    if let Some(rest) = s.strip_prefix("##") {
+        return Some((SchemaFieldType::Integer, rest));
+    }
+    if let Some(rest) = s.strip_prefix("#%") {
+        return Some((SchemaFieldType::Percent, rest));
+    }
+    if let Some(rest) = s.strip_prefix("#$") {
+        return Some((SchemaFieldType::Currency { decimal_places: None }, rest));
+    }
+    if let Some(rest) = s.strip_prefix('#') {
+        return Some((SchemaFieldType::Number { decimal_places: None }, rest));
+    }
+    if let Some(rest) = s.strip_prefix('~') {
+        return Some((SchemaFieldType::Null, rest));
+    }
+    if let Some(rest) = s.strip_prefix('?') {
+        return Some((SchemaFieldType::Boolean, rest));
+    }
+    if let Some(rest) = s.strip_prefix("\"\"").or_else(|| s.strip_prefix("''")) {
+        return Some((SchemaFieldType::String, rest));
+    }
+    for kw in ["timestamp", "duration", "date", "time"] {
+        if let Some(rest) = s.strip_prefix(kw) {
+            if rest.is_empty() || rest.starts_with('|') || rest.starts_with(char::is_whitespace) {
+                return temporal_type(kw).map(|t| (t, rest));
+            }
+        }
+    }
+    None
+}
+
+/// Capture a leading numeric default literal (the text after a type prefix),
+/// returning the typed default and the unconsumed remainder.
+fn take_numeric_default<'a>(after: &'a str, kind: &str) -> (Option<SchemaDefault>, &'a str) {
+    // Stop at the first non-number boundary (whitespace, `:`, `|`).
+    let end = after
+        .find(|c: char| c.is_whitespace() || c == ':' || c == '|')
+        .unwrap_or(after.len());
+    let literal = &after[..end];
+    if literal.is_empty() {
+        return (None, after);
+    }
+    let def = match kind {
+        "integer" => literal.parse::<i64>().ok().map(SchemaDefault::Integer),
+        "currency" => literal.parse::<f64>().ok().map(SchemaDefault::Currency),
+        "percent" => literal.parse::<f64>().ok().map(SchemaDefault::Percent),
+        _ => literal.parse::<f64>().ok().map(SchemaDefault::Number),
+    };
+    if def.is_some() {
+        (def, &after[end..])
+    } else {
+        (None, after)
+    }
+}
+
+/// Parse a trailing default literal token typed to the field's declared type.
+fn parse_default_literal(word: &str, field_type: &SchemaFieldType) -> Option<SchemaDefault> {
+    let w = word.trim();
+    if w.is_empty() {
+        return None;
+    }
+    if let Some(rest) = w.strip_prefix("##") {
+        return rest.parse::<i64>().ok().map(SchemaDefault::Integer);
+    }
+    if let Some(rest) = w.strip_prefix("#$") {
+        return rest.parse::<f64>().ok().map(SchemaDefault::Currency);
+    }
+    if let Some(rest) = w.strip_prefix("#%") {
+        return rest.parse::<f64>().ok().map(SchemaDefault::Percent);
+    }
+    if let Some(rest) = w.strip_prefix('#') {
+        return rest.parse::<f64>().ok().map(SchemaDefault::Number);
+    }
+    if let Some(rest) = w.strip_prefix('?') {
+        return Some(SchemaDefault::Bool(rest == "true"));
+    }
+    if w == "true" || w == "false" {
+        return Some(SchemaDefault::Bool(w == "true"));
+    }
+    // Bare numeric default — tag to the field's declared type.
+    if let Ok(n) = w.parse::<f64>() {
+        return Some(match field_type {
+            SchemaFieldType::Integer => SchemaDefault::Integer(n as i64),
+            SchemaFieldType::Currency { .. } => SchemaDefault::Currency(n),
+            SchemaFieldType::Percent => SchemaDefault::Percent(n),
+            _ => SchemaDefault::Number(n),
+        });
+    }
+    None
+}
+
+/// Parse a `field op value` conditional body.
+fn parse_conditional(body: &str, unless: bool) -> Option<SchemaConditional> {
+    let body = body.trim();
+    // Operators, longest first.
+    for (op_str, op) in [
+        ("!=", ConditionalOperator::NotEq),
+        (">=", ConditionalOperator::Gte),
+        ("<=", ConditionalOperator::Lte),
+        (">", ConditionalOperator::Gt),
+        ("<", ConditionalOperator::Lt),
+        ("=", ConditionalOperator::Eq),
+    ] {
+        if let Some(pos) = body.find(op_str) {
+            let field = body[..pos].trim().to_string();
+            let raw = body[pos + op_str.len()..].trim();
+            if field.is_empty() || raw.is_empty() {
+                continue;
+            }
+            let value = parse_conditional_value(raw);
+            return Some(SchemaConditional { field, operator: op, value, unless });
+        }
+    }
+    // Shorthand `:if field` -> `field = true`.
+    if !body.is_empty() {
+        return Some(SchemaConditional {
+            field: body.to_string(),
+            operator: ConditionalOperator::Eq,
+            value: ConditionalValue::Bool(true),
+            unless,
+        });
+    }
+    None
+}
+
+/// Parse a conditional comparison value (bool, number, or quoted/bare string).
+fn parse_conditional_value(raw: &str) -> ConditionalValue {
+    if raw == "true" || raw == "false" {
+        return ConditionalValue::Bool(raw == "true");
+    }
+    if let Ok(n) = raw.parse::<f64>() {
+        return ConditionalValue::Number(n);
+    }
+    ConditionalValue::String(raw.trim_matches(|c| c == '"' || c == '\'').to_string())
+}
+
+/// Parse a `min..max` bounds pair, preserving temporal/string literals.
+fn parse_bounds_pair(inner: &str) -> (Option<String>, Option<String>) {
+    let parts: Vec<&str> = inner.splitn(2, "..").collect();
+    let min = parts.first().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
+    let max = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
+    (min, max)
+}
+
+/// Parse an intersection of type references (`@A & @B`) into bare type names.
+/// Returns `None` when the value is not a `@`-reference composition.
+fn parse_type_intersection(value: &str) -> Option<Vec<String>> {
+    if !value.starts_with('@') {
+        return None;
+    }
+    let refs: Vec<String> = value
+        .split('&')
+        .map(|s| s.trim().trim_start_matches('@').trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if refs.is_empty() {
+        None
+    } else {
+        Some(refs)
     }
 }
 
@@ -1393,5 +1715,111 @@ dep = -"old"
     #[test]
     fn test_parse_range_max_only() {
         assert_eq!(parse_range("..50"), (None, Some(50)));
+    }
+
+    // ── Conformance fixes ───────────────────────────────────────────────
+
+    #[test]
+    fn test_percent_type_first_class() {
+        let s = parse_schema("{root}\ntax = #%").unwrap();
+        assert!(matches!(s.fields["root.tax"].field_type, SchemaFieldType::Percent));
+    }
+
+    #[test]
+    fn test_typed_default_integer() {
+        let s = parse_schema("{root}\na = ##3").unwrap();
+        let f = &s.fields["root.a"];
+        assert!(matches!(f.field_type, SchemaFieldType::Integer));
+        assert_eq!(f.default_value, Some(SchemaDefault::Integer(3)));
+    }
+
+    #[test]
+    fn test_typed_default_number_currency_percent() {
+        let s = parse_schema("{root}\nb = #0.05\nc = #$5.00\np = #%0.15").unwrap();
+        assert_eq!(s.fields["root.b"].default_value, Some(SchemaDefault::Number(0.05)));
+        assert_eq!(s.fields["root.c"].default_value, Some(SchemaDefault::Currency(5.0)));
+        assert_eq!(s.fields["root.p"].default_value, Some(SchemaDefault::Percent(0.15)));
+    }
+
+    #[test]
+    fn test_constrained_default_after_bounds() {
+        let s = parse_schema("{root}\npriority = ##:(1..5) ##3").unwrap();
+        let f = &s.fields["root.priority"];
+        assert_eq!(f.default_value, Some(SchemaDefault::Integer(3)));
+        assert!(matches!(&f.constraints[0],
+            SchemaConstraint::Bounds { min: Some(m), max: Some(x), .. } if m == "1" && x == "5"));
+    }
+
+    #[test]
+    fn test_union_date_timestamp() {
+        let s = parse_schema("{root}\nu = date|timestamp").unwrap();
+        match &s.fields["root.u"].field_type {
+            SchemaFieldType::Union(m) => {
+                assert!(matches!(m[0], SchemaFieldType::Date));
+                assert!(matches!(m[1], SchemaFieldType::Timestamp));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_union_number_null() {
+        let s = parse_schema("{root}\nn = #|~").unwrap();
+        match &s.fields["root.n"].field_type {
+            SchemaFieldType::Union(m) => {
+                assert!(matches!(m[0], SchemaFieldType::Number { .. }));
+                assert!(matches!(m[1], SchemaFieldType::Null));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_temporal_bounds_preserve_dates() {
+        let s = parse_schema("{root}\nd = date:(2020-06-15..2020-06-20)").unwrap();
+        let f = &s.fields["root.d"];
+        assert!(matches!(f.field_type, SchemaFieldType::Date));
+        assert!(matches!(&f.constraints[0],
+            SchemaConstraint::Bounds { min: Some(m), max: Some(x), .. }
+            if m == "2020-06-15" && x == "2020-06-20"));
+    }
+
+    #[test]
+    fn test_temporal_glued_immutable_keeps_type() {
+        let s = parse_schema("{root}\ncreated_at = !timestamp:immutable").unwrap();
+        let f = &s.fields["root.created_at"];
+        assert!(matches!(f.field_type, SchemaFieldType::Timestamp));
+        assert!(f.required);
+        assert!(f.immutable);
+    }
+
+    #[test]
+    fn test_temporal_glued_computed_keeps_type() {
+        let s = parse_schema("{root}\nstamp = date:computed").unwrap();
+        let f = &s.fields["root.stamp"];
+        assert!(matches!(f.field_type, SchemaFieldType::Date));
+        assert!(f.computed);
+    }
+
+    #[test]
+    fn test_pattern_then_if_conditional() {
+        let s = parse_schema("{root}\nfield = !:/^[a-z]+$/:if method = paypal").unwrap();
+        let f = &s.fields["root.field"];
+        assert!(f.required);
+        assert!(matches!(&f.constraints[0], SchemaConstraint::Pattern(p) if p == "^[a-z]+$"));
+        assert_eq!(f.conditionals.len(), 1);
+        let c = &f.conditionals[0];
+        assert_eq!(c.field, "method");
+        assert!(matches!(c.operator, ConditionalOperator::Eq));
+        assert!(matches!(&c.value, ConditionalValue::String(v) if v == "paypal"));
+    }
+
+    #[test]
+    fn test_type_intersection_section_composition() {
+        let s = parse_schema(
+            "{@hasName}\nname = !\n\n{@hasAge}\nage = !##\n\n{customer}\n= @hasName & @hasAge",
+        ).unwrap();
+        let f = &s.fields["customer._composition"];
+        assert!(matches!(&f.field_type, SchemaFieldType::TypeRef(n) if n == "hasName&hasAge"));
     }
 }

@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use crate::types::document::OdinDocument;
 use crate::types::schema::{
     OdinSchemaDefinition, SchemaConstraint, SchemaField,
-    SchemaFieldType, SchemaObjectConstraint, ConditionalOperator, ConditionalValue,
+    SchemaFieldType, SchemaObjectConstraint, SchemaType, ConditionalOperator, ConditionalValue,
     ValidationResult,
 };
 use crate::types::options::ValidateOptions;
@@ -51,8 +51,10 @@ pub fn validate_with_registry(
         return ValidationResult::invalid(errors);
     }
 
-    // 1. Validate fields defined in schema
-    for (path, field) in &schema.fields {
+    // 1. Validate fields defined in schema (including fields synthesized from
+    //    section `_composition` intersections and field-level `@TypeRef`s).
+    let expanded_fields = expand_field_compositions(doc, &schema, registry);
+    for (path, field) in &expanded_fields {
         validate_field(doc, path, field, &opts, &mut errors);
         if opts.fail_fast && !errors.is_empty() {
             return ValidationResult::invalid(errors);
@@ -318,6 +320,34 @@ fn validate_bounds(
         return;
     }
 
+    // For date/timestamp types, compare chronologically against temporal bounds.
+    if let Some(actual) = temporal_key(value) {
+        if let Some(min_str) = min {
+            if let Some(min_key) = parse_temporal_bound(min_str) {
+                if actual < min_key {
+                    errors.push(ValidationError::new(
+                        ValidationErrorCode::ValueOutOfBounds,
+                        path,
+                        format!("Date {value:?} is before minimum {min_str}"),
+                    ));
+                    return;
+                }
+            }
+        }
+        if let Some(max_str) = max {
+            if let Some(max_key) = parse_temporal_bound(max_str) {
+                if actual > max_key {
+                    errors.push(ValidationError::new(
+                        ValidationErrorCode::ValueOutOfBounds,
+                        path,
+                        format!("Date {value:?} is after maximum {max_str}"),
+                    ));
+                }
+            }
+        }
+        return;
+    }
+
     // For string types, compare length
     if let Some(s) = value.as_str() {
         let len = s.len();
@@ -347,6 +377,39 @@ fn validate_bounds(
             }
         }
     }
+}
+
+/// Days since the civil epoch (1970-01-01) for a proleptic Gregorian date.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// A comparable millisecond key for a temporal `OdinValue`, or `None` if the
+/// value is not temporal.
+fn temporal_key(value: &OdinValue) -> Option<i64> {
+    match value {
+        OdinValue::Date { year, month, day, .. } => {
+            Some(days_from_civil(*year as i64, *month as i64, *day as i64) * 86_400_000)
+        }
+        OdinValue::Timestamp { epoch_ms, .. } => Some(*epoch_ms),
+        _ => None,
+    }
+}
+
+/// Parse a temporal bound literal (`YYYY-MM-DD`, optionally with a time part)
+/// into a comparable millisecond key.
+fn parse_temporal_bound(s: &str) -> Option<i64> {
+    let date_part = s.split(['T', ' ']).next().unwrap_or(s);
+    let mut it = date_part.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    Some(days_from_civil(y, m, d) * 86_400_000)
 }
 
 fn validate_pattern(
@@ -563,33 +626,176 @@ fn validate_invariant(
     expr: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    // Simple expression evaluator: field op value
-    // Supports: >, <, >=, <=, ==, !=
-    let ops = [">=", "<=", "!=", "==", ">", "<"];
+    let expr = expr.trim();
+
+    // Spec: any present-but-null operand makes the expression evaluate to false.
+    if has_null_operand(doc, path, expr) {
+        errors.push(ValidationError::new(
+            ValidationErrorCode::InvariantViolation,
+            path,
+            format!("Invariant '{expr}' violated: null operand"),
+        ));
+        return;
+    }
+
+    // Arithmetic equality: lhs = a op b (e.g. "total = subtotal + tax").
+    if let Some((lhs, a, arith, b)) = parse_arithmetic(expr) {
+        let lhs_v = resolve_numeric(doc, path, lhs);
+        let a_v = resolve_numeric(doc, path, a);
+        let b_v = resolve_numeric(doc, path, b);
+        let (Some(lhs_v), Some(a_v), Some(b_v)) = (lhs_v, a_v, b_v) else {
+            return; // operand missing — invariant does not apply
+        };
+        let rhs = match arith {
+            '+' => a_v + b_v,
+            '-' => a_v - b_v,
+            '*' => a_v * b_v,
+            '/' => if b_v != 0.0 { a_v / b_v } else { f64::NAN },
+            _ => return,
+        };
+        if (lhs_v - rhs).abs() > 0.001 {
+            errors.push(ValidationError::new(
+                ValidationErrorCode::InvariantViolation,
+                path,
+                format!("Invariant '{expr}' violated"),
+            ));
+        }
+        return;
+    }
+
+    // Simple comparison: field op value_or_field.
+    let ops = [">=", "<=", "!=", "==", ">", "<", "="];
     for op in &ops {
         if let Some(pos) = expr.find(op) {
             let field_name = expr[..pos].trim();
-            let compare_val = expr[pos + op.len()..].trim();
+            let compare = expr[pos + op.len()..].trim();
+            if field_name.is_empty() || compare.is_empty() {
+                continue;
+            }
 
             let full_path = if path.is_empty() {
                 field_name.to_string()
             } else {
                 format!("{path}.{field_name}")
             };
+            let Some(val) = doc.get(&full_path) else { return };
 
-            if let Some(val) = doc.get(&full_path) {
-                let passes = evaluate_comparison(val, op, compare_val);
-                if !passes {
-                    errors.push(ValidationError::new(
-                        ValidationErrorCode::InvariantViolation,
-                        path,
-                        format!("Invariant '{expr}' violated"),
-                    ));
-                }
+            // Field-to-field or literal comparison.
+            let compare_path = if path.is_empty() {
+                compare.to_string()
+            } else {
+                format!("{path}.{compare}")
+            };
+            let passes = if let Some(other) = doc.get(&compare_path) {
+                evaluate_field_comparison(val, op, other)
+            } else {
+                evaluate_comparison(val, op, compare)
+            };
+            if !passes {
+                errors.push(ValidationError::new(
+                    ValidationErrorCode::InvariantViolation,
+                    path,
+                    format!("Invariant '{expr}' violated"),
+                ));
             }
             return;
         }
     }
+}
+
+/// Whether any identifier operand of `expr` is present in the document with a
+/// null value. Absent operands are left to required-field validation.
+fn has_null_operand(doc: &OdinDocument, path: &str, expr: &str) -> bool {
+    let mut token = String::new();
+    let mut tokens = Vec::new();
+    for ch in expr.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+            token.push(ch);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    for tok in tokens {
+        if tok == "true" || tok == "false" || tok.parse::<f64>().is_ok() {
+            continue;
+        }
+        let full = if path.is_empty() { tok.clone() } else { format!("{path}.{tok}") };
+        if let Some(OdinValue::Null { .. }) = doc.get(&full) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse an arithmetic invariant `lhs = a op b`, returning the operand names.
+fn parse_arithmetic(expr: &str) -> Option<(&str, &str, char, &str)> {
+    let eq = expr.find('=')?;
+    // Reject comparison operators masquerading as `=` (e.g. ">=", "==").
+    if expr.as_bytes().get(eq + 1) == Some(&b'=') {
+        return None;
+    }
+    if eq > 0 {
+        let prev = expr.as_bytes()[eq - 1];
+        if matches!(prev, b'>' | b'<' | b'!') {
+            return None;
+        }
+    }
+    let lhs = expr[..eq].trim();
+    let rhs = expr[eq + 1..].trim();
+    for op in ['+', '-', '*', '/'] {
+        if let Some(pos) = rhs.find(op) {
+            let a = rhs[..pos].trim();
+            let b = rhs[pos + 1..].trim();
+            if is_identifier(lhs) && is_identifier(a) && is_identifier(b) {
+                return Some((lhs, a, op, b));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `s` is a single bare identifier (word characters only).
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+/// Resolve a numeric value from a field name or numeric literal.
+fn resolve_numeric(doc: &OdinDocument, path: &str, name: &str) -> Option<f64> {
+    let full = if path.is_empty() { name.to_string() } else { format!("{path}.{name}") };
+    if let Some(v) = doc.get(&full) {
+        return v.as_f64();
+    }
+    name.parse::<f64>().ok()
+}
+
+/// Evaluate a field-to-field comparison.
+fn evaluate_field_comparison(left: &OdinValue, op: &str, right: &OdinValue) -> bool {
+    if let (Some(l), Some(r)) = (left.as_f64(), right.as_f64()) {
+        return match op {
+            ">" => l > r,
+            "<" => l < r,
+            ">=" => l >= r,
+            "<=" => l <= r,
+            "==" | "=" => (l - r).abs() < 0.001,
+            "!=" => (l - r).abs() >= 0.001,
+            _ => true,
+        };
+    }
+    if let (Some(l), Some(r)) = (left.as_str(), right.as_str()) {
+        return match op {
+            ">" => l > r,
+            "<" => l < r,
+            ">=" => l >= r,
+            "<=" => l <= r,
+            "==" | "=" => l == r,
+            "!=" => l != r,
+            _ => true,
+        };
+    }
+    true
 }
 
 fn evaluate_comparison(value: &OdinValue, op: &str, compare: &str) -> bool {
@@ -601,7 +807,7 @@ fn evaluate_comparison(value: &OdinValue, op: &str, compare: &str) -> bool {
                 "<" => num < cmp,
                 ">=" => num >= cmp,
                 "<=" => num <= cmp,
-                "==" => (num - cmp).abs() < f64::EPSILON,
+                "==" | "=" => (num - cmp).abs() < f64::EPSILON,
                 "!=" => (num - cmp).abs() >= f64::EPSILON,
                 _ => true,
             };
@@ -611,7 +817,7 @@ fn evaluate_comparison(value: &OdinValue, op: &str, compare: &str) -> bool {
     if let Some(s) = value.as_str() {
         let cmp = compare.trim_matches('"');
         return match op {
-            "==" => s == cmp,
+            "==" | "=" => s == cmp,
             "!=" => s != cmp,
             ">" => s > cmp,
             "<" => s < cmp,
@@ -777,6 +983,99 @@ fn matches_condition_value(
 // Schema Type Reference Validation (V013)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Whether an object at `path` is present — the path itself or any descendant
+/// holds a value.
+fn is_object_present(doc: &OdinDocument, path: &str) -> bool {
+    if doc.has(path) {
+        return true;
+    }
+    let prefix = format!("{path}.");
+    doc.assignments.keys().any(|p| p.starts_with(&prefix))
+}
+
+/// Build the effective field set for validation: the schema's own fields plus
+/// fields synthesized from section `_composition` intersections and field-level
+/// `@TypeRef`s (which enforce the referenced type's fields under the sub-path).
+fn expand_field_compositions(
+    doc: &OdinDocument,
+    schema: &OdinSchemaDefinition,
+    registry: Option<&TypeRegistry>,
+) -> Vec<(String, SchemaField)> {
+    use std::collections::HashMap as Map;
+    let mut result: Map<String, SchemaField> = Map::new();
+
+    // Section `_composition` intersections: merge every member type's fields
+    // under the parent path.
+    for (path, field) in &schema.fields {
+        if let Some(parent) = path.strip_suffix("._composition") {
+            if let SchemaFieldType::TypeRef(name) = &field.field_type {
+                for member in name.split('&').map(str::trim).filter(|m| !m.is_empty()) {
+                    if let Some(type_def) = lookup_type(schema, registry, member) {
+                        for tf in &type_def.fields {
+                            if tf.name == "_composition" {
+                                continue;
+                            }
+                            let full = format!("{parent}.{}", tf.name);
+                            result.insert(full.clone(), rename_field(tf, &full));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The schema's explicit fields (override synthesized ones).
+    for (path, field) in &schema.fields {
+        if path.ends_with("._composition") {
+            continue;
+        }
+        result.insert(path.clone(), field.clone());
+    }
+
+    // Field-level `@TypeRef`: enforce the referenced type's fields under the
+    // field path when the sub-object is present or the field is required.
+    let snapshot: Vec<(String, SchemaField)> =
+        result.iter().map(|(p, f)| (p.clone(), f.clone())).collect();
+    for (path, field) in &snapshot {
+        let name = match &field.field_type {
+            SchemaFieldType::TypeRef(n) => n.clone(),
+            SchemaFieldType::Reference(n) => n.clone(),
+            _ => continue,
+        };
+        let members: Vec<&str> = name.split('&').map(str::trim).filter(|m| !m.is_empty()).collect();
+        let type_defs: Vec<&SchemaType> = members
+            .iter()
+            .filter_map(|m| lookup_type(schema, registry, m))
+            .collect();
+        if type_defs.is_empty() {
+            continue; // runtime reference, not a defined type
+        }
+        if !is_object_present(doc, path) && !field.required {
+            continue;
+        }
+        for type_def in type_defs {
+            for tf in &type_def.fields {
+                if tf.name == "_composition" {
+                    continue;
+                }
+                let full = format!("{path}.{}", tf.name);
+                result.entry(full.clone()).or_insert_with(|| rename_field(tf, &full));
+            }
+        }
+    }
+
+    result.into_iter().collect()
+}
+
+/// Clone a field, replacing its `name` with `name` (the synthesized full path's
+/// leaf is kept as the original field name for messages; here we keep the leaf).
+fn rename_field(field: &SchemaField, full_path: &str) -> SchemaField {
+    let leaf = full_path.rsplit('.').next().unwrap_or(full_path);
+    let mut f = field.clone();
+    f.name = leaf.to_string();
+    f
+}
+
 /// Look up a named type, checking the import registry first then local types.
 fn lookup_type<'a>(
     schema: &'a OdinSchemaDefinition,
@@ -799,12 +1098,15 @@ fn validate_schema_type_references(
 ) {
     for (path, field) in &schema.fields {
         if let SchemaFieldType::TypeRef(name) = &field.field_type {
-            if lookup_type(schema, registry, name).is_none() {
-                errors.push(ValidationError::new(
-                    ValidationErrorCode::UnresolvedReference,
-                    path,
-                    format!("Unresolved type reference: @{name}"),
-                ));
+            // An intersection typeRef (`@a & @b`) carries `&`-joined member names.
+            for member in name.split('&').map(str::trim).filter(|m| !m.is_empty()) {
+                if lookup_type(schema, registry, member).is_none() {
+                    errors.push(ValidationError::new(
+                        ValidationErrorCode::UnresolvedReference,
+                        path,
+                        format!("Unresolved type reference: @{member}"),
+                    ));
+                }
             }
         }
     }
@@ -1164,6 +1466,7 @@ mod tests {
             confidential: false,
             deprecated: false,
             immutable: false,
+            computed: false,
             description: None,
             constraints: vec![],
             default_value: None,
@@ -1176,6 +1479,7 @@ mod tests {
             confidential: false,
             deprecated: false,
             immutable: false,
+            computed: false,
             description: None,
             constraints: vec![],
             default_value: None,
@@ -1213,6 +1517,7 @@ mod tests {
                     confidential: false,
                     deprecated: false,
                     immutable: false,
+                    computed: false,
                     description: None,
                     constraints: vec![],
                     default_value: None,
@@ -1233,6 +1538,7 @@ mod tests {
                     confidential: false,
                     deprecated: false,
                     immutable: false,
+                    computed: false,
                     description: None,
                     constraints: vec![],
                     default_value: None,
@@ -1259,6 +1565,7 @@ mod tests {
             confidential: false,
             deprecated: false,
             immutable: false,
+            computed: false,
             description: None,
             constraints: vec![],
             default_value: None,
@@ -1274,6 +1581,7 @@ mod tests {
             confidential: false,
             deprecated: false,
             immutable: false,
+            computed: false,
             description: None,
             constraints,
             default_value: None,
@@ -2291,6 +2599,135 @@ mod tests {
             .filter(|e| e.error_code == ValidationErrorCode::UnresolvedReference)
             .count();
         assert_eq!(v013, 0, "registry must resolve @types.policy_status");
+    }
+
+    // ── Conformance fixes (full validate pipeline) ──────────────────────
+
+    fn validate_text(schema_text: &str, input: &str) -> ValidationResult {
+        let schema = schema_parser::parse_schema(schema_text).unwrap();
+        let doc = crate::Odin::parse(input).unwrap();
+        validate(&doc, &schema, None)
+    }
+
+    #[test]
+    fn test_intersection_all_present_valid() {
+        let schema = "{@hasName}\nname = !\n\n{@hasAge}\nage = !##\n\n{customer}\n= @hasName & @hasAge";
+        let r = validate_text(schema, "{customer}\nname = \"Bob\"\nage = ##5");
+        assert!(r.valid, "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn test_intersection_missing_member_field_v001() {
+        let schema = "{@hasName}\nname = !\n\n{@hasAge}\nage = !##\n\n{customer}\n= @hasName & @hasAge";
+        let r = validate_text(schema, "{customer}\nname = \"Bob\"");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e|
+            e.error_code == ValidationErrorCode::RequiredFieldMissing && e.path == "customer.age"));
+    }
+
+    #[test]
+    fn test_intersection_unresolved_member_v013() {
+        let schema = "{@hasName}\nname = !\n\n{customer}\n= @hasName & @doesNotExist";
+        let r = validate_text(schema, "{customer}\nname = \"Bob\"");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e| e.error_code == ValidationErrorCode::UnresolvedReference));
+    }
+
+    #[test]
+    fn test_temporal_bounds_chronological() {
+        let schema = "{root}\nd = date:(2020-06-15..2020-06-20)";
+        assert!(validate_text(schema, "{root}\nd = 2020-06-17").valid);
+        assert!(!validate_text(schema, "{root}\nd = 2020-06-10").valid);
+        assert!(!validate_text(schema, "{root}\nd = 2020-06-25").valid);
+    }
+
+    #[test]
+    fn test_percent_type_validation() {
+        let schema = "{root}\ntax = #%";
+        assert!(validate_text(schema, "{root}\ntax = #%0.15").valid);
+        let bad = validate_text(schema, "{root}\ntax = \"fifteen\"");
+        assert!(!bad.valid);
+        assert!(bad.errors.iter().any(|e| e.error_code == ValidationErrorCode::TypeMismatch));
+    }
+
+    #[test]
+    fn test_union_null_member_accepts_null() {
+        assert!(validate_text("{root}\nn = #|~", "{root}\nn = ~").valid);
+    }
+
+    #[test]
+    fn test_union_date_timestamp_accepts_timestamp() {
+        assert!(validate_text("{root}\nu = date|timestamp", "{root}\nu = 2020-06-17T10:00:00Z").valid);
+    }
+
+    #[test]
+    fn test_pattern_conditional_required_when_met() {
+        let schema = "{root}\nfield = !:/^[a-z]+$/:if method = paypal\nmethod = ";
+        let r = validate_text(schema, "{root}\nmethod = \"paypal\"");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e|
+            e.error_code == ValidationErrorCode::ConditionalRequirementNotMet && e.path == "root.field"));
+    }
+
+    #[test]
+    fn test_pattern_conditional_optional_when_unmet() {
+        let schema = "{root}\nfield = !:/^[a-z]+$/:if method = paypal\nmethod = ";
+        assert!(validate_text(schema, "{root}\nmethod = \"stripe\"").valid);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_pattern_still_enforced_on_present_value() {
+        let schema = "{root}\nfield = !:/^[a-z]+$/:if method = paypal\nmethod = ";
+        let r = validate_text(schema, "{root}\nfield = \"ABC123\"\nmethod = \"paypal\"");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e|
+            e.error_code == ValidationErrorCode::PatternMismatch && e.path == "root.field"));
+    }
+
+    #[test]
+    fn test_field_typeref_enforces_nested_required() {
+        let schema = "{@address}\nstreet = !\ncity = !\n\n{customer}\nname = !\nbilling = @address";
+        let r = validate_text(schema, "{customer}\nname = \"X\"\nbilling.street = \"Main\"");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e|
+            e.error_code == ValidationErrorCode::RequiredFieldMissing && e.path == "customer.billing.city"));
+    }
+
+    #[test]
+    fn test_field_typeref_absent_optional_ok() {
+        let schema = "{@address}\nstreet = !\ncity = !\n\n{customer}\nname = !\nbilling = @address";
+        assert!(validate_text(schema, "{customer}\nname = \"X\"").valid);
+    }
+
+    #[test]
+    fn test_field_typeref_complete_valid() {
+        let schema = "{@address}\nstreet = !\ncity = !\n\n{customer}\nname = !\nbilling = @address";
+        assert!(validate_text(schema,
+            "{customer}\nname = \"X\"\nbilling.street = \"Main\"\nbilling.city = \"NYC\"").valid);
+    }
+
+    #[test]
+    fn test_invariant_null_operand_arithmetic_v008() {
+        let schema = "{order}\ntotal = #$\nsubtotal = #$\ntax = ~#$\n:invariant total = subtotal + tax";
+        let r = validate_text(schema, "{order}\ntotal = #$10.00\nsubtotal = #$10.00\ntax = ~");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e|
+            e.error_code == ValidationErrorCode::InvariantViolation && e.path == "order"));
+    }
+
+    #[test]
+    fn test_invariant_arithmetic_all_present_valid() {
+        let schema = "{order}\ntotal = #$\nsubtotal = #$\ntax = #$\n:invariant total = subtotal + tax";
+        assert!(validate_text(schema, "{order}\ntotal = #$12.00\nsubtotal = #$10.00\ntax = #$2.00").valid);
+    }
+
+    #[test]
+    fn test_invariant_comparison_null_operand_v008() {
+        let schema = "{range}\nstart = ~#\nend = ~#\n:invariant end >= start";
+        let r = validate_text(schema, "{range}\nend = #5\nstart = ~");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e| e.error_code == ValidationErrorCode::InvariantViolation));
     }
 
     /// A relative `{.sub}` header inside a `{@type}` nests its fields into that

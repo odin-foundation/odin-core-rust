@@ -999,6 +999,7 @@ mod tests {
             confidential: false,
             deprecated: false,
             immutable: false,
+            computed: false,
             description: None,
             constraints: vec![],
             default_value: None,

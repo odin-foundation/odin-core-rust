@@ -72,12 +72,14 @@ pub struct SchemaField {
     /// the responsibility of the storage layer (e.g. andvari-engine
     /// rejects writes that would mutate or delete a prior value).
     pub immutable: bool,
+    /// Whether this field is computed (derived, not author-supplied).
+    pub computed: bool,
     /// Optional description.
     pub description: Option<String>,
     /// Validation constraints.
     pub constraints: Vec<SchemaConstraint>,
-    /// Default value if not provided.
-    pub default_value: Option<String>,
+    /// Typed default value if not provided.
+    pub default_value: Option<SchemaDefault>,
     /// Conditional requirements (`:if field op value` / `:unless field op value`).
     pub conditionals: Vec<SchemaConditional>,
 }
@@ -121,6 +123,37 @@ pub enum ConditionalValue {
     Number(f64),
     /// Boolean value.
     Bool(bool),
+}
+
+/// A typed default value captured from `= ##3`, `= #0.05`, `= #$5.00`, `= #%0.15`, etc.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaDefault {
+    /// String default.
+    String(String),
+    /// Number default.
+    Number(f64),
+    /// Integer default.
+    Integer(i64),
+    /// Currency default.
+    Currency(f64),
+    /// Percent default.
+    Percent(f64),
+    /// Boolean default.
+    Bool(bool),
+}
+
+impl SchemaDefault {
+    /// The ODIN value-type tag for this default (e.g. "integer", "currency").
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::String(_) => "string",
+            Self::Number(_) => "number",
+            Self::Integer(_) => "integer",
+            Self::Currency(_) => "currency",
+            Self::Percent(_) => "percent",
+            Self::Bool(_) => "boolean",
+        }
+    }
 }
 
 /// The type of a schema field.

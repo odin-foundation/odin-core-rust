@@ -286,6 +286,7 @@ mod tests {
                             confidential: false,
                             deprecated: false,
                             immutable: false,
+                            computed: false,
                             description: None,
                             constraints: vec![],
                             default_value: None,
@@ -298,6 +299,7 @@ mod tests {
                             confidential: false,
                             deprecated: false,
                             immutable: false,
+                            computed: false,
                             description: None,
                             constraints: vec![SchemaConstraint::Bounds {
                                 min: Some("0".to_string()),
