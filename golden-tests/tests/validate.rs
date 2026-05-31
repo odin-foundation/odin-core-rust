@@ -216,3 +216,8 @@ fn run_conformance_suite(rel: &str) {
 fn golden_validate_conformance() {
     run_conformance_suite("conformance/validate-conformance.json");
 }
+
+#[test]
+fn golden_validate_conditional_binary_decimal() {
+    run_conformance_suite("conformance/conditional-binary-decimal.json");
+}

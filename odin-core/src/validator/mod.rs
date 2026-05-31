@@ -132,6 +132,11 @@ fn validate_field(
 ) {
     let value = doc.get(path);
 
+    // Computed fields are produced downstream, not author-supplied.
+    if field.computed && value.is_none() {
+        return;
+    }
+
     // Required check (V001 / V010)
     if field.required && value.is_none() {
         if field.conditionals.is_empty() {
@@ -191,6 +196,24 @@ fn validate_field(
             schema_path: None,
         });
         return;
+    }
+
+    // Decimal places: enforce exactly N places (#.N) from the raw string.
+    if let SchemaFieldType::Decimal { decimal_places: Some(places) } = field.field_type {
+        if let OdinValue::Number { value: num, raw, .. } = value {
+            let raw_str = raw.clone().unwrap_or_else(|| num.to_string());
+            let actual = raw_str.find('.').map_or(0, |dot| raw_str.len() - dot - 1);
+            if actual != places as usize {
+                errors.push(ValidationError {
+                    path: path.to_string(),
+                    error_code: ValidationErrorCode::ValueOutOfBounds,
+                    message: format!("Decimal places mismatch: expected exactly {places}, got {actual}"),
+                    expected: Some(places.to_string()),
+                    actual: Some(actual.to_string()),
+                    schema_path: None,
+                });
+            }
+        }
     }
 
     // Constraint validation
@@ -2751,5 +2774,53 @@ mod tests {
             !schema.fields.contains_key("term.effective"),
             "term.* must not leak to the schema root"
         );
+    }
+
+    // ── Conformance: conditional, computed, binary size, decimal places ──────
+
+    fn has_code_at(result: &ValidationResult, code: &str, path: &str) -> bool {
+        result.errors.iter().any(|e| e.code() == code && e.path == path)
+    }
+
+    #[test]
+    fn unless_required_when_condition_false() {
+        let schema = "{$}\nodin = \"1.0.0\"\nschema = \"1.0.0\"\n\n{Person}\nstatus =\nphone = ! :unless status = \"inactive\"";
+        let ok = validate_text(schema, "{Person}\nstatus = \"inactive\"");
+        assert!(ok.valid);
+        let bad = validate_text(schema, "{Person}\nstatus = \"active\"");
+        assert!(!bad.valid);
+        assert!(has_code_at(&bad, "V010", "Person.phone"));
+    }
+
+    #[test]
+    fn computed_absent_not_required() {
+        let schema = "{$}\nodin = \"1.0.0\"\nschema = \"1.0.0\"\n\n{Order}\ntotal = !# :computed";
+        let r = validate_text(schema, "{Order}\nname = \"x\"");
+        assert!(r.valid, "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn binary_size_byte_length() {
+        let schema = "{$}\nodin = \"1.0.0\"\nschema = \"1.0.0\"\n\n{R}\nhash = ^:(4)";
+        assert!(validate_text(schema, "{R}\nhash = ^AAAAAA==").valid);
+        let small = validate_text(schema, "{R}\nhash = ^AAAA");
+        assert!(has_code_at(&small, "V003", "R.hash"));
+        let large = validate_text(schema, "{R}\nhash = ^AAAAAAA=");
+        assert!(has_code_at(&large, "V003", "R.hash"));
+    }
+
+    #[test]
+    fn binary_sha256_size_wrong() {
+        let schema = "{$}\nodin = \"1.0.0\"\nschema = \"1.0.0\"\n\n{R}\nhash = ^sha256:(32)";
+        let r = validate_text(schema, "{R}\nhash = ^sha256:AAAAAAAAAAAAAAAAAAAAAA==");
+        assert!(has_code_at(&r, "V003", "R.hash"));
+    }
+
+    #[test]
+    fn decimal_places_exact() {
+        let schema = "{$}\nodin = \"1.0.0\"\nschema = \"1.0.0\"\n\n{R}\nrate = #.4";
+        assert!(validate_text(schema, "{R}\nrate = #1.2345").valid);
+        assert!(has_code_at(&validate_text(schema, "{R}\nrate = #1.23"), "V003", "R.rate"));
+        assert!(has_code_at(&validate_text(schema, "{R}\nrate = #1.23456"), "V003", "R.rate"));
     }
 }

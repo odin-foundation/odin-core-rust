@@ -159,3 +159,8 @@ fn golden_canonical_normalization() {
 fn golden_canonical_tabular_expansion() {
     run_canonical_suite("tabular-expansion.json");
 }
+
+#[test]
+fn golden_canonical_precision_and_modifiers() {
+    run_canonical_suite("precision-and-modifiers.json");
+}

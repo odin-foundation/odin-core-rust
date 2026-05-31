@@ -1334,6 +1334,7 @@ mod tests {
             loop_vars: LV.get_or_init(HashMap::new),
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
         }
     }
 
@@ -1821,6 +1822,7 @@ mod extended_tests {
             loop_vars: LV.get_or_init(HashMap::new),
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
         }
     }
 
@@ -3432,6 +3434,7 @@ mod extended_tests_2 {
             loop_vars: LV.get_or_init(HashMap::new),
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
         }
     }
 

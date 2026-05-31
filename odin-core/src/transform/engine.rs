@@ -53,6 +53,30 @@ struct ExecContext<'a> {
     source_format: String,
     /// Policy for `:validate` / `:enum` / `:range` failures (`fail`/`warn`/`skip`).
     validation_policy: ValidationPolicy,
+    /// Policy for lookup/source misses (`fail`/`warn`/`skip`/`default`).
+    missing_policy: MissingPolicy,
+}
+
+/// Policy applied when a `%lookup` reports a miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingPolicy {
+    /// Record a T004 error.
+    Fail,
+    /// Record a T004 warning.
+    Warn,
+    /// Stay silent (default null).
+    Silent,
+}
+
+impl MissingPolicy {
+    /// Read the policy from a target's `onMissing` option (default silent).
+    fn from_options(options: &HashMap<String, String>) -> Self {
+        match options.get("onMissing").map(String::as_str) {
+            Some("fail") => Self::Fail,
+            Some("warn") => Self::Warn,
+            _ => Self::Silent,
+        }
+    }
 }
 
 /// Policy applied when a `:validate` / `:enum` / `:range` constraint fails.
@@ -143,6 +167,7 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
         field_modifiers: HashMap::new(),
         source_format,
         validation_policy: ValidationPolicy::from_options(&transform.target.options),
+        missing_policy: MissingPolicy::from_options(&transform.target.options),
     };
 
     // 2. Build output object
@@ -361,6 +386,7 @@ fn execute_multi_record(
         field_modifiers: HashMap::new(),
         source_format: source_format.to_string(),
         validation_policy: ValidationPolicy::from_options(&transform.target.options),
+        missing_policy: MissingPolicy::from_options(&transform.target.options),
     };
 
     let mut output = DynValue::Object(Vec::new());
@@ -805,6 +831,10 @@ fn process_mapping(
         }
     }
 
+    // A :default modifier rescues a missing lookup; suppress errors it raises.
+    let has_default = mapping.directives.iter().any(|d| d.name == "default");
+    let errors_before = if has_default { ctx.errors.len() } else { 0 };
+
     // :object builds a structural object from an inline `{k = @path, ...}` spec.
     let value = if let Some(dir) = mapping.directives.iter().find(|d| d.name == "object") {
         if let Some(crate::types::values::DirectiveValue::String(spec)) = &dir.value {
@@ -817,6 +847,11 @@ fn process_mapping(
         // Reborrow output as shared — evaluate_expression only reads from it.
         evaluate_expression(&mapping.expression, ctx, current_source, &*output)
     };
+
+    // Drop errors raised during evaluation when a :default is present.
+    if has_default && ctx.errors.len() > errors_before {
+        ctx.errors.truncate(errors_before);
+    }
 
     match value {
         Ok(val) => {
@@ -1343,9 +1378,15 @@ fn execute_verb_call(
         loop_vars: &ctx.loop_vars,
         accumulators: &ctx.accumulators,
         tables: &ctx.tables,
+        lookup_miss: std::cell::Cell::new(None),
     };
 
     let result = verb_fn(&evaluated_args, &verb_ctx)?;
+
+    // Report a lookup miss through the onMissing policy.
+    if let Some(miss) = verb_ctx.lookup_miss.take() {
+        report_lookup_miss(ctx, &miss.table, &miss.key);
+    }
 
     // Special handling: accumulate and set update the accumulator state
     if call.verb == "accumulate" || call.verb == "set" {
@@ -1355,6 +1396,20 @@ fn execute_verb_call(
     }
 
     Ok(result)
+}
+
+/// Record a `%lookup` miss honoring the `onMissing` policy (default silent).
+fn report_lookup_miss(ctx: &mut ExecContext, table: &str, key: &str) {
+    let message = format!("Lookup key '{key}' not found in table '{table}'");
+    match ctx.missing_policy {
+        MissingPolicy::Fail => ctx.errors.push(TransformError {
+            message,
+            path: None,
+            code: Some(crate::types::transform::transform_error_codes::T004_LOOKUP_KEY_NOT_FOUND.to_string()),
+        }),
+        MissingPolicy::Warn => ctx.warnings.push(TransformWarning { message, path: None }),
+        MissingPolicy::Silent => {}
+    }
 }
 
 fn evaluate_verb_arg(
@@ -13120,6 +13175,72 @@ mod extended_tests_2 {
         let r = parse_and_exec(&text, &source);
         assert!(!r.success);
         assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T013")));
+    }
+
+    // ── %lookup miss honoring onMissing ──────────────────────────────────────
+
+    fn lookup_header(on_missing: Option<&str>) -> String {
+        let policy = on_missing.map_or(String::new(), |p| format!("target.onMissing = \"{p}\"\n"));
+        format!(
+            "{{$}}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"json->json\"\ntarget.format = \"json\"\n{policy}\n{{$table.STATUS[code, name]}}\n\"A\", \"Active\"\n\"P\", \"Pending\"\n\n"
+        )
+    }
+
+    #[test]
+    fn lookup_hit_no_miss() {
+        let text = format!("{}{}", lookup_header(None), "{result}\nname = %lookup \"STATUS.name\" @.code\n");
+        let r = parse_and_exec(&text, &json_obj(vec![("code", s("A"))]));
+        assert!(r.success, "errors: {:?}", r.errors);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn lookup_miss_silent_by_default() {
+        let text = format!("{}{}", lookup_header(None), "{result}\nname = %lookup \"STATUS.name\" @.code\n");
+        let r = parse_and_exec(&text, &json_obj(vec![("code", s("Z"))]));
+        assert!(r.success, "errors: {:?}", r.errors);
+        assert!(r.errors.is_empty());
+        assert!(r.warnings.is_empty());
+    }
+
+    #[test]
+    fn lookup_miss_fail_raises_t004() {
+        let text = format!("{}{}", lookup_header(Some("fail")), "{result}\nname = %lookup \"STATUS.name\" @.code\n");
+        let r = parse_and_exec(&text, &json_obj(vec![("code", s("Z"))]));
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T004")));
+    }
+
+    #[test]
+    fn lookup_miss_warn_collects_warning() {
+        let text = format!("{}{}", lookup_header(Some("warn")), "{result}\nname = %lookup \"STATUS.name\" @.code\n");
+        let r = parse_and_exec(&text, &json_obj(vec![("code", s("Z"))]));
+        assert!(r.success, "errors: {:?}", r.errors);
+        assert!(!r.warnings.is_empty());
+    }
+
+    #[test]
+    fn lookup_missing_table_fail_raises_t004() {
+        let text = format!("{}{}", lookup_header(Some("fail")), "{result}\nname = %lookup \"NOPE.name\" @.code\n");
+        let r = parse_and_exec(&text, &json_obj(vec![("code", s("A"))]));
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T004")));
+    }
+
+    #[test]
+    fn lookup_default_verb_suppresses_miss() {
+        let text = format!("{}{}", lookup_header(Some("fail")), "{result}\nname = %lookupDefault \"STATUS.name\" @.code \"Unknown\"\n");
+        let r = parse_and_exec(&text, &json_obj(vec![("code", s("Z"))]));
+        assert!(r.success, "errors: {:?}", r.errors);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn lookup_default_modifier_suppresses_miss() {
+        let text = format!("{}{}", lookup_header(Some("fail")), "{result}\nname = \"%lookup STATUS.name @.code :default Unknown\"\n");
+        let r = parse_and_exec(&text, &json_obj(vec![("code", s("Z"))]));
+        assert!(r.success, "errors: {:?}", r.errors);
+        assert!(r.errors.is_empty());
     }
 }
 

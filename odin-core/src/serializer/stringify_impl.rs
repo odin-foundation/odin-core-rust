@@ -112,15 +112,15 @@ fn split_path<'a>(path: &'a str) -> (Option<&'a str>, &'a str) {
 }
 
 fn write_modifiers(output: &mut String, mods: &OdinModifiers) {
-    // Canonical order: ! (required), * (confidential), - (deprecated)
+    // Canonical order: ! (required), - (deprecated), * (confidential)
     if mods.required {
         output.push('!');
     }
-    if mods.confidential {
-        output.push('*');
-    }
     if mods.deprecated {
         output.push('-');
+    }
+    if mods.confidential {
+        output.push('*');
     }
 }
 
@@ -147,7 +147,12 @@ fn write_value(output: &mut String, value: &OdinValue, canonical: bool) {
         OdinValue::Number { value, raw, decimal_places, .. } => {
             output.push('#');
             if canonical {
-                write_canonical_number(output, *value);
+                if let Some(r) = raw {
+                    // Prefer raw to preserve precision beyond f64 range.
+                    write_canonical_number_str(output, r);
+                } else {
+                    write_canonical_number(output, *value);
+                }
             } else if let Some(r) = raw {
                 output.push_str(r);
             } else if let Some(dp) = decimal_places {
@@ -159,8 +164,14 @@ fn write_value(output: &mut String, value: &OdinValue, canonical: bool) {
         OdinValue::Currency { value, raw, decimal_places, currency_code, .. } => {
             output.push_str("#$");
             if canonical {
-                let dp = (*decimal_places as usize).max(2);
-                let _ = write!(output, "{value:.prec$}", prec = dp);
+                if let Some(r) = raw {
+                    // Prefer raw to preserve precision and integer parts beyond f64 range.
+                    let num_part = r.find(':').map_or(r.as_str(), |p| &r[..p]);
+                    write_canonical_currency_str(output, num_part);
+                } else {
+                    let dp = (*decimal_places as usize).max(2);
+                    let _ = write!(output, "{value:.prec$}", prec = dp);
+                }
                 if let Some(code) = currency_code {
                     output.push(':');
                     push_ascii_uppercase(output, code);
@@ -337,6 +348,37 @@ fn base64_encode_into(data: &[u8], output: &mut String) {
             output.push('=');
         }
         _ => {}
+    }
+}
+
+/// Write a number's preserved raw string in canonical form: strip trailing
+/// zeros (and a trailing dot) from a plain decimal, leave exponential forms as-is.
+fn write_canonical_number_str(output: &mut String, raw: &str) {
+    if raw.contains('.') && !raw.contains('e') && !raw.contains('E') {
+        let trimmed = raw.trim_end_matches('0').trim_end_matches('.');
+        output.push_str(trimmed);
+    } else {
+        output.push_str(raw);
+    }
+}
+
+/// Write a currency's preserved raw numeric string in canonical form:
+/// at least 2 fractional places, exact integer part preserved.
+fn write_canonical_currency_str(output: &mut String, num: &str) {
+    let (sign, unsigned) = match num.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", num),
+    };
+    let (int_part, frac_part) = match unsigned.find('.') {
+        Some(dot) => (&unsigned[..dot], &unsigned[dot + 1..]),
+        None => (unsigned, ""),
+    };
+    output.push_str(sign);
+    output.push_str(int_part);
+    output.push('.');
+    output.push_str(frac_part);
+    for _ in frac_part.len()..2 {
+        output.push('0');
     }
 }
 
@@ -935,8 +977,8 @@ mod tests {
             .build()
             .unwrap();
         let out = stringify(&doc, None);
-        // Canonical order: ! * -
-        assert!(out.contains("field = !*-\"value\""));
+        // Canonical order: ! - *
+        assert!(out.contains("field = !-*\"value\""));
     }
 
     #[test]
@@ -1259,7 +1301,7 @@ mod tests {
             cdata: false,
         };
         write_modifiers(&mut out, &mods);
-        assert_eq!(out, "!*-");
+        assert_eq!(out, "!-*");
     }
 
     #[test]

@@ -1514,6 +1514,7 @@ mod tests {
             loop_vars: LV.get_or_init(HashMap::new),
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
         }
     }
 
@@ -1528,7 +1529,7 @@ mod tests {
     impl OwnedCtx {
         fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
         fn ctx(&self) -> VerbContext<'_> {
-            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl }
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None) }
         }
     }
 
@@ -2617,6 +2618,7 @@ mod extended_tests {
             loop_vars: LV.get_or_init(HashMap::new),
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
         }
     }
 
@@ -2629,7 +2631,7 @@ mod extended_tests {
     impl OwnedCtx {
         fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
         fn ctx(&self) -> VerbContext<'_> {
-            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl }
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None) }
         }
     }
 
@@ -4459,6 +4461,7 @@ mod extended_tests_2 {
             loop_vars: LV.get_or_init(HashMap::new),
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
         }
     }
 
@@ -4471,7 +4474,7 @@ mod extended_tests_2 {
     impl OwnedCtx {
         fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
         fn ctx(&self) -> VerbContext<'_> {
-            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl }
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None) }
         }
     }
     fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }

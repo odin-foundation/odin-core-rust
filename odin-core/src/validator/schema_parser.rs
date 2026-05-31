@@ -487,17 +487,35 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
         field_type = SchemaFieldType::Integer;
         rest = after;
     } else if rest.starts_with("#$") {
-        let after = rest[2..].trim_start();
-        let (def, after) = take_numeric_default(after, "currency");
-        parsed_default = def;
-        field_type = SchemaFieldType::Currency { decimal_places: None };
-        rest = after;
+        let after = &rest[2..];
+        if let Some((places, after_places)) = take_decimal_places(after) {
+            field_type = SchemaFieldType::Currency { decimal_places: Some(places) };
+            rest = after_places.trim_start();
+        } else {
+            let (def, after) = take_numeric_default(after.trim_start(), "currency");
+            parsed_default = def;
+            field_type = SchemaFieldType::Currency { decimal_places: None };
+            rest = after;
+        }
     } else if rest.starts_with('#') && !rest.starts_with("#(") {
-        let after = rest[1..].trim_start();
-        let (def, after) = take_numeric_default(after, "number");
-        parsed_default = def;
-        field_type = SchemaFieldType::Number { decimal_places: None };
-        rest = after;
+        let after = &rest[1..];
+        if let Some((places, after_places)) = take_decimal_places(after) {
+            field_type = SchemaFieldType::Decimal { decimal_places: Some(places) };
+            rest = after_places.trim_start();
+        } else {
+            let (def, after) = take_numeric_default(after.trim_start(), "number");
+            parsed_default = def;
+            field_type = SchemaFieldType::Number { decimal_places: None };
+            rest = after;
+        }
+    } else if rest.starts_with('^') {
+        let after = &rest[1..];
+        // Optional algorithm tag (e.g. `^sha256`); size constraint handled in the directive loop.
+        let alg_end = after
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(after.len());
+        rest = &after[alg_end..];
+        field_type = SchemaFieldType::Binary;
     } else if rest.starts_with('?') {
         field_type = SchemaFieldType::Boolean;
         rest = rest[1..].trim_start();
@@ -637,6 +655,21 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
             if after.starts_with('(') {
                 if let Some(paren_end) = after.find(')') {
                     let inner = &after[1..paren_end];
+                    if matches!(field_type, SchemaFieldType::Binary) && !inner.contains(',') {
+                        // Binary size constraint: byte-length bounds or exact length.
+                        let (min, max) = if inner.contains("..") {
+                            parse_bounds_pair(inner)
+                        } else {
+                            let v = inner.trim().to_string();
+                            (Some(v.clone()), Some(v))
+                        };
+                        constraints.push(SchemaConstraint::Size {
+                            min: min.and_then(|s| s.parse::<u64>().ok()),
+                            max: max.and_then(|s| s.parse::<u64>().ok()),
+                        });
+                        remaining = after[paren_end + 1..].trim_start();
+                        continue;
+                    }
                     if inner.contains("..") {
                         let (min, max) = parse_bounds_pair(inner);
                         constraints.push(SchemaConstraint::Bounds {
@@ -829,6 +862,18 @@ fn take_union_member(s: &str) -> Option<(SchemaFieldType, &str)> {
 
 /// Capture a leading numeric default literal (the text after a type prefix),
 /// returning the typed default and the unconsumed remainder.
+/// Detect a glued decimal-places suffix (`.N`) on a numeric prefix (`#.4`, `#$.4`).
+/// Returns the place count and the remaining text when present.
+fn take_decimal_places(after: &str) -> Option<(u8, &str)> {
+    let digits = after.strip_prefix('.')?;
+    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    let places = digits[..end].parse::<u8>().ok()?;
+    Some((places, &digits[end..]))
+}
+
 fn take_numeric_default<'a>(after: &'a str, kind: &str) -> (Option<SchemaDefault>, &'a str) {
     // Stop at the first non-number boundary (whitespace, `:`, `|`).
     let end = after

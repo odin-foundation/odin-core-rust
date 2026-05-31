@@ -160,7 +160,7 @@ mod tests {
             .build()
             .unwrap();
         let out = String::from_utf8(canonicalize(&doc)).unwrap();
-        assert!(out.contains("!*-\"val\""));
+        assert!(out.contains("!-*\"val\""));
     }
 
     // ── Sections ────────────────────────────────────────────────────────────

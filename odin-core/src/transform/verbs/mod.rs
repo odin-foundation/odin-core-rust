@@ -35,6 +35,16 @@ pub struct VerbContext<'a> {
     pub loop_vars: &'a HashMap<String, DynValue>,
     pub accumulators: &'a HashMap<String, DynValue>,
     pub tables: &'a HashMap<String, crate::types::transform::LookupTable>,
+    /// Set by `%lookup` on a table/column/key miss so the engine can report
+    /// it through the `onMissing` policy.
+    pub lookup_miss: std::cell::Cell<Option<LookupMiss>>,
+}
+
+/// A `%lookup` miss: the referenced table and the joined match key.
+#[derive(Clone)]
+pub struct LookupMiss {
+    pub table: String,
+    pub key: String,
 }
 
 /// Global singleton for built-in verbs (initialized once, shared across all executions).
@@ -905,6 +915,13 @@ fn verb_lookup(args: &[DynValue], ctx: &VerbContext) -> Result<DynValue, String>
                 return Ok(default.clone());
             }
         }
+        // Report the miss for the onMissing policy.
+        let key = keys
+            .iter()
+            .map(coerce_str_pub)
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.lookup_miss.set(Some(LookupMiss { table: table_name.to_string(), key }));
         Ok(DynValue::Null)
     }
 }
@@ -1791,6 +1808,7 @@ mod extended_tests {
             loop_vars: LV.get_or_init(HashMap::new),
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
         }
     }
 
@@ -2441,6 +2459,7 @@ mod extended_tests_2 {
             loop_vars: LV.get_or_init(HashMap::new),
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
         }
     }
 
