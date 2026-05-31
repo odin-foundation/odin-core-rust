@@ -377,4 +377,97 @@ fn tabular_columns_capped() {
     assert!(r.is_err(), "expected error for excessive tabular columns");
 }
 
+// ─── Top-level $.path metadata assignment (canonical form) ──────────────────
+
+#[test]
+fn top_level_meta_assignment_routes_to_metadata() {
+    let d = Odin::parse("$.odin = \"1.0.0\"\nname = \"Bob\"\n").unwrap();
+    assert_eq!(d.get_string("$.odin"), Some("1.0.0"));
+    assert_eq!(d.metadata.get(&"odin".to_string()).and_then(|v| v.as_str()), Some("1.0.0"));
+    assert_eq!(d.get_string("name"), Some("Bob"));
+}
+
+#[test]
+fn parse_canonicalize_metadata_roundtrip_is_idempotent() {
+    let input = "{$}\nodin = \"1.0.0\"\nid = \"doc1\"\n\nname = \"Bob\"\n";
+    let doc = Odin::parse(input).unwrap();
+    let c1 = Odin::canonicalize(&doc);
+    let text = String::from_utf8(c1.clone()).unwrap();
+    assert!(text.contains("$.odin = \"1.0.0\""), "canonical flattens metadata: {text}");
+    let doc2 = Odin::parse(&text).unwrap();
+    let c2 = Odin::canonicalize(&doc2);
+    assert_eq!(c1, c2, "parse(canonicalize(doc)) must be idempotent");
+}
+
+// ─── Integer fractional rejection (## non-integral) ─────────────────────────
+
+#[test]
+fn integer_with_fraction_is_rejected() {
+    let r = Odin::parse("x = ##4.2\n");
+    assert!(r.is_err(), "expected error for fractional integer, got {r:?}");
+    assert_eq!(r.unwrap_err().code(), "P006");
+}
+
+#[test]
+fn negative_integer_with_fraction_is_rejected() {
+    let r = Odin::parse("x = ##-3.7\n");
+    assert!(r.is_err(), "expected error for negative fractional integer, got {r:?}");
+    assert_eq!(r.unwrap_err().code(), "P006");
+}
+
+#[test]
+fn integer_scientific_notation_is_accepted() {
+    let d = Odin::parse("x = ##1e3\n").unwrap();
+    assert_eq!(d.get_integer("x"), Some(1000));
+}
+
+// ─── @$.path meta reference ─────────────────────────────────────────────────
+
+#[test]
+fn meta_reference_with_dot_parses() {
+    let d = Odin::parse("x = @$.id\n").unwrap();
+    match d.get("x") {
+        Some(crate::OdinValue::Reference { path, .. }) => assert_eq!(path, "$.id"),
+        other => panic!("expected reference @$.id, got {other:?}"),
+    }
+}
+
+#[test]
+fn meta_reference_nested_path_parses() {
+    let d = Odin::parse("x = @$.i18n.en.name\n").unwrap();
+    match d.get("x") {
+        Some(crate::OdinValue::Reference { path, .. }) => assert_eq!(path, "$.i18n.en.name"),
+        other => panic!("expected reference @$.i18n.en.name, got {other:?}"),
+    }
+}
+
+#[test]
+fn const_reference_still_parses() {
+    let d = Odin::parse("x = @$const.NAME\n").unwrap();
+    match d.get("x") {
+        Some(crate::OdinValue::Reference { path, .. }) => assert_eq!(path, "$const.NAME"),
+        other => panic!("expected reference @$const.NAME, got {other:?}"),
+    }
+}
+
+// ─── Document chain API ─────────────────────────────────────────────────────
+
+#[test]
+fn parse_documents_returns_full_chain() {
+    let input = "{$}\nid = \"a\"\n\n{}\nx = \"1\"\n\n---\n\n{$}\nid = \"b\"\n\n{}\nx = \"2\"\n";
+    let docs = Odin::parse_documents(input).unwrap();
+    assert_eq!(docs.len(), 2);
+    assert_eq!(docs[0].get_string("$.id"), Some("a"));
+    assert_eq!(docs[0].get_string("x"), Some("1"));
+    assert_eq!(docs[1].get_string("$.id"), Some("b"));
+    assert_eq!(docs[1].get_string("x"), Some("2"));
+}
+
+#[test]
+fn parse_documents_single_document_yields_one() {
+    let docs = Odin::parse_documents("name = \"solo\"\n").unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].get_string("name"), Some("solo"));
+}
+
 

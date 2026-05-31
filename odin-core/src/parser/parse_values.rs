@@ -171,24 +171,40 @@ pub(super) fn parse_integer(raw: &str, line: usize, col: usize) -> Result<OdinVa
         ));
     }
 
-    match raw.parse::<i64>() {
-        Ok(value) => {
-            Ok(OdinValue::Integer {
-                value,
-                raw: Some(raw.to_string()),
-                modifiers: None,
-                directives: Vec::new(),
-            })
-        }
-        Err(_) => {
-            Ok(OdinValue::Integer {
-                value: 0,
-                raw: Some(raw.to_string()),
-                modifiers: None,
-                directives: Vec::new(),
-            })
-        }
+    // Fast path: plain decimal integer.
+    if let Ok(value) = raw.parse::<i64>() {
+        return Ok(OdinValue::Integer {
+            value,
+            raw: Some(raw.to_string()),
+            modifiers: None,
+            directives: Vec::new(),
+        });
     }
+
+    // Otherwise interpret as a float (handles exponents like `1e3`) and
+    // require an integral result — `##4.2` is rejected, `##1e3` accepted.
+    let value: f64 = raw.parse().map_err(|_| {
+        ParseError::with_message(ParseErrorCode::InvalidTypePrefix, line, col, &format!("invalid integer: {raw}"))
+    })?;
+    if !value.is_finite() || value.fract() != 0.0 {
+        return Err(ParseError::with_message(
+            ParseErrorCode::InvalidTypePrefix, line, col,
+            &format!("Integer (##) value cannot have a fractional part: {raw}"),
+        ));
+    }
+
+    // Integral float: narrow to i64 when in range, else preserve raw with value 0.
+    let int_value = if value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        value as i64
+    } else {
+        0
+    };
+    Ok(OdinValue::Integer {
+        value: int_value,
+        raw: Some(raw.to_string()),
+        modifiers: None,
+        directives: Vec::new(),
+    })
 }
 
 pub(super) fn parse_currency(raw: &str, line: usize, col: usize) -> Result<OdinValue, ParseError> {
