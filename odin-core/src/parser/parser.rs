@@ -1410,7 +1410,7 @@ impl<'a> Parser<'a> {
                 let esc = self.bytes[self.pos];
                 self.pos += 1;
                 match esc {
-                    b'n' | b'r' | b't' | b'\\' | b'"' | b'/' | b'0' => {}
+                    b'n' | b'r' | b't' | b'\\' | b'"' | b'/' | b'0' | b'$' => {}
                     b'u' => {
                         if let Err(e) = self.consume_unicode_hex(4, start_line, start_col) {
                             return ValueStep::Err(e);
@@ -1508,6 +1508,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_typed_numeric(&mut self, line: usize, col: usize, kind: NumKind) -> ValueStep {
+        // A numeric type prefix on a reference (`##@.year`, `#$@.premium`) carries a
+        // synthetic `:type` directive so the value is coerced when resolved.
+        if self.bytes.get(self.pos).copied() == Some(b'@') {
+            return self.parse_prefixed_reference(line, col, kind);
+        }
         let val_start = self.pos;
         // Optional leading `-`, then digits / `.` / exponent. Letters are
         // refused so `##abc` falls through to parse_integer's empty-value error.
@@ -1584,6 +1589,25 @@ impl<'a> Parser<'a> {
             raw.to_string()
         };
         ValueStep::Ok(OdinValues::reference(&normalized))
+    }
+
+    /// Parse a reference following a numeric type prefix, attaching a `:type` directive.
+    fn parse_prefixed_reference(&mut self, line: usize, col: usize, kind: NumKind) -> ValueStep {
+        use crate::types::values::{OdinDirective, DirectiveValue};
+        let step = self.parse_reference(line, col);
+        let type_name = match kind {
+            NumKind::Integer => "integer",
+            NumKind::Number => "number",
+            NumKind::Currency => "currency",
+            NumKind::Percent => "percent",
+        };
+        if let ValueStep::Ok(value) = step {
+            return ValueStep::Ok(value.with_directives(vec![OdinDirective {
+                name: "type".to_string(),
+                value: Some(DirectiveValue::String(type_name.to_string())),
+            }]));
+        }
+        step
     }
 
     fn parse_date_like(&mut self, line: usize, col: usize) -> ValueStep {

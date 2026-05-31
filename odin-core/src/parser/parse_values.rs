@@ -20,6 +20,16 @@ pub(super) fn unescape_string(raw: &str) -> String {
                 b'"' => { out.push('"'); i += 2; }
                 b'/' => { out.push('/'); i += 2; }
                 b'0' => { out.push('\0'); i += 2; }
+                b'$' => {
+                    // Literal dollar; preserve the backslash before `${` so the
+                    // interpolation layer recognizes the escaped marker.
+                    if bytes.get(i + 2) == Some(&b'{') {
+                        out.push_str("\\$");
+                    } else {
+                        out.push('$');
+                    }
+                    i += 2;
+                }
                 b'u' if i + 5 < bytes.len() => {
                     let hex = &raw[i + 2..i + 6];
                     if let Ok(code) = u32::from_str_radix(hex, 16) {

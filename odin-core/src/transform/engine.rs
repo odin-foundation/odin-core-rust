@@ -1144,6 +1144,12 @@ fn evaluate_expression(
         }
 
         FieldExpression::Literal(odin_val) => {
+            if let OdinValue::String { value: s, .. } = odin_val {
+                if s.contains("${") {
+                    let interpolated = interpolate_string(s, ctx, current_source, current_output)?;
+                    return Ok(DynValue::String(interpolated));
+                }
+            }
             Ok(odin_value_to_dyn(odin_val))
         }
 
@@ -1159,6 +1165,99 @@ fn evaluate_expression(
             }
             Ok(obj)
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// String interpolation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Upper bound on interpolations per template, guarding against resource exhaustion.
+const MAX_INTERPOLATIONS: usize = 1000;
+
+/// Interpolate `${...}` expressions within a string template.
+///
+/// Supports `${@path}` path lookups and `${%verb args}` verb expressions.
+/// `\${...}` is escaped and emitted as a literal `${...}`.
+fn interpolate_string(
+    template: &str,
+    ctx: &mut ExecContext,
+    current_source: &DynValue,
+    current_output: &DynValue,
+) -> Result<String, String> {
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    let mut count = 0;
+    while i < bytes.len() {
+        // Detect `${` or `\${`.
+        let escaped = bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'$') && bytes.get(i + 2) == Some(&b'{');
+        let marker = bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{');
+        if !escaped && !marker {
+            let ch_len = utf8_len(bytes[i]);
+            out.push_str(&template[i..(i + ch_len).min(template.len())]);
+            i += ch_len;
+            continue;
+        }
+        let open = if escaped { i + 2 } else { i + 1 }; // index of `{`
+        let Some(rel) = template[open + 1..].find('}') else {
+            // Unbalanced: emit the rest verbatim.
+            out.push_str(&template[i..]);
+            break;
+        };
+        let close = open + 1 + rel;
+        let expr = &template[open + 1..close];
+        if escaped {
+            out.push_str("${");
+            out.push_str(expr);
+            out.push('}');
+            i = close + 1;
+            continue;
+        }
+        count += 1;
+        if count > MAX_INTERPOLATIONS {
+            out.push_str(&template[i..]);
+            break;
+        }
+        let trimmed = expr.trim();
+        if trimmed.starts_with('@') || trimmed.starts_with('%') {
+            let field_expr = super::parser::parse_value_expression(trimmed);
+            let value = evaluate_expression(&field_expr, ctx, current_source, current_output)?;
+            out.push_str(&dyn_to_interp_string(&value));
+        } else {
+            // Unknown expression — emit verbatim.
+            out.push_str(&template[i..=close]);
+        }
+        i = close + 1;
+    }
+    Ok(out)
+}
+
+#[inline]
+fn utf8_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
+/// Render a `DynValue` as a string for interpolation substitution.
+fn dyn_to_interp_string(value: &DynValue) -> String {
+    match value {
+        DynValue::Null => String::new(),
+        DynValue::String(s) | DynValue::FloatRaw(s)
+        | DynValue::Date(s) | DynValue::Timestamp(s) | DynValue::Time(s)
+        | DynValue::Duration(s) => s.clone(),
+        DynValue::CurrencyRaw(s, _, _) => s.clone(),
+        DynValue::Integer(n) => n.to_string(),
+        DynValue::Float(n) | DynValue::Currency(n, _, _) | DynValue::Percent(n) => n.to_string(),
+        DynValue::Bool(b) => b.to_string(),
+        DynValue::Reference(p) => format!("@{p}"),
+        DynValue::Binary(b64) => format!("^{b64}"),
+        DynValue::Array(_) | DynValue::Object(_) => String::new(),
     }
 }
 
@@ -3210,6 +3309,47 @@ mod tests {
         assert!(result.success);
         let out = result.output.unwrap();
         assert_eq!(out.get("Greeting"), Some(&DynValue::String("Hello, World!".to_string())));
+    }
+
+    #[test]
+    fn test_literal_interpolation_path() {
+        let transform = minimal_transform(vec![FieldMapping {
+            target: "Name".to_string(),
+            expression: FieldExpression::Literal(OdinValues::string("${@.name}")),
+            directives: vec![],
+            modifiers: None,
+        }]);
+        let source = DynValue::Object(vec![("name".to_string(), DynValue::String("Alice".to_string()))]);
+        let out = execute(&transform, &source).output.unwrap();
+        assert_eq!(out.get("Name"), Some(&DynValue::String("Alice".to_string())));
+    }
+
+    #[test]
+    fn test_literal_interpolation_escaped_dollar_literal() {
+        // `\$` decoded by the parser produces a literal `$`; `${...}` still interpolates.
+        let transform = minimal_transform(vec![FieldMapping {
+            target: "Price".to_string(),
+            expression: FieldExpression::Literal(OdinValues::string("Total: $${@.amount}")),
+            directives: vec![],
+            modifiers: None,
+        }]);
+        let source = DynValue::Object(vec![("amount".to_string(), DynValue::String("42.00".to_string()))]);
+        let out = execute(&transform, &source).output.unwrap();
+        assert_eq!(out.get("Price"), Some(&DynValue::String("Total: $42.00".to_string())));
+    }
+
+    #[test]
+    fn test_literal_interpolation_escaped_marker_suppressed() {
+        // A preserved `\${...}` emits a literal `${...}` without interpolation.
+        let transform = minimal_transform(vec![FieldMapping {
+            target: "Template".to_string(),
+            expression: FieldExpression::Literal(OdinValues::string("Use \\${@.field} here")),
+            directives: vec![],
+            modifiers: None,
+        }]);
+        let source = DynValue::Object(vec![("field".to_string(), DynValue::String("X".to_string()))]);
+        let out = execute(&transform, &source).output.unwrap();
+        assert_eq!(out.get("Template"), Some(&DynValue::String("Use ${@.field} here".to_string())));
     }
 
     #[test]
