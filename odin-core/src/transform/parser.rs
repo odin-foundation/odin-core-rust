@@ -511,6 +511,10 @@ fn build_segment(
     let mut discriminator: Option<Discriminator> = None;
     let mut pass: Option<usize> = None;
     let mut condition: Option<String> = None;
+    // Conditional-chain role: "if", "elif", or "else" (None for plain segments).
+    let mut branch: Option<&'static str> = None;
+    // Parsed verb-expression condition (when the condition is a `%verb ...` form).
+    let mut condition_expr: Option<FieldExpression> = None;
     let mut children: Vec<TransformSegment> = Vec::new();
 
     let mut child_fields: FxHashMap<String, Vec<(String, OdinValue, Option<OdinModifiers>)>> =
@@ -553,8 +557,12 @@ fn build_segment(
                         pass = Some(n);
                     }
                 }
-                "_if" | "_when" => {
-                    condition = Some(odin_value_to_string(&value));
+                "_if" | "_when" | "_elif" => {
+                    branch = Some(if field == "_elif" { "elif" } else { "if" });
+                    parse_segment_condition(&value, &mut condition, &mut condition_expr);
+                }
+                "_else" => {
+                    branch = Some("else");
                 }
                 "_discriminator" => {
                     if let OdinValue::Reference { path, .. } = &value {
@@ -641,28 +649,20 @@ fn build_segment(
     // Build segment directives from parsed underscore-prefixed fields
     let mut directives = Vec::new();
     if let Some(ref sp) = source_path {
-        directives.push(SegmentDirective {
-            directive_type: "loop".to_string(),
-            value: Some(sp.clone()),
-        });
+        directives.push(SegmentDirective::new("loop", Some(sp.clone())));
     }
     if let Some(p) = pass {
-        directives.push(SegmentDirective {
-            directive_type: "pass".to_string(),
-            value: Some(p.to_string()),
-        });
+        directives.push(SegmentDirective::new("pass", Some(p.to_string())));
     }
-    if let Some(ref c) = condition {
+    if let Some(kind) = branch {
         directives.push(SegmentDirective {
-            directive_type: "if".to_string(),
-            value: Some(c.clone()),
+            directive_type: kind.to_string(),
+            value: condition.clone(),
+            expr: condition_expr.clone(),
         });
     }
     if let Some(ref d) = discriminator {
-        directives.push(SegmentDirective {
-            directive_type: "type".to_string(),
-            value: Some(d.value.clone()),
-        });
+        directives.push(SegmentDirective::new("type", Some(d.value.clone())));
     }
 
     TransformSegment {
@@ -677,6 +677,28 @@ fn build_segment(
         items,
         pass,
         condition,
+    }
+}
+
+/// Resolve a segment condition value into either a parsed verb expression or a
+/// legacy infix string. A verb value, or a string beginning with `%`, becomes a
+/// parsed expression; anything else is kept as a legacy infix condition string.
+fn parse_segment_condition(
+    value: &OdinValue,
+    condition: &mut Option<String>,
+    condition_expr: &mut Option<FieldExpression>,
+) {
+    match value {
+        OdinValue::Verb { .. } => {
+            *condition_expr = Some(value_to_field_expression(value));
+        }
+        OdinValue::String { value: s, .. } if s.trim_start().starts_with('%') => {
+            let (expr, _) = parse_string_expression_with_directives(s);
+            *condition_expr = Some(expr);
+        }
+        _ => {
+            *condition = Some(odin_value_to_string(value));
+        }
     }
 }
 

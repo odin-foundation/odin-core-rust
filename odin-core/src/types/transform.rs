@@ -123,17 +123,26 @@ pub struct TransformSegment {
     pub items: Vec<SegmentItem>,
     /// Pass number (for multi-pass transforms).
     pub pass: Option<usize>,
-    /// Condition for this segment.
+    /// Legacy infix condition string for this segment (e.g., `@x = "y"`).
     pub condition: Option<String>,
 }
 
 /// A directive on a transform segment.
 #[derive(Debug, Clone)]
 pub struct SegmentDirective {
-    /// Directive type (e.g., "type", "pass", "when").
+    /// Directive type (e.g., "type", "pass", "when", "if", "elif", "else").
     pub directive_type: String,
     /// Directive value.
     pub value: Option<String>,
+    /// Parsed verb-expression condition (for `if`/`elif` written as `%verb ...`).
+    pub expr: Option<FieldExpression>,
+}
+
+impl SegmentDirective {
+    /// Create a directive with a string value and no parsed expression.
+    pub fn new(directive_type: impl Into<String>, value: Option<String>) -> Self {
+        Self { directive_type: directive_type.into(), value, expr: None }
+    }
 }
 
 /// An item in a transform segment — either a field mapping or a child segment.
@@ -529,6 +538,17 @@ pub mod transform_error_codes {
     pub const T010_POSITION_OVERFLOW: &str = "T010";
     /// Incompatible or unknown conversion target (e.g., unknown unit in dateDiff/distance).
     pub const T011_INCOMPATIBLE_CONVERSION: &str = "T011";
+    /// Conditional branch (`elif`/`else`) with no preceding `if`.
+    pub const T012_DANGLING_BRANCH: &str = "T012";
+}
+
+/// Build a T012 dangling-branch error (an `elif`/`else` with no preceding `if`).
+pub fn dangling_branch_error(directive: &str, segment: Option<&str>) -> TransformError {
+    TransformError {
+        message: format!("'{directive}' segment has no preceding 'if'"),
+        path: segment.map(std::string::ToString::to_string),
+        code: Some(transform_error_codes::T012_DANGLING_BRANCH.to_string()),
+    }
 }
 
 /// An error during transformation.

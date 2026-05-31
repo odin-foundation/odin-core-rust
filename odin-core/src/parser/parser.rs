@@ -84,7 +84,13 @@ fn find_comment_start_quote_aware(s: &str) -> Option<usize> {
     None
 }
 
-/// Match an inline header directive `name :type "value"` / `name :if "expr"`.
+/// Match an inline header directive in a section header.
+///
+/// Supported forms:
+/// - `name :type "value"` — quoted discriminator value.
+/// - `name :if <expr>` / `name :elif <expr>` — unquoted expression captured to `}`.
+/// - `name :else` — bare flag (value `true`).
+///
 /// Returns `(name, "_<directive>", value)` on success.
 fn parse_inline_header_directive(header: &str) -> Option<(&str, String, String)> {
     let colon = header.find(" :")?;
@@ -95,10 +101,23 @@ fn parse_inline_header_directive(header: &str) -> Option<(&str, String, String)>
         .find(|c: char| !c.is_ascii_alphabetic())
         .unwrap_or(after_colon.len());
     let keyword = &after_colon[..kw_end];
-    if keyword != "type" && keyword != "if" { return None; }
-    let rest = after_colon[kw_end..].trim_start();
-    let value = rest.strip_prefix('"')?.strip_suffix('"')?;
-    Some((name, format!("_{keyword}"), value.to_string()))
+    let rest = after_colon[kw_end..].trim();
+    match keyword {
+        "type" => {
+            let value = rest.strip_prefix('"')?.strip_suffix('"')?;
+            Some((name, "_type".to_string(), value.to_string()))
+        }
+        "if" | "elif" => {
+            // Unquoted expression — capture everything up to the closing brace.
+            if rest.is_empty() { return None; }
+            Some((name, format!("_{keyword}"), rest.to_string()))
+        }
+        "else" => {
+            if !rest.is_empty() { return None; }
+            Some((name, "_else".to_string(), "true".to_string()))
+        }
+        _ => None,
+    }
 }
 
 struct Parser<'a> {

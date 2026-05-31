@@ -126,32 +126,32 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
     // 3. Order segments by pass: pass 1 first, then 2, ..., then 0/None last
     let ordered = order_segments_by_pass(&transform.segments);
 
+    // Group ordered segments into runs of equal pass. Conditional chains are
+    // resolved within each pass run, so a chain never spans a pass boundary.
     let mut is_first_pass = true;
-    let mut current_pass: Option<usize> = None;
-    let last_idx = ordered.len().saturating_sub(1);
-    for (idx, seg) in ordered.iter().enumerate() {
-        // Reset non-persist accumulators at each pass transition (matching TS behavior).
-        // The first pass never resets. All subsequent pass transitions do.
-        let seg_pass = seg.pass;
-        if seg_pass != current_pass {
-            if !is_first_pass {
-                for (name, def) in &transform.accumulators {
-                    if !def.persist {
-                        let initial = odin_value_to_dyn(&def.initial);
-                        ctx.accumulators.insert(name.clone(), initial);
-                    }
-                }
-            }
-            is_first_pass = false;
-            current_pass = seg_pass;
+    let mut start = 0;
+    while start < ordered.len() {
+        let pass = ordered[start].pass;
+        let mut end = start + 1;
+        while end < ordered.len() && ordered[end].pass == pass {
+            end += 1;
         }
 
-        process_segment(seg, &mut ctx, &mut output, "");
-        // Snapshot for cross-segment refs in later segments. The clone after
-        // the last segment is never read.
-        if idx < last_idx {
-            ctx.global_output = output.clone();
+        // Reset non-persist accumulators at each pass transition. The first
+        // pass never resets; all subsequent pass transitions do.
+        if !is_first_pass {
+            for (name, def) in &transform.accumulators {
+                if !def.persist {
+                    let initial = odin_value_to_dyn(&def.initial);
+                    ctx.accumulators.insert(name.clone(), initial);
+                }
+            }
         }
+        is_first_pass = false;
+
+        process_segment_list(&ordered[start..end], &mut ctx, &mut output);
+        ctx.global_output = output.clone();
+        start = end;
     }
 
     // 4. Apply confidential enforcement to the entire output tree
@@ -487,13 +487,22 @@ fn order_segments_by_pass(segments: &[TransformSegment]) -> Vec<&TransformSegmen
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn process_segment(segment: &TransformSegment, ctx: &mut ExecContext, output: &mut DynValue, path_prefix: &str) {
-    // Check condition: comparison expression or truthy path.
-    if let Some(ref condition) = segment.condition {
+    // Legacy per-segment condition check (used for nested/recursive segments).
+    // Conditional chains at the top level are resolved by `process_segment_list`.
+    if let Some(if_dir) = segment.directives.iter().find(|d| d.directive_type == "if") {
+        if !evaluate_segment_condition(if_dir, segment, ctx) {
+            return;
+        }
+    } else if let Some(ref condition) = segment.condition {
         if !evaluate_condition(condition, ctx.source, &ctx.constants, &ctx.accumulators) {
             return;
         }
     }
+    process_segment_body(segment, ctx, output, path_prefix);
+}
 
+/// Emit a segment unconditionally (the condition, if any, was already evaluated).
+fn process_segment_body(segment: &TransformSegment, ctx: &mut ExecContext, output: &mut DynValue, path_prefix: &str) {
     // Check discriminator
     if let Some(ref disc) = segment.discriminator {
         let disc_val = resolve_path(ctx.source, &disc.path, &ctx.constants, &ctx.accumulators);
@@ -1990,6 +1999,88 @@ fn evaluate_condition(
     }
     let resolved = resolve_path(source, trimmed, constants, accumulators);
     is_truthy(&resolved)
+}
+
+/// Evaluate a segment condition directive: a verb expression (evaluated by the
+/// normal expression evaluator and coerced to truthy), or a legacy infix string.
+fn evaluate_segment_condition(
+    directive: &crate::types::transform::SegmentDirective,
+    segment: &TransformSegment,
+    ctx: &mut ExecContext,
+) -> bool {
+    if let Some(ref expr) = directive.expr {
+        let source = ctx.source.clone();
+        let output = ctx.global_output.clone();
+        return match evaluate_expression(expr, ctx, &source, &output) {
+            Ok(v) => is_truthy(&v),
+            Err(_) => false,
+        };
+    }
+    let condition = directive
+        .value
+        .as_deref()
+        .or(segment.condition.as_deref());
+    match condition {
+        Some(c) => evaluate_condition(c, ctx.source, &ctx.constants, &ctx.accumulators),
+        None => true,
+    }
+}
+
+/// Process a list of segments, honoring `if`/`elif`/`else` conditional chains.
+///
+/// A chain is a run of consecutive segments: one `if`, then any `elif`, then an
+/// optional `else`. Only the first branch whose condition holds is emitted; the
+/// rest are skipped. Any non-chain segment (or a new `if`) breaks the chain.
+fn process_segment_list(segments: &[&TransformSegment], ctx: &mut ExecContext, output: &mut DynValue) {
+    // 'none' = no active chain; 'pending' = chain open, none taken; 'taken' = a branch taken.
+    #[derive(PartialEq)]
+    enum Branch { None, Pending, Taken }
+    let mut branch = Branch::None;
+    let last_idx = segments.len().saturating_sub(1);
+
+    for (idx, segment) in segments.iter().enumerate() {
+        let if_dir = segment.directives.iter().find(|d| d.directive_type == "if");
+        let elif_dir = segment.directives.iter().find(|d| d.directive_type == "elif");
+        let else_dir = segment.directives.iter().find(|d| d.directive_type == "else");
+
+        if let Some(dir) = if_dir {
+            let taken = evaluate_segment_condition(dir, segment, ctx);
+            branch = if taken { Branch::Taken } else { Branch::Pending };
+            if taken {
+                process_segment_body(segment, ctx, output, "");
+            }
+        } else if let Some(dir) = elif_dir {
+            if branch == Branch::None {
+                ctx.errors.push(crate::types::transform::dangling_branch_error("elif", Some(&segment.path)));
+                continue;
+            }
+            if branch == Branch::Taken {
+                continue;
+            }
+            let taken = evaluate_segment_condition(dir, segment, ctx);
+            branch = if taken { Branch::Taken } else { Branch::Pending };
+            if taken {
+                process_segment_body(segment, ctx, output, "");
+            }
+        } else if else_dir.is_some() {
+            if branch == Branch::None {
+                ctx.errors.push(crate::types::transform::dangling_branch_error("else", Some(&segment.path)));
+                continue;
+            }
+            if branch == Branch::Pending {
+                process_segment_body(segment, ctx, output, "");
+            }
+            branch = Branch::None;
+        } else {
+            branch = Branch::None;
+            process_segment(segment, ctx, output, "");
+        }
+
+        // Snapshot output for cross-segment references in later segments.
+        if idx < last_idx {
+            ctx.global_output = output.clone();
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -12233,7 +12324,7 @@ mod extended_tests_2 {
         let transform_text = format!(
             "{}{}",
             header(),
-            "{Quote}\ndriverName = @driver.name\n\n{DuiDetails :if \"@driver.hasDui\"}\nstate = @driver.dui.state\n",
+            "{Quote}\ndriverName = @driver.name\n\n{DuiDetails :if @driver.hasDui}\nstate = @driver.dui.state\n",
         );
         let source = json_obj(vec![(
             "driver",
@@ -12259,7 +12350,7 @@ mod extended_tests_2 {
         let transform_text = format!(
             "{}{}",
             header(),
-            "{Quote}\ndriverName = @driver.name\n\n{DuiDetails :if \"@driver.hasDui\"}\nstate = @driver.dui.state\n",
+            "{Quote}\ndriverName = @driver.name\n\n{DuiDetails :if @driver.hasDui}\nstate = @driver.dui.state\n",
         );
         let source = json_obj(vec![(
             "driver",
@@ -12270,6 +12361,153 @@ mod extended_tests_2 {
         let out = r.output.unwrap();
         assert!(out.get("DuiDetails").is_none());
         assert!(out.get("Quote").is_some());
+    }
+
+    // ── Verb-expression segment conditions ────────────────────────────────────
+
+    // A verb-expression condition that evaluates truthy includes the section.
+    #[test]
+    fn verb_condition_truthy_includes_section() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{Quote}\nname = @.name\n\n{Adult :if %gte @.age ##18}\nstatus = \"adult\"\n",
+        );
+        let source = json_obj(vec![("name", s("Pat")), ("age", i(30))]);
+        let r = parse_and_exec(&text, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let out = r.output.unwrap();
+        assert_eq!(out.get("Adult").and_then(|d| d.get("status")), Some(&s("adult")));
+    }
+
+    // `%and @a %lt @b ##25` combines two conditions.
+    #[test]
+    fn verb_condition_and_combines() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{S :if %and @.active %lt @.age ##25}\nv = \"yes\"\n",
+        );
+        let included = parse_and_exec(&text, &json_obj(vec![("active", b(true)), ("age", i(20))]));
+        assert!(included.success);
+        assert!(included.output.unwrap().get("S").is_some());
+
+        // Second clause false -> excluded.
+        let excluded = parse_and_exec(&text, &json_obj(vec![("active", b(true)), ("age", i(40))]));
+        assert!(excluded.success);
+        assert!(excluded.output.unwrap().get("S").is_none());
+    }
+
+    // `%or %eq @s "CA" %not @v` combines an equality and a negation.
+    #[test]
+    fn verb_condition_or_with_not() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{S :if %or %eq @.state \"CA\" %not @.verified}\nv = \"yes\"\n",
+        );
+        // state != CA but not(verified=false) = true -> included.
+        let by_not = parse_and_exec(&text, &json_obj(vec![("state", s("TX")), ("verified", b(false))]));
+        assert!(by_not.success);
+        assert!(by_not.output.unwrap().get("S").is_some());
+
+        // state == CA -> included via the eq clause.
+        let by_eq = parse_and_exec(&text, &json_obj(vec![("state", s("CA")), ("verified", b(true))]));
+        assert!(by_eq.success);
+        assert!(by_eq.output.unwrap().get("S").is_some());
+
+        // Neither clause holds -> excluded.
+        let neither = parse_and_exec(&text, &json_obj(vec![("state", s("TX")), ("verified", b(true))]));
+        assert!(neither.success);
+        assert!(neither.output.unwrap().get("S").is_none());
+    }
+
+    // A legacy quoted-infix body condition still evaluates (back-compat).
+    #[test]
+    fn legacy_infix_condition_back_compat() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{S}\n_if = \"@x = true\"\nv = \"yes\"\n",
+        );
+        let included = parse_and_exec(&text, &json_obj(vec![("x", b(true))]));
+        assert!(included.success);
+        assert!(included.output.unwrap().get("S").is_some());
+
+        let excluded = parse_and_exec(&text, &json_obj(vec![("x", b(false))]));
+        assert!(excluded.success);
+        assert!(excluded.output.unwrap().get("S").is_none());
+    }
+
+    // ── if/elif/else chains ───────────────────────────────────────────────────
+
+    fn chain_transform() -> String {
+        format!(
+            "{}{}",
+            header(),
+            "{HighRisk :if %eq @.tier \"dui\"}\nband = \"high-risk\"\n\n\
+             {Young :elif %lt @.age ##25}\nband = \"young\"\n\n\
+             {Standard :else}\nband = \"standard\"\n",
+        )
+    }
+
+    // The `if` branch wins; later branches are skipped.
+    #[test]
+    fn chain_takes_if_branch() {
+        let r = parse_and_exec(&chain_transform(), &json_obj(vec![("tier", s("dui")), ("age", i(40))]));
+        assert!(r.success, "errors: {:?}", r.errors);
+        let out = r.output.unwrap();
+        assert!(out.get("HighRisk").is_some());
+        assert!(out.get("Young").is_none());
+        assert!(out.get("Standard").is_none());
+    }
+
+    // Falls through to the matching `elif`.
+    #[test]
+    fn chain_falls_through_to_elif() {
+        let r = parse_and_exec(&chain_transform(), &json_obj(vec![("tier", s("standard")), ("age", i(20))]));
+        assert!(r.success, "errors: {:?}", r.errors);
+        let out = r.output.unwrap();
+        assert!(out.get("HighRisk").is_none());
+        assert!(out.get("Young").is_some());
+        assert!(out.get("Standard").is_none());
+    }
+
+    // Falls through to the `else` fallback.
+    #[test]
+    fn chain_falls_through_to_else() {
+        let r = parse_and_exec(&chain_transform(), &json_obj(vec![("tier", s("standard")), ("age", i(40))]));
+        assert!(r.success, "errors: {:?}", r.errors);
+        let out = r.output.unwrap();
+        assert!(out.get("HighRisk").is_none());
+        assert!(out.get("Young").is_none());
+        assert!(out.get("Standard").is_some());
+    }
+
+    // An `elif` with no preceding `if` raises T012 and fails the transform.
+    #[test]
+    fn orphan_elif_raises_t012() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{Lonely :elif %eq @.tier \"dui\"}\nband = \"x\"\n",
+        );
+        let r = parse_and_exec(&text, &json_obj(vec![("tier", s("dui"))]));
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T012")));
+    }
+
+    // An `else` with no preceding `if` raises T012 and fails the transform.
+    #[test]
+    fn orphan_else_raises_t012() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{Lonely :else}\nband = \"x\"\n",
+        );
+        let r = parse_and_exec(&text, &json_obj(vec![("tier", s("dui"))]));
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T012")));
     }
 }
 

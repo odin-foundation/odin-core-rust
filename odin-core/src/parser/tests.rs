@@ -146,11 +146,24 @@ use crate::Odin;
     assert_eq!(d.get_string("rows[1].name"), Some("Bob"));
     assert_eq!(d.get_integer("rows[0].id"), Some(0));
 }
-// Header-inline `:if` emits a synthetic `<section>._if` assignment.
+// Header-inline `:if` emits a synthetic `<section>._if` assignment capturing
+// the unquoted expression text up to the closing brace.
 #[test] fn header_inline_if_directive() {
-    let d = Odin::parse("{DuiDetails :if \"@driver.hasDui = true\"}\nstate = \"TX\"\n").unwrap();
+    let d = Odin::parse("{DuiDetails :if @driver.hasDui = true}\nstate = \"TX\"\n").unwrap();
     assert_eq!(d.get_string("DuiDetails._if"), Some("@driver.hasDui = true"));
     assert_eq!(d.get_string("DuiDetails.state"), Some("TX"));
+}
+// Header-inline `:if` with a verb-expression condition.
+#[test] fn header_inline_if_verb_directive() {
+    let d = Odin::parse("{HighRisk :if %eq @driver.tier \"dui\"}\nband = \"high\"\n").unwrap();
+    assert_eq!(d.get_string("HighRisk._if"), Some("%eq @driver.tier \"dui\""));
+    assert_eq!(d.get_string("HighRisk.band"), Some("high"));
+}
+// Header-inline `:elif` / `:else` emit synthetic chain directives.
+#[test] fn header_inline_elif_else_directives() {
+    let d = Odin::parse("{A :if @x}\nv = \"a\"\n{B :elif %lt @y ##5}\nv = \"b\"\n{C :else}\nv = \"c\"\n").unwrap();
+    assert_eq!(d.get_string("B._elif"), Some("%lt @y ##5"));
+    assert_eq!(d.get_string("C._else"), Some("true"));
 }
 // Header-inline `:type` emits a synthetic `<section>._type` assignment.
 #[test] fn header_inline_type_directive() {
