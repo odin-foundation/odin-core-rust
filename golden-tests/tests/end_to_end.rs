@@ -80,41 +80,40 @@ fn source_format(direction: &str) -> &str {
     direction.split("->").next().unwrap_or("odin")
 }
 
-/// Parse input data based on source format
-fn parse_input(raw: &str, format: &str) -> DynValue {
+/// Parse input data based on source format.
+///
+/// `target_format` decides ODIN ingestion: XML export preserves currency type +
+/// scale (incl. array-of-records); other targets flatten currency to a number.
+fn parse_input(raw: &str, format: &str, target_format: &str) -> DynValue {
     match format {
         "json" => parse_source(raw, "json").unwrap_or(DynValue::Null),
         // For fixed-width, csv, and delimited: pass raw string — engine handles multi-record splitting
         "fixed-width" | "csv" | "delimited" => DynValue::String(raw.to_string()),
         "odin" => {
-            // Parse ODIN document and convert to DynValue
-            match odin_core::Odin::parse(raw) {
-                Ok(doc) => odin_doc_to_dyn(&doc),
-                Err(e) => panic!("Failed to parse ODIN input: {e}"),
+            let doc = odin_core::Odin::parse(raw)
+                .unwrap_or_else(|e| panic!("Failed to parse ODIN input: {e}"));
+            if target_format == "xml" {
+                odin_core::transform::document_to_dynvalue(&doc)
+            } else {
+                odin_doc_to_dyn_flat(&doc)
             }
         }
         other => parse_source(raw, other).unwrap_or(DynValue::Null),
     }
 }
 
-/// Convert an OdinDocument to a nested DynValue structure.
-///
-/// ODIN documents store assignments as flat paths like `primitives.string_simple = "Hello"`.
-/// The transform engine expects these to be nested objects like `{ primitives: { string_simple: "Hello" } }`.
-fn odin_doc_to_dyn(doc: &odin_core::OdinDocument) -> DynValue {
+/// Convert an ODIN document to a nested DynValue, flattening currency to a number.
+fn odin_doc_to_dyn_flat(doc: &odin_core::OdinDocument) -> DynValue {
     let mut root = DynValue::Object(Vec::new());
     for (path, value) in doc.assignments.iter() {
-        // Skip metadata paths (prefixed with $)
         if path.starts_with('$') {
             continue;
         }
-        let dyn_val = odin_value_to_dyn(value);
-        set_nested_path(&mut root, path, dyn_val);
+        set_nested_path(&mut root, path, odin_value_to_dyn_flat(value));
     }
     root
 }
 
-/// Set a value at a dotted path in a nested DynValue, creating intermediate objects as needed.
 fn set_nested_path(root: &mut DynValue, path: &str, value: DynValue) {
     let segments: Vec<&str> = path.split('.').collect();
     set_nested_recursive(root, &segments, value);
@@ -124,24 +123,18 @@ fn set_nested_recursive(current: &mut DynValue, segments: &[&str], value: DynVal
     if segments.is_empty() {
         return;
     }
-
     let seg = segments[0];
     let is_last = segments.len() == 1;
-
     if let DynValue::Object(entries) = current {
-        // Check for array index syntax: key[N]
         if let Some(bracket_pos) = seg.find('[') {
             let key = &seg[..bracket_pos];
             let idx_str = &seg[bracket_pos + 1..seg.len() - 1];
             if let Ok(idx) = idx_str.parse::<usize>() {
-                // Find or create the array
-                let arr_pos = entries.iter().position(|(k, _)| k == key);
-                let arr_pos = if let Some(pos) = arr_pos {
-                    pos
-                } else {
-                    entries.push((key.to_string(), DynValue::Array(Vec::new())));
-                    entries.len() - 1
-                };
+                let arr_pos = entries.iter().position(|(k, _)| k == key)
+                    .unwrap_or_else(|| {
+                        entries.push((key.to_string(), DynValue::Array(Vec::new())));
+                        entries.len() - 1
+                    });
                 if let DynValue::Array(items) = &mut entries[arr_pos].1 {
                     let fill = if is_last { DynValue::Null } else { DynValue::Object(Vec::new()) };
                     while items.len() <= idx {
@@ -156,24 +149,20 @@ fn set_nested_recursive(current: &mut DynValue, segments: &[&str], value: DynVal
                 return;
             }
         }
-
         if is_last {
             entries.push((seg.to_string(), value));
+        } else if let Some(pos) = entries.iter().position(|(k, _)| k == seg) {
+            set_nested_recursive(&mut entries[pos].1, &segments[1..], value);
         } else {
-            let existing = entries.iter().position(|(k, _)| k == seg);
-            if let Some(pos) = existing {
-                set_nested_recursive(&mut entries[pos].1, &segments[1..], value);
-            } else {
-                entries.push((seg.to_string(), DynValue::Object(Vec::new())));
-                let last = entries.len() - 1;
-                set_nested_recursive(&mut entries[last].1, &segments[1..], value);
-            }
+            entries.push((seg.to_string(), DynValue::Object(Vec::new())));
+            let last = entries.len() - 1;
+            set_nested_recursive(&mut entries[last].1, &segments[1..], value);
         }
     }
 }
 
-/// Convert OdinValue to DynValue
-fn odin_value_to_dyn(val: &odin_core::OdinValue) -> DynValue {
+/// Convert an OdinValue to DynValue, flattening currency to a plain number.
+fn odin_value_to_dyn_flat(val: &odin_core::OdinValue) -> DynValue {
     use odin_core::OdinValue;
     match val {
         OdinValue::Null { .. } => DynValue::Null,
@@ -190,18 +179,16 @@ fn odin_value_to_dyn(val: &odin_core::OdinValue) -> DynValue {
         OdinValue::Reference { path, .. } => DynValue::String(path.clone()),
         OdinValue::Binary { .. } => DynValue::Null,
         OdinValue::Array { items, .. } => {
-            let dyn_items: Vec<DynValue> = items.iter().map(|item| {
-                match item {
-                    odin_core::types::values::OdinArrayItem::Value(v) => odin_value_to_dyn(v),
-                    odin_core::types::values::OdinArrayItem::Record(fields) => {
-                        DynValue::Object(fields.iter().map(|(k, v)| (k.clone(), odin_value_to_dyn(v))).collect())
-                    }
+            let dyn_items = items.iter().map(|item| match item {
+                odin_core::types::values::OdinArrayItem::Value(v) => odin_value_to_dyn_flat(v),
+                odin_core::types::values::OdinArrayItem::Record(fields) => {
+                    DynValue::Object(fields.iter().map(|(k, v)| (k.clone(), odin_value_to_dyn_flat(v))).collect())
                 }
             }).collect();
             DynValue::Array(dyn_items)
         }
         OdinValue::Object { value, .. } => {
-            DynValue::Object(value.iter().map(|(k, v)| (k.clone(), odin_value_to_dyn(v))).collect())
+            DynValue::Object(value.iter().map(|(k, v)| (k.clone(), odin_value_to_dyn_flat(v))).collect())
         }
         OdinValue::Verb { .. } => DynValue::Null,
     }
@@ -249,7 +236,7 @@ fn run_transform_test(test: &TestDefinition, category_path: &str) {
 
     let direction = test.direction.as_deref().unwrap_or("odin->odin");
     let src_fmt = source_format(direction);
-    let input = parse_input(&input_raw, src_fmt);
+    let input = parse_input(&input_raw, src_fmt, &transform.target.format);
 
     let result = execute_transform(&transform, &input);
 
@@ -292,7 +279,7 @@ fn run_roundtrip_test(test: &TestDefinition, category_path: &str) {
 
     let direction = test.direction.as_deref().unwrap_or("fixed-width->fixed-width");
     let src_fmt = source_format(direction);
-    let input = parse_input(&input_raw, src_fmt);
+    let input = parse_input(&input_raw, src_fmt, &import_transform.target.format);
 
     let import_result = execute_transform(&import_transform, &input);
     assert!(import_result.success, "[{}] Import transform failed", test.id);

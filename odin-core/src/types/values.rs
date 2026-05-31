@@ -36,12 +36,14 @@ pub struct OdinModifiers {
     pub deprecated: bool,
     /// Emit as XML attribute instead of child element (`:attr` modifier).
     pub attr: bool,
+    /// XML namespace prefix for the element (`:ns` modifier).
+    pub ns: Option<String>,
 }
 
 impl OdinModifiers {
     /// Returns `true` if no modifiers are set.
     pub fn is_empty(&self) -> bool {
-        !self.required && !self.confidential && !self.deprecated && !self.attr
+        !self.required && !self.confidential && !self.deprecated && !self.attr && self.ns.is_none()
     }
 
     /// Returns `true` if any modifier is set.
@@ -992,6 +994,7 @@ mod tests {
             confidential: true,
             deprecated: false,
             attr: false,
+            ns: None,
         };
         let val = OdinValues::string("secret").with_modifiers(mods);
         assert!(val.is_required());
@@ -1476,6 +1479,7 @@ mod tests {
             confidential: true,
             deprecated: true,
             attr: true,
+            ns: None,
         };
         let v = OdinValues::string("x").with_modifiers(mods);
         assert!(v.is_required());

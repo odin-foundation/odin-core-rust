@@ -152,6 +152,7 @@ mod tests {
             confidential: true,
             deprecated: true,
             attr: false,
+            ns: None,
         };
         let doc = OdinDocumentBuilder::new()
             .set("field", OdinValues::string("val").with_modifiers(mods))

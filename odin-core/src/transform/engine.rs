@@ -167,7 +167,7 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
         // Fixed-width export uses segment mapping directives for positioning
         formatters::format_fixed_width_from_segments(&output, &transform.segments, &transform.target.options)
     } else if transform.target.format.eq_ignore_ascii_case("xml") {
-        formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers)
+        formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers, &transform.target.namespaces)
     } else {
         format_output(&output, &transform.target.format, &transform.target.options)
     };
@@ -448,7 +448,7 @@ fn execute_multi_record(
     } else if transform.target.format.eq_ignore_ascii_case("fixed-width") {
         formatters::format_fixed_width_from_segments(&output, &transform.segments, &transform.target.options)
     } else if transform.target.format.eq_ignore_ascii_case("xml") {
-        formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers)
+        formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers, &transform.target.namespaces)
     } else {
         format_output(&output, &transform.target.format, &transform.target.options)
     };
@@ -778,7 +778,7 @@ fn process_mapping(
             }
             // Record field modifiers for ODIN/XML formatter (using full path)
             if let Some(ref mods) = mapping.modifiers {
-                if mods.confidential || mods.required || mods.deprecated || mods.attr {
+                if mods.confidential || mods.required || mods.deprecated || mods.attr || mods.ns.is_some() {
                     let full_key = if path_prefix.is_empty() {
                         mapping.target.clone()
                     } else {
@@ -1933,6 +1933,7 @@ mod tests {
             target: TargetConfig {
                 format: "json".to_string(),
                 options: HashMap::new(),
+                ..Default::default()
             },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
@@ -2181,6 +2182,7 @@ mod tests {
             target: TargetConfig {
                 format: "json".to_string(),
                 options: HashMap::new(),
+                ..Default::default()
             },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
@@ -2238,6 +2240,7 @@ mod tests {
                     confidential: true,
                     deprecated: false,
                     attr: false,
+                    ns: None,
                 }),
             },
             FieldMapping {
@@ -2275,6 +2278,7 @@ mod tests {
                     confidential: true,
                     deprecated: false,
                     attr: false,
+                    ns: None,
                 }),
             },
         ]);
@@ -2385,6 +2389,7 @@ mod tests {
             target: TargetConfig {
                 format: "json".to_string(),
                 options: HashMap::new(),
+                ..Default::default()
             },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
@@ -2433,6 +2438,7 @@ mod tests {
             target: TargetConfig {
                 format: "json".to_string(),
                 options: HashMap::new(),
+                ..Default::default()
             },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
@@ -2608,6 +2614,7 @@ mod tests {
             target: TargetConfig {
                 format: "json".to_string(),
                 options: HashMap::new(),
+                ..Default::default()
             },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
@@ -2642,6 +2649,7 @@ mod tests {
             confidential,
             deprecated,
             attr: false,
+            ns: None,
         }
     }
 
@@ -6792,6 +6800,7 @@ mod tests {
             target: TargetConfig {
                 format: "json".to_string(),
                 options: HashMap::new(),
+                ..Default::default()
             },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
@@ -8334,7 +8343,7 @@ mod extended_tests {
         OdinTransform {
             metadata: TransformMetadata::default(),
             source: None,
-            target: TargetConfig { format: "json".to_string(), options: HashMap::new() },
+            target: TargetConfig { format: "json".to_string(), options: HashMap::new(), ..Default::default() },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
             tables: HashMap::new(),
@@ -8356,7 +8365,7 @@ mod extended_tests {
         OdinTransform {
             metadata: TransformMetadata::default(),
             source: None,
-            target: TargetConfig { format: "json".to_string(), options: HashMap::new() },
+            target: TargetConfig { format: "json".to_string(), options: HashMap::new(), ..Default::default() },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
             tables: HashMap::new(),
@@ -8457,19 +8466,19 @@ mod extended_tests {
     }
 
     fn confidential_mods() -> OdinModifiers {
-        OdinModifiers { required: false, confidential: true, deprecated: false, attr: false }
+        OdinModifiers { required: false, confidential: true, deprecated: false, attr: false, ns: None }
     }
 
     fn required_mods() -> OdinModifiers {
-        OdinModifiers { required: true, confidential: false, deprecated: false, attr: false }
+        OdinModifiers { required: true, confidential: false, deprecated: false, attr: false, ns: None }
     }
 
     fn deprecated_mods() -> OdinModifiers {
-        OdinModifiers { required: false, confidential: false, deprecated: true, attr: false }
+        OdinModifiers { required: false, confidential: false, deprecated: true, attr: false, ns: None }
     }
 
     fn all_mods() -> OdinModifiers {
-        OdinModifiers { required: true, confidential: true, deprecated: true, attr: false }
+        OdinModifiers { required: true, confidential: true, deprecated: true, attr: false, ns: None }
     }
 
     fn src_obj(fields: Vec<(&str, DynValue)>) -> DynValue {
@@ -10309,7 +10318,7 @@ mod extended_tests {
 
     #[test]
     fn ext_conf_redact_with_required_modifier() {
-        let mods = OdinModifiers { required: true, confidential: true, deprecated: false, attr: false };
+        let mods = OdinModifiers { required: true, confidential: true, deprecated: false, attr: false, ns: None };
         let mut t = mk_transform(vec![modifiers_field("SSN", "@.ssn", mods)]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let result = execute(&t, &src_obj(vec![("ssn", s("123-45-6789"))]));
@@ -10741,7 +10750,7 @@ mod extended_tests_2 {
         OdinTransform {
             metadata: TransformMetadata::default(),
             source: None,
-            target: TargetConfig { format: "json".to_string(), options: HashMap::new() },
+            target: TargetConfig { format: "json".to_string(), options: HashMap::new(), ..Default::default() },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
             tables: HashMap::new(),
@@ -10763,7 +10772,7 @@ mod extended_tests_2 {
         OdinTransform {
             metadata: TransformMetadata::default(),
             source: None,
-            target: TargetConfig { format: "json".to_string(), options: HashMap::new() },
+            target: TargetConfig { format: "json".to_string(), options: HashMap::new(), ..Default::default() },
             constants: HashMap::new(),
             accumulators: HashMap::new(),
             tables: HashMap::new(),
@@ -10786,7 +10795,7 @@ mod extended_tests_2 {
     }
 
     fn make_modifiers(required: bool, confidential: bool, deprecated: bool) -> crate::types::values::OdinModifiers {
-        crate::types::values::OdinModifiers { required, confidential, deprecated, attr: false }
+        crate::types::values::OdinModifiers { required, confidential, deprecated, attr: false, ns: None }
     }
 
     fn verb_mapping(target: &str, verb: &str, args: Vec<VerbArg>) -> FieldMapping {
@@ -12097,5 +12106,137 @@ mod extended_tests_2 {
         let r = execute(&t, &json_obj(vec![("a", i(3)), ("b", i(5))]));
         assert!(r.success);
         assert_eq!(r.output.unwrap().get("Val"), Some(&b(true)));
+    }
+}
+
+// XML target: emitTypeHints suppression and :ns namespace prefixing.
+mod xml_namespace_typehints_tests {
+    use crate::Odin;
+    use crate::types::transform::DynValue;
+    use crate::transform::engine::execute;
+
+    fn parse_and_exec(transform_text: &str, source: &DynValue) -> crate::types::transform::TransformResult {
+        let t = Odin::parse_transform(transform_text).unwrap();
+        execute(&t, source)
+    }
+
+    // Flat source object holding a typed integer and a currency value (#$9.99 USD).
+    fn typed_source() -> DynValue {
+        DynValue::Object(vec![
+            ("count".to_string(), DynValue::Integer(42)),
+            ("price".to_string(), DynValue::Currency(9.99, 2, Some("USD".to_string()))),
+        ])
+    }
+
+    // odin->xml transform with one typed-integer and one currency field under {Root}.
+    fn typed_xml_transform(emit_type_hints_false: bool) -> String {
+        let hint = if emit_type_hints_false { "target.emitTypeHints = ?false\n" } else { "" };
+        format!(
+            "{{$}}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->xml\"\ntarget.format = \"xml\"\n{hint}\n{{$source}}\nformat = \"odin\"\n\n{{Root}}\nCount = @.count\nPrice = @.price\n"
+        )
+    }
+
+    // ── Scenario 1: emitTypeHints default (true) emits odin:type + xmlns:odin ──
+    #[test]
+    fn xml_type_hints_default_emits_odin_attributes() {
+        let r = parse_and_exec(&typed_xml_transform(false), &typed_source());
+        assert!(r.success, "errors: {:?}", r.errors);
+        let xml = r.formatted.unwrap();
+        assert!(xml.contains("xmlns:odin"), "missing xmlns:odin in:\n{xml}");
+        assert!(xml.contains("odin:type=\"integer\""), "missing integer type hint in:\n{xml}");
+        // Currency renders its own type hint plus the currency code.
+        assert!(xml.contains("odin:type=\"currency\""), "missing currency type hint in:\n{xml}");
+        assert!(xml.contains("odin:currencyCode=\"USD\""), "missing currencyCode in:\n{xml}");
+        assert!(xml.contains("9.99"), "currency value missing in:\n{xml}");
+    }
+
+    // ── Scenario 2: emitTypeHints=false suppresses all odin: attributes, keeps values ──
+    #[test]
+    fn xml_type_hints_false_suppresses_odin_attributes() {
+        let r = parse_and_exec(&typed_xml_transform(true), &typed_source());
+        assert!(r.success, "errors: {:?}", r.errors);
+        let xml = r.formatted.unwrap();
+        assert!(!xml.contains("odin:type"), "odin:type leaked in:\n{xml}");
+        assert!(!xml.contains("odin:currencyCode"), "odin:currencyCode leaked in:\n{xml}");
+        assert!(!xml.contains("xmlns:odin"), "xmlns:odin leaked in:\n{xml}");
+        assert!(!xml.contains("odin:"), "odin: prefix leaked in:\n{xml}");
+        assert!(xml.contains("42"), "integer value missing in:\n{xml}");
+        assert!(xml.contains("9.99"), "currency value missing in:\n{xml}");
+    }
+
+    // ── Scenario 3: :ns prefixes one element + declares xmlns on root; other element bare ──
+    #[test]
+    fn xml_ns_prefix_and_root_declaration() {
+        let transform = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->xml\"\ntarget.format = \"xml\"\n\n{$source}\nformat = \"odin\"\n\n{$target.namespace}\np = \"urn:x\"\n\n{Root}\nFirst = @.a :ns p\nSecond = @.b\n";
+        let source = DynValue::Object(vec![
+            ("a".to_string(), DynValue::String("one".to_string())),
+            ("b".to_string(), DynValue::String("two".to_string())),
+        ]);
+        let r = parse_and_exec(transform, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let xml = r.formatted.unwrap();
+        assert!(xml.contains("xmlns:p=\"urn:x\""), "root xmlns:p missing in:\n{xml}");
+        assert!(xml.contains("<p:First>"), "prefixed element missing in:\n{xml}");
+        assert!(xml.contains("<Second>"), "unprefixed element missing in:\n{xml}");
+        assert!(!xml.contains("<p:Second>"), "Second wrongly prefixed in:\n{xml}");
+    }
+
+    // ── Scenario 4: two declared namespaces both appear as xmlns: on root ──
+    #[test]
+    fn xml_multiple_namespaces_on_root() {
+        let transform = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->xml\"\ntarget.format = \"xml\"\n\n{$source}\nformat = \"odin\"\n\n{$target.namespace}\np = \"urn:p\"\nq = \"urn:q\"\n\n{Root}\nFirst = @.a :ns p\nSecond = @.b :ns q\n";
+        let source = DynValue::Object(vec![
+            ("a".to_string(), DynValue::String("one".to_string())),
+            ("b".to_string(), DynValue::String("two".to_string())),
+        ]);
+        let r = parse_and_exec(transform, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let xml = r.formatted.unwrap();
+        assert!(xml.contains("xmlns:p=\"urn:p\""), "xmlns:p missing in:\n{xml}");
+        assert!(xml.contains("xmlns:q=\"urn:q\""), "xmlns:q missing in:\n{xml}");
+    }
+
+    // ── Scenario 6: raw odin currency source renders currency type + code ──
+    #[test]
+    fn xml_raw_odin_currency_renders_type_and_code() {
+        let doc = Odin::parse("total = #$9.99:USD\n").unwrap();
+        let source = crate::transform::document_to_dynvalue(&doc);
+        let transform = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->xml\"\ntarget.format = \"xml\"\n\n{$source}\nformat = \"odin\"\n\n{Root}\nTotal = @.total\n";
+        let r = parse_and_exec(transform, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let xml = r.formatted.unwrap();
+        assert!(xml.contains("odin:type=\"currency\""), "missing currency type hint in:\n{xml}");
+        assert!(xml.contains("odin:currencyCode=\"USD\""), "missing currencyCode in:\n{xml}");
+        assert!(xml.contains("9.99"), "currency value missing in:\n{xml}");
+    }
+
+    // ── Scenario 7: code-less odin currency renders currency type with preserved decimals, no code ──
+    #[test]
+    fn xml_raw_odin_codeless_currency_renders_currency_type() {
+        let doc = Odin::parse("total = #$50.00\n").unwrap();
+        let source = crate::transform::document_to_dynvalue(&doc);
+        let transform = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->xml\"\ntarget.format = \"xml\"\n\n{$source}\nformat = \"odin\"\n\n{Root}\nTotal = @.total\n";
+        let r = parse_and_exec(transform, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let xml = r.formatted.unwrap();
+        assert!(xml.contains("odin:type=\"currency\""), "missing currency type hint in:\n{xml}");
+        assert!(xml.contains(">50.00<"), "currency decimals not preserved in:\n{xml}");
+        assert!(!xml.contains("odin:currencyCode"), "currencyCode wrongly emitted for code-less in:\n{xml}");
+    }
+
+    // ── Scenario 5: namespace + emitTypeHints=false together — prefixed element, no odin: ──
+    #[test]
+    fn xml_ns_with_type_hints_false() {
+        let transform = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->xml\"\ntarget.format = \"xml\"\ntarget.emitTypeHints = ?false\n\n{$source}\nformat = \"odin\"\n\n{$target.namespace}\np = \"urn:x\"\n\n{Root}\nAmount = @.amount :ns p\n";
+        let source = DynValue::Object(vec![
+            ("amount".to_string(), DynValue::Currency(9.99, 2, Some("USD".to_string()))),
+        ]);
+        let r = parse_and_exec(transform, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let xml = r.formatted.unwrap();
+        assert!(xml.contains("xmlns:p=\"urn:x\""), "xmlns:p missing in:\n{xml}");
+        assert!(xml.contains("<p:Amount"), "prefixed element missing in:\n{xml}");
+        assert!(!xml.contains("odin:"), "odin: prefix leaked in:\n{xml}");
+        assert!(xml.contains("9.99"), "currency value missing in:\n{xml}");
     }
 }

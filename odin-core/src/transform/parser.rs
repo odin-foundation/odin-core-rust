@@ -121,16 +121,19 @@ fn parse_source_discriminator(doc: &OdinDocument) -> Option<SourceDiscriminator>
 fn parse_target_config(doc: &OdinDocument) -> TargetConfig {
     let format = get_meta_string(doc, "target.format").unwrap_or_default();
     let mut options = HashMap::new();
+    let mut namespaces = Vec::new();
 
     for (key, value) in &doc.metadata {
-        if let Some(rest) = key.strip_prefix("target.") {
+        if let Some(prefix) = key.strip_prefix("target.namespace.") {
+            namespaces.push((prefix.to_string(), odin_value_to_string(value)));
+        } else if let Some(rest) = key.strip_prefix("target.") {
             if rest != "format" {
                 options.insert(rest.to_string(), odin_value_to_string(value));
             }
         }
     }
 
-    TargetConfig { format, options }
+    TargetConfig { format, options, namespaces }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,8 +392,9 @@ fn parse_strict_types(doc: &OdinDocument) -> bool {
         .unwrap_or(false)
 }
 
-/// Merge directive-based modifiers (`:confidential`, `:required`, `:deprecated`)
-/// into the existing `Option<OdinModifiers>` from the document's prefix modifiers.
+/// Merge directive-based modifiers (`:confidential`, `:required`, `:deprecated`,
+/// `:attr`, `:ns`) into the existing `Option<OdinModifiers>` from the document's
+/// prefix modifiers.
 fn merge_directive_modifiers(
     modifiers: Option<OdinModifiers>,
     directives: &[crate::types::values::OdinDirective],
@@ -399,19 +403,19 @@ fn merge_directive_modifiers(
     let has_req = directives.iter().any(|d| d.name == "required");
     let has_dep = directives.iter().any(|d| d.name == "deprecated");
     let has_attr = directives.iter().any(|d| d.name == "attr");
-    if !has_conf && !has_req && !has_dep && !has_attr {
+    let ns_prefix = directives.iter().find(|d| d.name == "ns").and_then(|d| match &d.value {
+        Some(crate::types::values::DirectiveValue::String(s)) => Some(s.clone()),
+        _ => None,
+    });
+    if !has_conf && !has_req && !has_dep && !has_attr && ns_prefix.is_none() {
         return modifiers;
     }
-    let mut m = modifiers.unwrap_or(OdinModifiers {
-        required: false,
-        deprecated: false,
-        confidential: false,
-        attr: false,
-    });
+    let mut m = modifiers.unwrap_or_default();
     if has_conf { m.confidential = true; }
     if has_req { m.required = true; }
     if has_dep { m.deprecated = true; }
     if has_attr { m.attr = true; }
+    if ns_prefix.is_some() { m.ns = ns_prefix; }
     Some(m)
 }
 
@@ -1726,6 +1730,7 @@ mod tests {
             confidential: true,
             deprecated: false,
             attr: false,
+            ns: None,
         };
         let doc = OdinDocumentBuilder::new()
             .set_with_modifiers(

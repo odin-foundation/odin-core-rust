@@ -303,19 +303,25 @@ pub fn format_xml_with_options(
 /// Supported options:
 /// - `declaration`: "false" to skip the `<?xml ...?>` declaration (default true)
 /// - `indent`: indentation spaces (default 2)
+/// - `emitTypeHints`: "false" for plain XML with no odin: attributes/namespace (default true)
+///
+/// `namespaces` declares prefix->URI pairs emitted as `xmlns:<prefix>` on the root.
 pub fn format_xml_full(
     value: &DynValue,
     options: &std::collections::HashMap<String, String>,
     modifiers: &std::collections::HashMap<String, crate::types::values::OdinModifiers>,
+    namespaces: &[(String, String)],
 ) -> String {
     let include_declaration = options.get("declaration").map_or(true, |v| v != "false");
     let indent: usize = options.get("indent").and_then(|v| v.parse().ok()).unwrap_or(2);
+    let emit_type_hints = options.get("emitTypeHints").map_or(true, |v| v != "false");
 
     let mut output = String::new();
     if include_declaration {
         output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     }
-    let needs_ns = xml_needs_odin_namespace(value);
+    // xmlns:odin is only emitted with type hints; target namespaces always emit.
+    let needs_ns = emit_type_hints && xml_needs_odin_namespace(value);
 
     if let DynValue::Object(entries) = value {
         for (key, val) in entries {
@@ -323,12 +329,12 @@ pub fn format_xml_full(
                 DynValue::Array(items) => {
                     // Array sections: each item is a repeating element (no xmlns:odin)
                     for item in items {
-                        xml_write_element_full(&mut output, key, item, indent, 0, false, modifiers, key);
+                        xml_write_element_full(&mut output, key, item, indent, 0, false, modifiers, key, emit_type_hints, namespaces);
                     }
                 }
                 _ => {
-                    // Object sections: root-level elements get xmlns:odin
-                    xml_write_element_full(&mut output, key, val, indent, 0, needs_ns, modifiers, key);
+                    // Object sections: root-level elements get xmlns declarations
+                    xml_write_element_full(&mut output, key, val, indent, 0, needs_ns, modifiers, key, emit_type_hints, namespaces);
                 }
             }
         }
@@ -368,14 +374,16 @@ fn xml_needs_odin_namespace(value: &DynValue) -> bool {
 
 /// Get the odin:type string for a `DynValue`, or None for string types.
 /// Numeric values that are whole numbers are typed as "integer".
+/// Currency is always "currency".
 fn xml_odin_type(value: &DynValue) -> Option<&'static str> {
     match value {
         DynValue::Bool(_) => Some("boolean"),
         DynValue::Integer(_) => Some("integer"),
-        DynValue::Float(f) | DynValue::Currency(f, _, _) | DynValue::Percent(f) => {
+        DynValue::Currency(_, _, _) | DynValue::CurrencyRaw(_, _, _) => Some("currency"),
+        DynValue::Float(f) | DynValue::Percent(f) => {
             if f.fract() == 0.0 && f.is_finite() { Some("integer") } else { Some("number") }
         }
-        DynValue::FloatRaw(s) | DynValue::CurrencyRaw(s, _, _) => {
+        DynValue::FloatRaw(s) => {
             if let Ok(f) = s.parse::<f64>() {
                 if f.fract() == 0.0 && f.is_finite() { Some("integer") } else { Some("number") }
             } else {
@@ -397,7 +405,9 @@ fn xml_value_text(value: &DynValue) -> String {
     match value {
         DynValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         DynValue::Integer(n) => { let mut buf = itoa::Buffer::new(); buf.format(*n).to_string() }
-        DynValue::Float(n) | DynValue::Currency(n, _, _) | DynValue::Percent(n) => format_float(*n),
+        DynValue::Float(n) | DynValue::Percent(n) => format_float(*n),
+        // Currency keeps its decimal scale (default 2 -> "50.00").
+        DynValue::Currency(n, dp, _) => format!("{:.prec$}", n, prec = *dp as usize),
         DynValue::FloatRaw(s) | DynValue::CurrencyRaw(s, _, _) => s.clone(),
         DynValue::String(s) | DynValue::Reference(s) | DynValue::Binary(s)
         | DynValue::Date(s) | DynValue::Timestamp(s) | DynValue::Time(s)
@@ -418,13 +428,27 @@ fn xml_write_element_full(
     include_ns: bool,
     modifiers: &std::collections::HashMap<String, crate::types::values::OdinModifiers>,
     section_key: &str,
+    emit_type_hints: bool,
+    namespaces: &[(String, String)],
 ) {
+    // Qualify the element name with its :ns prefix when present.
+    let raw_tag = tag;
+    let qtag = match modifiers.get(section_key).and_then(|m| m.ns.as_deref()) {
+        Some(prefix) => format!("{prefix}:{tag}"),
+        None => tag.to_string(),
+    };
+    let tag = qtag.as_str();
+    let is_root = depth == 0;
+
     match value {
         DynValue::Null => {
             xml_indent(output, indent, depth);
             output.push('<');
             output.push_str(tag);
-            output.push_str(" odin:type=\"null\"></");
+            if emit_type_hints {
+                output.push_str(" odin:type=\"null\"");
+            }
+            output.push_str("></");
             output.push_str(tag);
             output.push_str(">\n");
         }
@@ -435,6 +459,16 @@ fn xml_write_element_full(
 
             if include_ns {
                 output.push_str(" xmlns:odin=\"https://odin.foundation/ns\"");
+            }
+            // Declare target namespaces on the root element only.
+            if is_root {
+                for (prefix, uri) in namespaces {
+                    output.push_str(" xmlns:");
+                    output.push_str(prefix);
+                    output.push_str("=\"");
+                    output.push_str(&xml_escape(uri));
+                    output.push('"');
+                }
             }
 
             // Collect :attr fields as XML attributes
@@ -461,7 +495,7 @@ fn xml_write_element_full(
                     continue;
                 }
                 let child_section = format!("{section_key}.{child_key}");
-                xml_write_element_full(output, child_key, child_val, indent, depth + 1, false, modifiers, &child_section);
+                xml_write_element_full(output, child_key, child_val, indent, depth + 1, false, modifiers, &child_section, emit_type_hints, namespaces);
             }
 
             xml_indent(output, indent, depth);
@@ -471,7 +505,7 @@ fn xml_write_element_full(
         }
         DynValue::Array(items) => {
             for item in items {
-                xml_write_element_full(output, tag, item, indent, depth, false, modifiers, section_key);
+                xml_write_element_full(output, raw_tag, item, indent, depth, false, modifiers, section_key, emit_type_hints, namespaces);
             }
         }
         _ => {
@@ -479,10 +513,18 @@ fn xml_write_element_full(
             xml_indent(output, indent, depth);
             output.push('<');
             output.push_str(tag);
-            if let Some(odin_type) = xml_odin_type(value) {
-                output.push_str(" odin:type=\"");
-                output.push_str(odin_type);
-                output.push('"');
+            if emit_type_hints {
+                if let Some(odin_type) = xml_odin_type(value) {
+                    output.push_str(" odin:type=\"");
+                    output.push_str(odin_type);
+                    output.push('"');
+                }
+                // Carry the currency code alongside the type hint.
+                if let DynValue::Currency(_, _, Some(code)) | DynValue::CurrencyRaw(_, _, Some(code)) = value {
+                    output.push_str(" odin:currencyCode=\"");
+                    output.push_str(&xml_escape(code));
+                    output.push('"');
+                }
             }
             output.push('>');
             output.push_str(&xml_value_text(value));

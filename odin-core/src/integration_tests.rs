@@ -2495,7 +2495,7 @@ mod builder_advanced {
     #[test]
     fn build_with_required_modifier() {
         let val = OdinValues::string("important").with_modifiers(OdinModifiers {
-            required: true, confidential: false, deprecated: false, attr: false,
+            required: true, confidential: false, deprecated: false, attr: false, ns: None,
         });
         let d = OdinDocumentBuilder::new().set("field", val).build().unwrap();
         assert!(d.get("field").unwrap().is_required());
@@ -2505,7 +2505,7 @@ mod builder_advanced {
     #[test]
     fn build_with_confidential_modifier() {
         let val = OdinValues::string("secret").with_modifiers(OdinModifiers {
-            required: false, confidential: true, deprecated: false, attr: false,
+            required: false, confidential: true, deprecated: false, attr: false, ns: None,
         });
         let d = OdinDocumentBuilder::new().set("ssn", val).build().unwrap();
         assert!(d.get("ssn").unwrap().is_confidential());
@@ -2514,7 +2514,7 @@ mod builder_advanced {
     #[test]
     fn build_with_deprecated_modifier() {
         let val = OdinValues::string("old").with_modifiers(OdinModifiers {
-            required: false, confidential: false, deprecated: true, attr: false,
+            required: false, confidential: false, deprecated: true, attr: false, ns: None,
         });
         let d = OdinDocumentBuilder::new().set("legacy", val).build().unwrap();
         assert!(d.get("legacy").unwrap().is_deprecated());
@@ -2523,7 +2523,7 @@ mod builder_advanced {
     #[test]
     fn build_with_all_modifiers() {
         let val = OdinValues::integer(42).with_modifiers(OdinModifiers {
-            required: true, confidential: true, deprecated: true, attr: false,
+            required: true, confidential: true, deprecated: true, attr: false, ns: None,
         });
         let d = OdinDocumentBuilder::new().set("x", val).build().unwrap();
         let v = d.get("x").unwrap();

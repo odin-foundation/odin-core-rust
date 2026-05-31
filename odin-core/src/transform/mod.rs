@@ -87,8 +87,10 @@ fn odin_value_to_dynvalue(value: &OdinValue) -> DynValue {
         OdinValue::Boolean { value: b, .. } => DynValue::Bool(*b),
         OdinValue::Integer { value: n, .. } => DynValue::Integer(*n),
         OdinValue::Number { value: f, .. }
-        | OdinValue::Currency { value: f, .. }
         | OdinValue::Percent { value: f, .. } => DynValue::Float(*f),
+        OdinValue::Currency { value, decimal_places, currency_code, .. } => {
+            DynValue::Currency(*value, *decimal_places, currency_code.clone())
+        }
         OdinValue::String { value: s, .. }
         | OdinValue::Time { value: s, .. }
         | OdinValue::Duration { value: s, .. } => DynValue::String(s.clone()),

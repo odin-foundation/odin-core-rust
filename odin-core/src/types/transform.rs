@@ -63,12 +63,14 @@ pub struct SourceConfig {
 }
 
 /// Target format configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TargetConfig {
     /// Target format (json, xml, csv, fixed-width, flat, odin).
     pub format: String,
     /// Format-specific options (e.g., root element for XML).
     pub options: HashMap<String, String>,
+    /// XML namespace declarations (prefix -> URI) in declaration order.
+    pub namespaces: Vec<(String, String)>,
 }
 
 /// Accumulator definition for aggregation across records.
