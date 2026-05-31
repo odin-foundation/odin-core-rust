@@ -471,3 +471,34 @@ fn parse_documents_single_document_yields_one() {
 }
 
 
+
+// ─── Bare segment-directive lines & header-inline loop/counter/from ──────────
+
+#[test]
+fn parse_bare_loop_and_counter_directives() {
+    let d = Odin::parse("{rows[]}\n:loop items\n:counter idx\nn = \"x\"\n").unwrap();
+    assert_eq!(d.get_string("rows[]._loop"), Some("items"));
+    assert_eq!(d.get_string("rows[]._counter"), Some("idx"));
+}
+
+#[test]
+fn parse_bare_from_directive() {
+    let d = Odin::parse("{out}\n:from data.records\nv = \"x\"\n").unwrap();
+    assert_eq!(d.get_string("out._from"), Some("data.records"));
+}
+
+#[test]
+fn parse_bare_loop_with_alias() {
+    let d = Odin::parse("{rows[]}\n:loop items :as item\n").unwrap();
+    assert_eq!(d.get_string("rows[]._loop"), Some("items :as item"));
+}
+
+#[test]
+fn parse_header_inline_loop_counter_from() {
+    let d = Odin::parse("{rows[] :loop items}\nn = \"x\"\n").unwrap();
+    assert_eq!(d.get_string("rows[]._loop"), Some("items"));
+    let d2 = Odin::parse("{rows[] :counter idx}\nn = \"x\"\n").unwrap();
+    assert_eq!(d2.get_string("rows[]._counter"), Some("idx"));
+    let d3 = Odin::parse("{out :from data.records}\nv = \"x\"\n").unwrap();
+    assert_eq!(d3.get_string("out._from"), Some("data.records"));
+}

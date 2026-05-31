@@ -51,6 +51,30 @@ struct ExecContext<'a> {
     /// Source format string (e.g., "fixed-width", "odin", "json").
     /// Used to determine whether extraction directives should be applied on references.
     source_format: String,
+    /// Policy for `:validate` / `:enum` / `:range` failures (`fail`/`warn`/`skip`).
+    validation_policy: ValidationPolicy,
+}
+
+/// Policy applied when a `:validate` / `:enum` / `:range` constraint fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationPolicy {
+    /// Record a T013 error and drop the field.
+    Fail,
+    /// Record a warning but still emit the value.
+    Warn,
+    /// Silently drop the field.
+    Skip,
+}
+
+impl ValidationPolicy {
+    /// Read the policy from a target's `onValidation` option (default `fail`).
+    fn from_options(options: &HashMap<String, String>) -> Self {
+        match options.get("onValidation").map(String::as_str) {
+            Some("warn") => Self::Warn,
+            Some("skip") => Self::Skip,
+            _ => Self::Fail,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,6 +142,7 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
         global_output: DynValue::Object(Vec::new()),
         field_modifiers: HashMap::new(),
         source_format,
+        validation_policy: ValidationPolicy::from_options(&transform.target.options),
     };
 
     // 2. Build output object
@@ -335,6 +360,7 @@ fn execute_multi_record(
         global_output: DynValue::Object(Vec::new()),
         field_modifiers: HashMap::new(),
         source_format: source_format.to_string(),
+        validation_policy: ValidationPolicy::from_options(&transform.target.options),
     };
 
     let mut output = DynValue::Object(Vec::new());
@@ -556,11 +582,25 @@ fn process_segment_body(segment: &TransformSegment, ctx: &mut ExecContext, outpu
             let mut result_items = Vec::new();
             let len = items.len() as i64;
             let is_value_only = segment.mappings.iter().all(|m| m.target == "_");
+            // `:counter name` exposes the loop index by name; `:as alias`
+            // exposes the current item under an alias path.
+            let counter_name = segment.directives.iter()
+                .find(|d| d.directive_type == "counter")
+                .and_then(|d| d.value.clone());
+            let loop_alias = segment.directives.iter()
+                .find(|d| d.directive_type == "as")
+                .and_then(|d| d.value.clone());
             for (idx, item) in items.iter().enumerate() {
                 // Set loop variables
                 ctx.loop_vars.insert("_item".to_string(), item.clone());
                 ctx.loop_vars.insert("_index".to_string(), DynValue::Integer(idx as i64));
                 ctx.loop_vars.insert("_length".to_string(), DynValue::Integer(len));
+                if let Some(ref c) = counter_name {
+                    ctx.loop_vars.insert(c.clone(), DynValue::Integer(idx as i64));
+                }
+                if let Some(ref a) = loop_alias {
+                    ctx.loop_vars.insert(a.clone(), item.clone());
+                }
 
                 let mut item_output = DynValue::Object(Vec::new());
                 for mapping in &segment.mappings {
@@ -604,9 +644,17 @@ fn process_segment_body(segment: &TransformSegment, ctx: &mut ExecContext, outpu
                 ctx.loop_vars.remove("_item");
                 ctx.loop_vars.remove("_index");
                 ctx.loop_vars.remove("_length");
+                if let Some(ref c) = counter_name {
+                    ctx.loop_vars.remove(c);
+                }
+                if let Some(ref a) = loop_alias {
+                    ctx.loop_vars.remove(a);
+                }
             }
             let array_val = DynValue::Array(result_items);
-            if is_root {
+            if is_internal {
+                // Computation-only sink: ran for side effects, emit nothing.
+            } else if is_root {
                 *output = array_val;
             } else {
                 set_path(output, clean_name, array_val);
@@ -741,9 +789,34 @@ fn process_mapping(
     output: &mut DynValue,
     path_prefix: &str,
 ) {
-    // Pass the current output so expressions can reference previously-set fields.
-    // Reborrow output as shared — evaluate_expression only reads from it.
-    let value = evaluate_expression(&mapping.expression, ctx, current_source, &*output);
+    // Field-level :if / :unless — drop the field when the condition fails.
+    if let Some(dir) = mapping.directives.iter().find(|d| d.name == "if") {
+        if let Some(crate::types::values::DirectiveValue::String(cond)) = &dir.value {
+            if !evaluate_field_condition(cond, ctx, current_source) {
+                return;
+            }
+        }
+    }
+    if let Some(dir) = mapping.directives.iter().find(|d| d.name == "unless") {
+        if let Some(crate::types::values::DirectiveValue::String(cond)) = &dir.value {
+            if evaluate_field_condition(cond, ctx, current_source) {
+                return;
+            }
+        }
+    }
+
+    // :object builds a structural object from an inline `{k = @path, ...}` spec.
+    let value = if let Some(dir) = mapping.directives.iter().find(|d| d.name == "object") {
+        if let Some(crate::types::values::DirectiveValue::String(spec)) = &dir.value {
+            Ok(build_inline_object(spec, ctx, current_source, &*output))
+        } else {
+            Ok(DynValue::Object(Vec::new()))
+        }
+    } else {
+        // Pass the current output so expressions can reference previously-set fields.
+        // Reborrow output as shared — evaluate_expression only reads from it.
+        evaluate_expression(&mapping.expression, ctx, current_source, &*output)
+    };
 
     match value {
         Ok(val) => {
@@ -766,6 +839,25 @@ fn process_mapping(
                 apply_type_directives(val, &type_dirs)
             };
 
+            // Validation modifiers: :validate, :enum, :range (honors onValidation policy).
+            if !validate_field_value(&val, mapping, ctx) {
+                return;
+            }
+
+            // :raw — parse a JSON string into a structural value.
+            let val = if mapping.directives.iter().any(|d| d.name == "raw") {
+                parse_raw_json_value(val)
+            } else {
+                val
+            };
+
+            // :array — wrap the value in a single-element array.
+            let val = if mapping.directives.iter().any(|d| d.name == "array") {
+                DynValue::Array(vec![val])
+            } else {
+                val
+            };
+
             // Apply confidential modifiers at the mapping level if needed
             let final_val = if let Some(ref mods) = mapping.modifiers {
                 if mods.confidential {
@@ -786,7 +878,7 @@ fn process_mapping(
             }
             // Record field modifiers for ODIN/XML formatter (using full path)
             if let Some(ref mods) = mapping.modifiers {
-                if mods.confidential || mods.required || mods.deprecated || mods.attr || mods.ns.is_some() {
+                if mods.confidential || mods.required || mods.deprecated || mods.attr || mods.cdata || mods.ns.is_some() {
                     let full_key = if path_prefix.is_empty() {
                         mapping.target.clone()
                     } else {
@@ -803,6 +895,205 @@ fn process_mapping(
                 path: Some(mapping.target.clone()),
                 code: code.map(|c| c.to_string()),
             });
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Field-level directive helpers (:if, :object, :validate, :raw)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Evaluate a field `:if` / `:unless` condition. The left path resolves against
+/// the current loop item when present, falling back to the root source.
+fn evaluate_field_condition(condition: &str, ctx: &ExecContext, current_source: &DynValue) -> bool {
+    let trimmed = condition.trim();
+    if let Some((path, op, value_part)) = split_condition(trimmed) {
+        let left = resolve_field_path(path, ctx, current_source);
+        let right = parse_condition_literal(value_part);
+        return crate::transform::verbs::compare_values(&left, op, &right);
+    }
+    is_truthy(&resolve_field_path(trimmed, ctx, current_source))
+}
+
+/// Resolve a condition path against the loop item / current source, then source.
+fn resolve_field_path(path: &str, ctx: &ExecContext, current_source: &DynValue) -> DynValue {
+    if let Some(v) = lookup_loop_var(&ctx.loop_vars, path) {
+        return v;
+    }
+    if path.starts_with('.') || path.starts_with("@.") {
+        return resolve_path(current_source, path, &ctx.constants, &ctx.accumulators);
+    }
+    let from_current = resolve_path(current_source, path, &ctx.constants, &ctx.accumulators);
+    if !matches!(from_current, DynValue::Null) {
+        return from_current;
+    }
+    resolve_path(ctx.source, path, &ctx.constants, &ctx.accumulators)
+}
+
+/// Build a structural object from an inline `:object {k = @path, ...}` spec.
+fn build_inline_object(
+    spec: &str,
+    ctx: &mut ExecContext,
+    current_source: &DynValue,
+    current_output: &DynValue,
+) -> DynValue {
+    let trimmed = spec.trim().trim_start_matches('{').trim_end_matches('}');
+    let mut obj = DynValue::Object(Vec::new());
+    if trimmed.trim().is_empty() {
+        return obj;
+    }
+    for pair in split_object_pairs(trimmed) {
+        let eq = match pair.find('=') {
+            Some(i) => i,
+            None => continue,
+        };
+        let key = pair[..eq].trim();
+        let rhs = pair[eq + 1..].trim();
+        if key.is_empty() {
+            continue;
+        }
+        let expr = crate::transform::parser::parse_value_expression(rhs);
+        match evaluate_expression(&expr, ctx, current_source, current_output) {
+            Ok(v) => set_path(&mut obj, key, v),
+            Err(_) => set_path(&mut obj, key, DynValue::Null),
+        }
+    }
+    obj
+}
+
+/// Split an inline-object body on commas that are not nested inside braces.
+fn split_object_pairs(body: &str) -> Vec<String> {
+    let mut pairs = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in body.chars() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                pairs.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    if !current.trim().is_empty() {
+        pairs.push(current);
+    }
+    pairs
+}
+
+/// Parse a string value as JSON for `:raw`, producing a structural value.
+fn parse_raw_json_value(value: DynValue) -> DynValue {
+    if let DynValue::String(ref s) = value {
+        if let Ok(parsed) = crate::utils::json_parser::parse_json(s) {
+            return parsed;
+        }
+    }
+    value
+}
+
+/// Render a `DynValue` as a plain string for validation comparisons.
+fn dyn_to_plain_string(value: &DynValue) -> String {
+    match value {
+        DynValue::String(s) | DynValue::Reference(s) | DynValue::Binary(s)
+        | DynValue::Date(s) | DynValue::Timestamp(s) | DynValue::Time(s)
+        | DynValue::Duration(s) | DynValue::FloatRaw(s) | DynValue::CurrencyRaw(s, _, _) => s.clone(),
+        DynValue::Integer(n) => n.to_string(),
+        DynValue::Float(n) | DynValue::Currency(n, _, _) | DynValue::Percent(n) => n.to_string(),
+        DynValue::Bool(b) => b.to_string(),
+        DynValue::Null => String::new(),
+        _ => String::new(),
+    }
+}
+
+/// Validate a value against `:validate` / `:enum` / `:range` directives.
+/// Returns `false` when the field must be dropped (onValidation = skip).
+fn validate_field_value(value: &DynValue, mapping: &FieldMapping, ctx: &mut ExecContext) -> bool {
+    let has_validation = mapping.directives.iter()
+        .any(|d| matches!(d.name.as_str(), "validate" | "enum" | "range"));
+    if !has_validation || matches!(value, DynValue::Null) {
+        return true;
+    }
+
+    let policy = ctx.validation_policy.clone();
+    let mut failures: Vec<String> = Vec::new();
+
+    if let Some(dir) = mapping.directives.iter().find(|d| d.name == "validate") {
+        if let Some(crate::types::values::DirectiveValue::String(pattern)) = &dir.value {
+            let s = dyn_to_plain_string(value);
+            #[cfg(feature = "regex")]
+            {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => {
+                        if !re.is_match(&s) {
+                            failures.push(format!("value '{s}' does not match pattern '{pattern}'"));
+                        }
+                    }
+                    Err(_) => failures.push(format!("invalid validation pattern '{pattern}'")),
+                }
+            }
+            #[cfg(not(feature = "regex"))]
+            {
+                let _ = (&s, pattern);
+            }
+        }
+    }
+
+    if let Some(dir) = mapping.directives.iter().find(|d| d.name == "enum") {
+        if let Some(crate::types::values::DirectiveValue::String(list)) = &dir.value {
+            let allowed: Vec<String> = list
+                .split(',')
+                .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                .collect();
+            let s = dyn_to_plain_string(value);
+            if !allowed.iter().any(|a| a == &s) {
+                failures.push(format!("value '{}' is not one of [{}]", s, allowed.join(", ")));
+            }
+        }
+    }
+
+    if let Some(dir) = mapping.directives.iter().find(|d| d.name == "range") {
+        if let Some(crate::types::values::DirectiveValue::String(range_str)) = &dir.value {
+            let mut parts = range_str.splitn(2, "..");
+            let min = parts.next().and_then(|p| p.trim().parse::<f64>().ok());
+            let max = parts.next().and_then(|p| p.trim().parse::<f64>().ok());
+            match value.as_f64() {
+                Some(num) => {
+                    if min.is_some_and(|m| num < m) || max.is_some_and(|m| num > m) {
+                        failures.push(format!("value {num} is outside range {range_str}"));
+                    }
+                }
+                None => failures.push(format!(
+                    "value '{}' is not numeric for range {range_str}",
+                    dyn_to_plain_string(value)
+                )),
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        return true;
+    }
+
+    let message = format!("Validation failed for '{}': {}", mapping.target, failures.join("; "));
+    match policy {
+        ValidationPolicy::Warn => {
+            ctx.warnings.push(TransformWarning {
+                message,
+                path: Some(mapping.target.clone()),
+            });
+            true
+        }
+        ValidationPolicy::Skip => false,
+        ValidationPolicy::Fail => {
+            ctx.errors.push(TransformError {
+                message,
+                path: Some(mapping.target.clone()),
+                code: Some(crate::types::transform::transform_error_codes::T013_VALIDATION_FAILED.to_string()),
+            });
+            false
         }
     }
 }
@@ -843,6 +1134,10 @@ fn evaluate_expression(
                 if let Some(len) = ctx.loop_vars.get("_length") {
                     return Ok(len.clone());
                 }
+            }
+            // Named loop variables (`:counter name`, `:as alias`) are readable by name.
+            if let Some(v) = lookup_loop_var(&ctx.loop_vars, path) {
+                return Ok(v);
             }
             // Try current segment output first for local field references, then source
             Ok(resolve_path_with_output(current_source, current_output, &ctx.global_output, path, &ctx.constants, &ctx.accumulators))
@@ -994,6 +1289,8 @@ fn evaluate_verb_arg(
                 } else {
                     resolve_path_with_output(current_source, current_output, &ctx.global_output, path, &ctx.constants, &ctx.accumulators)
                 }
+            } else if let Some(v) = lookup_loop_var(&ctx.loop_vars, path) {
+                v
             } else {
                 resolve_path_with_output(current_source, current_output, &ctx.global_output, path, &ctx.constants, &ctx.accumulators)
             };
@@ -1030,6 +1327,24 @@ fn evaluate_verb_arg(
             execute_verb_call(nested_call, ctx, current_source, current_output)
         }
     }
+}
+
+/// Resolve a reference path against the named loop variables (`:counter`/`:as`).
+///
+/// Handles a bare variable name (e.g. `@rownum` -> `rownum`) and the
+/// accumulator-style reference (`@$accumulator.rownum`) that the spec allows
+/// for reading a loop counter.
+fn lookup_loop_var(loop_vars: &HashMap<String, DynValue>, path: &str) -> Option<DynValue> {
+    let clean = path.strip_prefix('@').unwrap_or(path);
+    let name = clean
+        .strip_prefix("$accumulator.")
+        .or_else(|| clean.strip_prefix("$accumulators."))
+        .unwrap_or(clean);
+    // Only bare names (no nested path) map to loop variables.
+    if name.is_empty() || name.contains('.') || name.contains('[') {
+        return None;
+    }
+    loop_vars.get(name).cloned()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2410,6 +2725,7 @@ mod tests {
                     deprecated: false,
                     attr: false,
                     ns: None,
+                    cdata: false,
                 }),
             },
             FieldMapping {
@@ -2448,6 +2764,7 @@ mod tests {
                     deprecated: false,
                     attr: false,
                     ns: None,
+                    cdata: false,
                 }),
             },
         ]);
@@ -2860,6 +3177,7 @@ mod tests {
             deprecated,
             attr: false,
             ns: None,
+            cdata: false,
         }
     }
 
@@ -8676,19 +8994,19 @@ mod extended_tests {
     }
 
     fn confidential_mods() -> OdinModifiers {
-        OdinModifiers { required: false, confidential: true, deprecated: false, attr: false, ns: None }
+        OdinModifiers { required: false, confidential: true, deprecated: false, attr: false, ns: None, cdata: false }
     }
 
     fn required_mods() -> OdinModifiers {
-        OdinModifiers { required: true, confidential: false, deprecated: false, attr: false, ns: None }
+        OdinModifiers { required: true, confidential: false, deprecated: false, attr: false, ns: None, cdata: false }
     }
 
     fn deprecated_mods() -> OdinModifiers {
-        OdinModifiers { required: false, confidential: false, deprecated: true, attr: false, ns: None }
+        OdinModifiers { required: false, confidential: false, deprecated: true, attr: false, ns: None, cdata: false }
     }
 
     fn all_mods() -> OdinModifiers {
-        OdinModifiers { required: true, confidential: true, deprecated: true, attr: false, ns: None }
+        OdinModifiers { required: true, confidential: true, deprecated: true, attr: false, ns: None, cdata: false }
     }
 
     fn src_obj(fields: Vec<(&str, DynValue)>) -> DynValue {
@@ -10528,7 +10846,7 @@ mod extended_tests {
 
     #[test]
     fn ext_conf_redact_with_required_modifier() {
-        let mods = OdinModifiers { required: true, confidential: true, deprecated: false, attr: false, ns: None };
+        let mods = OdinModifiers { required: true, confidential: true, deprecated: false, attr: false, ns: None, cdata: false };
         let mut t = mk_transform(vec![modifiers_field("SSN", "@.ssn", mods)]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let result = execute(&t, &src_obj(vec![("ssn", s("123-45-6789"))]));
@@ -11005,7 +11323,7 @@ mod extended_tests_2 {
     }
 
     fn make_modifiers(required: bool, confidential: bool, deprecated: bool) -> crate::types::values::OdinModifiers {
-        crate::types::values::OdinModifiers { required, confidential, deprecated, attr: false, ns: None }
+        crate::types::values::OdinModifiers { required, confidential, deprecated, attr: false, ns: None, cdata: false }
     }
 
     fn verb_mapping(target: &str, verb: &str, args: Vec<VerbArg>) -> FieldMapping {
@@ -12509,6 +12827,160 @@ mod extended_tests_2 {
         assert!(!r.success);
         assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T012")));
     }
+
+    // ── Wave-3 transform directives ───────────────────────────────────────────
+
+    // `:object` builds a nested object from an inline `{k = @path}` spec.
+    #[test]
+    fn field_object_builds_nested_object() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{Quote}\ncontact = \":object {name = @insured.name, phone = @insured.phone}\"\n",
+        );
+        let source = json_obj(vec![(
+            "insured",
+            json_obj(vec![("name", s("John Doe")), ("phone", s("512-555-1234"))]),
+        )]);
+        let r = parse_and_exec(&text, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let contact = r.output.unwrap().get("Quote").unwrap().get("contact").unwrap().clone();
+        assert_eq!(contact.get("name"), Some(&s("John Doe")));
+        assert_eq!(contact.get("phone"), Some(&s("512-555-1234")));
+    }
+
+    // `:raw` parses a JSON string into a structural value.
+    #[test]
+    fn field_raw_emits_structural_json() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{Document}\nmetadata = \"@document.jsonMetadata :raw\"\n",
+        );
+        let source = json_obj(vec![(
+            "document",
+            json_obj(vec![("jsonMetadata", s("{\"version\":2,\"active\":true}"))]),
+        )]);
+        let r = parse_and_exec(&text, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let meta = r.output.unwrap().get("Document").unwrap().get("metadata").unwrap().clone();
+        assert_eq!(meta.get("version"), Some(&i(2)));
+        assert_eq!(meta.get("active"), Some(&b(true)));
+    }
+
+    // `:array` wraps the value in a single-element array.
+    #[test]
+    fn field_array_wraps_value() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{Policy}\ncodes = \"@policy.primaryCode :array\"\n",
+        );
+        let source = json_obj(vec![("policy", json_obj(vec![("primaryCode", s("COLL"))]))]);
+        let r = parse_and_exec(&text, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let codes = r.output.unwrap().get("Policy").unwrap().get("codes").unwrap().clone();
+        assert_eq!(codes, DynValue::Array(vec![s("COLL")]));
+    }
+
+    // Field `:if path = value` emits only when the comparison holds.
+    #[test]
+    fn field_if_comparison_filters() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{Quote}\ndiscount = \"@policy.discount :if @policy.tier = gold\"\nsurcharge = \"@policy.surcharge :if @policy.tier = bronze\"\n",
+        );
+        let source = json_obj(vec![(
+            "policy",
+            json_obj(vec![("tier", s("gold")), ("discount", i(15)), ("surcharge", i(40))]),
+        )]);
+        let r = parse_and_exec(&text, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let quote = r.output.unwrap().get("Quote").unwrap().clone();
+        assert_eq!(quote.get("discount"), Some(&i(15)));
+        assert!(quote.get("surcharge").is_none());
+    }
+
+    // `:counter` exposes the loop index by name and via `@$accumulator`.
+    #[test]
+    fn loop_counter_readable() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{rows[]}\n:loop items\n:counter rownum\nn = \"@rownum\"\nm = \"@$accumulator.rownum\"\n",
+        );
+        let source = json_obj(vec![(
+            "items",
+            DynValue::Array(vec![
+                json_obj(vec![("sku", s("A"))]),
+                json_obj(vec![("sku", s("B"))]),
+            ]),
+        )]);
+        let r = parse_and_exec(&text, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let rows = r.output.unwrap().get("rows").unwrap().clone();
+        let second = rows.get_index(1).unwrap().clone();
+        assert_eq!(second.get("n"), Some(&i(1)));
+        assert_eq!(second.get("m"), Some(&i(1)));
+    }
+
+    // A `_`-prefixed looping computation section runs but emits nothing.
+    #[test]
+    fn computation_sink_loop_omitted() {
+        let text = format!(
+            "{}{}",
+            "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"json->json\"\ntarget.format = \"json\"\n\n{$accumulator}\ntotal = ##0\n\n",
+            "{_sumItems[]}\n:loop items\n_ = \"%accumulate total @.amount\"\n\n{Summary}\ntotal = \"@$accumulator.total\"\n",
+        );
+        let source = json_obj(vec![(
+            "items",
+            DynValue::Array(vec![
+                json_obj(vec![("amount", i(10))]),
+                json_obj(vec![("amount", i(20))]),
+                json_obj(vec![("amount", i(30))]),
+            ]),
+        )]);
+        let r = parse_and_exec(&text, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let out = r.output.unwrap();
+        assert!(out.get("_sumItems").is_none());
+        assert_eq!(out.get("Summary").unwrap().get("total"), Some(&i(60)));
+    }
+
+    // `:enum` / `:range` validation under onValidation = warn still emits.
+    #[test]
+    fn validation_warn_emits_and_warns() {
+        let text = format!(
+            "{}{}",
+            "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"json->json\"\ntarget.format = \"json\"\ntarget.onValidation = \"warn\"\n\n",
+            "{Record}\nstatus = \"@record.status :enum A,P,C\"\nyear = \"@record.year :range 1900..2100\"\n",
+        );
+        let source = json_obj(vec![(
+            "record",
+            json_obj(vec![("status", s("Z")), ("year", i(1850))]),
+        )]);
+        let r = parse_and_exec(&text, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let rec = r.output.unwrap().get("Record").unwrap().clone();
+        assert_eq!(rec.get("status"), Some(&s("Z")));
+        assert_eq!(rec.get("year"), Some(&i(1850)));
+        assert!(r.warnings.len() >= 2);
+    }
+
+    // `:enum` validation under the default (fail) policy raises T013 and drops the field.
+    #[test]
+    fn validation_fail_raises_t013() {
+        let text = format!(
+            "{}{}",
+            header(),
+            "{Record}\nstatus = \"@record.status :enum A,P,C\"\n",
+        );
+        let source = json_obj(vec![("record", json_obj(vec![("status", s("Z"))]))]);
+        let r = parse_and_exec(&text, &source);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T013")));
+    }
 }
 
 // XML target: emitTypeHints suppression and :ns namespace prefixing.
@@ -12640,5 +13112,26 @@ mod xml_namespace_typehints_tests {
         assert!(xml.contains("<p:Amount"), "prefixed element missing in:\n{xml}");
         assert!(!xml.contains("odin:"), "odin: prefix leaked in:\n{xml}");
         assert!(xml.contains("9.99"), "currency value missing in:\n{xml}");
+    }
+
+    // `:cdata` wraps element text in a CDATA section instead of escaping it.
+    #[test]
+    fn xml_cdata_wraps_element_text() {
+        let transform = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->xml\"\ntarget.format = \"xml\"\ntarget.emitTypeHints = ?false\n\n{Policy}\nDescription = \"@policy.description :cdata\"\n";
+        let source = DynValue::Object(vec![(
+            "policy".to_string(),
+            DynValue::Object(vec![(
+                "description".to_string(),
+                DynValue::String("premium < 500 & deductible > 0".to_string()),
+            )]),
+        )]);
+        let r = parse_and_exec(transform, &source);
+        assert!(r.success, "errors: {:?}", r.errors);
+        let xml = r.formatted.unwrap();
+        assert!(
+            xml.contains("<![CDATA[premium < 500 & deductible > 0]]>"),
+            "CDATA section missing in:\n{xml}"
+        );
+        assert!(!xml.contains("&lt;"), "text was escaped instead of CDATA:\n{xml}");
     }
 }

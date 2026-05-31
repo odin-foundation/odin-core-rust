@@ -554,11 +554,11 @@ bool = "@.boolVal"
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn json_import_quoted_verb_is_literal_string() {
-    // A quoted string that starts with % should be treated as a literal string,
-    // NOT parsed as a verb expression. Only bare (unquoted) %verb lines are verbs.
+fn json_import_quoted_verb_executes() {
+    // A quoted string that starts with % is parsed as a verb expression, the
+    // same as a bare %verb line — quoting does not turn it into a literal.
     let input = DynValue::Object(vec![
-        ("value".into(), DynValue::String("hello".into())),
+        ("value".into(), DynValue::String("  hello  ".into())),
     ]);
     let t = r#"{$}
 odin = "1.0.0"
@@ -573,10 +573,10 @@ bare_verb = %trim @.value
     let output = run_transform(t, input);
     // bare_copy should resolve the reference
     assert_eq!(get_output_value(&output, "output", "bare_copy"),
-        Some(&DynValue::String("hello".into())));
-    // quoted_verb should be a literal string, not a verb call
+        Some(&DynValue::String("  hello  ".into())));
+    // quoted_verb executes the trim verb
     assert_eq!(get_output_value(&output, "output", "quoted_verb"),
-        Some(&DynValue::String("%trim @.value".into())));
+        Some(&DynValue::String("hello".into())));
     // bare_verb should execute the trim verb
     assert_eq!(get_output_value(&output, "output", "bare_verb"),
         Some(&DynValue::String("hello".into())));

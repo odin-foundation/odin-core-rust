@@ -153,6 +153,7 @@ mod tests {
             deprecated: true,
             attr: false,
             ns: None,
+            cdata: false,
         };
         let doc = OdinDocumentBuilder::new()
             .set("field", OdinValues::string("val").with_modifiers(mods))

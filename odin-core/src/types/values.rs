@@ -38,6 +38,8 @@ pub struct OdinModifiers {
     pub attr: bool,
     /// XML namespace prefix for the element (`:ns` modifier).
     pub ns: Option<String>,
+    /// Wrap XML element text in a CDATA section (`:cdata` modifier).
+    pub cdata: bool,
 }
 
 impl OdinModifiers {
@@ -995,6 +997,7 @@ mod tests {
             deprecated: false,
             attr: false,
             ns: None,
+            cdata: false,
         };
         let val = OdinValues::string("secret").with_modifiers(mods);
         assert!(val.is_required());
@@ -1480,6 +1483,7 @@ mod tests {
             deprecated: true,
             attr: true,
             ns: None,
+            cdata: false,
         };
         let v = OdinValues::string("x").with_modifiers(mods);
         assert!(v.is_required());

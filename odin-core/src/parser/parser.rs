@@ -107,8 +107,8 @@ fn parse_inline_header_directive(header: &str) -> Option<(&str, String, String)>
             let value = rest.strip_prefix('"')?.strip_suffix('"')?;
             Some((name, "_type".to_string(), value.to_string()))
         }
-        "if" | "elif" => {
-            // Unquoted expression — capture everything up to the closing brace.
+        "if" | "elif" | "loop" | "counter" | "from" => {
+            // Unquoted expression/value — capture everything up to the closing brace.
             if rest.is_empty() { return None; }
             Some((name, format!("_{keyword}"), rest.to_string()))
         }
@@ -230,6 +230,11 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 b'@' => match self.parse_top_directive() {
+                    StepResult::Ok => {}
+                    StepResult::Bail => return Err(bail_to_err(line, col)),
+                    StepResult::Err(e) => return Err(e),
+                },
+                b':' if self.is_bare_directive_line() => match self.parse_bare_directive() {
                     StepResult::Ok => {}
                     StepResult::Bail => return Err(bail_to_err(line, col)),
                     StepResult::Err(e) => return Err(e),
@@ -612,6 +617,73 @@ impl<'a> Parser<'a> {
                 b';' => self.skip_comment(),
                 b'\n' => return StepResult::Ok,
                 _ => return StepResult::Bail,
+            }
+        }
+        StepResult::Ok
+    }
+
+    /// True when the current `:` begins a bare segment-directive line
+    /// (`:loop`, `:counter`, `:from`, `:if`, `:elif`, `:else`, `:literal`).
+    fn is_bare_directive_line(&self) -> bool {
+        let mut i = self.pos + 1;
+        while i < self.bytes.len() && (self.bytes[i] == b' ' || self.bytes[i] == b'\t') {
+            i += 1;
+        }
+        let name_start = i;
+        while i < self.bytes.len() && self.bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        matches!(
+            &self.source[name_start..i],
+            "loop" | "counter" | "from" | "if" | "elif" | "else" | "literal"
+        )
+    }
+
+    /// Parse a bare `:name rest-of-line` directive into a synthetic
+    /// `<header>._name = "rest"` assignment (mirrors the `_name = "..."` form).
+    fn parse_bare_directive(&mut self) -> StepResult {
+        self.pos += 1; // consume ':'
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
+            self.pos += 1;
+        }
+        let name_start = self.pos;
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_alphabetic() {
+            self.pos += 1;
+        }
+        let name = self.source[name_start..self.pos].to_string();
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] == b' ' || self.bytes[self.pos] == b'\t') {
+            self.pos += 1;
+        }
+        // Capture the value up to end-of-line / comment.
+        let val_start = self.pos;
+        while self.pos < self.bytes.len() && !matches!(self.bytes[self.pos], b'\n' | b'\r' | b';') {
+            self.pos += 1;
+        }
+        let value = self.source[val_start..self.pos].trim();
+        let value = if value.is_empty() { "true".to_string() } else { value.to_string() };
+
+        let full_path = match &self.current_header {
+            Some(h) if !h.is_empty() => format!("{h}._{name}"),
+            _ => format!("_{name}"),
+        };
+
+        // Trailing whitespace / comment / newline.
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b' ' | b'\t' | b'\r' => self.pos += 1,
+                b';' => self.skip_comment(),
+                b'\n' => break,
+                _ => return StepResult::Bail,
+            }
+        }
+
+        let synthetic = OdinValues::string(value);
+        if self.options.allow_duplicates {
+            self.assignments.insert(full_path, synthetic);
+        } else {
+            match self.assignments.entry(full_path) {
+                indexmap::map::Entry::Occupied(_) => {} // first occurrence wins
+                indexmap::map::Entry::Vacant(e) => { e.insert(synthetic); }
             }
         }
         StepResult::Ok

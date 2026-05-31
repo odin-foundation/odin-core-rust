@@ -540,6 +540,8 @@ pub mod transform_error_codes {
     pub const T011_INCOMPATIBLE_CONVERSION: &str = "T011";
     /// Conditional branch (`elif`/`else`) with no preceding `if`.
     pub const T012_DANGLING_BRANCH: &str = "T012";
+    /// Field value failed a `:validate` / `:enum` / `:range` constraint.
+    pub const T013_VALIDATION_FAILED: &str = "T013";
 }
 
 /// Build a T012 dangling-branch error (an `elif`/`else` with no preceding `if`).

@@ -928,6 +928,7 @@ mod tests {
             deprecated: true,
             attr: false,
             ns: None,
+            cdata: false,
         };
         let doc = OdinDocumentBuilder::new()
             .set("field", OdinValues::string("value").with_modifiers(mods))
@@ -946,6 +947,7 @@ mod tests {
             deprecated: false,
             attr: false,
             ns: None,
+            cdata: false,
         };
         let doc = OdinDocumentBuilder::new()
             .set("secret", OdinValues::string("xxx").with_modifiers(mods))
@@ -1254,6 +1256,7 @@ mod tests {
             deprecated: true,
             attr: false,
             ns: None,
+            cdata: false,
         };
         write_modifiers(&mut out, &mods);
         assert_eq!(out, "!*-");

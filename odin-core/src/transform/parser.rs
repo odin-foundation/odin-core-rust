@@ -403,11 +403,12 @@ fn merge_directive_modifiers(
     let has_req = directives.iter().any(|d| d.name == "required");
     let has_dep = directives.iter().any(|d| d.name == "deprecated");
     let has_attr = directives.iter().any(|d| d.name == "attr");
+    let has_cdata = directives.iter().any(|d| d.name == "cdata");
     let ns_prefix = directives.iter().find(|d| d.name == "ns").and_then(|d| match &d.value {
         Some(crate::types::values::DirectiveValue::String(s)) => Some(s.clone()),
         _ => None,
     });
-    if !has_conf && !has_req && !has_dep && !has_attr && ns_prefix.is_none() {
+    if !has_conf && !has_req && !has_dep && !has_attr && !has_cdata && ns_prefix.is_none() {
         return modifiers;
     }
     let mut m = modifiers.unwrap_or_default();
@@ -415,6 +416,7 @@ fn merge_directive_modifiers(
     if has_req { m.required = true; }
     if has_dep { m.deprecated = true; }
     if has_attr { m.attr = true; }
+    if has_cdata { m.cdata = true; }
     if ns_prefix.is_some() { m.ns = ns_prefix; }
     Some(m)
 }
@@ -508,6 +510,8 @@ fn build_segment(
     use crate::types::transform::SegmentItem;
 
     let mut source_path: Option<String> = None;
+    let mut loop_alias: Option<String> = None;
+    let mut counter: Option<String> = None;
     let mut discriminator: Option<Discriminator> = None;
     let mut pass: Option<usize> = None;
     let mut condition: Option<String> = None;
@@ -548,7 +552,20 @@ fn build_segment(
             // Directive field
             match field.as_str() {
                 "_loop" | "_from" => {
-                    source_path = Some(odin_value_to_string(&value));
+                    // A `:loop path :as alias` form carries an alias suffix.
+                    let raw = odin_value_to_string(&value);
+                    if let Some(as_pos) = raw.find(" :as ") {
+                        source_path = Some(raw[..as_pos].trim().to_string());
+                        let alias = raw[as_pos + 5..].trim();
+                        if !alias.is_empty() {
+                            loop_alias = Some(alias.to_string());
+                        }
+                    } else {
+                        source_path = Some(raw);
+                    }
+                }
+                "_counter" => {
+                    counter = Some(odin_value_to_string(&value).trim().to_string());
                 }
                 "_pass" => {
                     if let Some(n) = value.as_i64() {
@@ -650,6 +667,12 @@ fn build_segment(
     let mut directives = Vec::new();
     if let Some(ref sp) = source_path {
         directives.push(SegmentDirective::new("loop", Some(sp.clone())));
+    }
+    if let Some(ref alias) = loop_alias {
+        directives.push(SegmentDirective::new("as", Some(alias.clone())));
+    }
+    if let Some(ref c) = counter {
+        directives.push(SegmentDirective::new("counter", Some(c.clone())));
     }
     if let Some(p) = pass {
         directives.push(SegmentDirective::new("pass", Some(p.to_string())));
@@ -841,12 +864,23 @@ fn get_verb_arity(verb: &str) -> i32 {
 // Transform Expression Parser
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Parse a single value expression (`@path`, `%verb ...`, or a literal) into a
+/// `FieldExpression`. Used by the engine for inline `:object` specs.
+pub(crate) fn parse_value_expression(raw: &str) -> FieldExpression {
+    parse_string_expression_with_directives(raw).0
+}
+
 /// Parse a string value as a transform expression, also collecting any trailing
 /// directives (`:pos`, `:len`, `:leftPad`, etc.) that follow the expression.
 fn parse_string_expression_with_directives(raw: &str) -> (FieldExpression, Vec<crate::types::values::OdinDirective>) {
     let trimmed = raw.trim();
 
-    if trimmed.starts_with('%') {
+    if trimmed.starts_with(':') {
+        // Directives-only value (e.g. `:object {...}`, `:raw`) — the base
+        // expression is null and the directives drive the output.
+        let dirs = parse_remaining_directives(trimmed);
+        (FieldExpression::Literal(OdinValues::null()), dirs)
+    } else if trimmed.starts_with('%') {
         let (expr, consumed) = parse_verb_expression(trimmed);
         // Parse remaining directives after the verb expression
         let remaining = &trimmed[consumed..];
@@ -1109,10 +1143,61 @@ fn parse_extraction_directive(s: &str) -> (Option<crate::types::values::OdinDire
         return (None, 0);
     }
 
-    // Get directive name (after colon, until whitespace or end)
+    // Get directive name (after colon, until whitespace or `{` or end)
     let name_start = 1;
-    let name_end = s[name_start..].find(char::is_whitespace).map_or(s.len(), |p| p + name_start);
+    let name_end = s[name_start..]
+        .find(|c: char| c.is_whitespace() || c == '{')
+        .map_or(s.len(), |p| p + name_start);
     let name = &s[name_start..name_end];
+
+    // Behavioural directives with bespoke value capture (`:if`, `:object`, ...).
+    match name {
+        // Flag directives — no value.
+        "raw" | "array" | "cdata" => {
+            return (Some(OdinDirective { name: name.to_string(), value: None }), name_end);
+        }
+        // Condition / expression captured to end of string.
+        "if" | "unless" => {
+            let rest = s[name_end..].trim();
+            let value = if rest.is_empty() { None } else { Some(DirectiveValue::String(rest.to_string())) };
+            return (Some(OdinDirective { name: name.to_string(), value }), s.len());
+        }
+        // Inline object spec — capture the balanced `{...}` block.
+        "object" => {
+            let after = &s[name_end..];
+            let brace_start = after.find('{');
+            if let Some(bs) = brace_start {
+                let abs_start = name_end + bs;
+                if let Some(block_len) = balanced_brace_len(&s[abs_start..]) {
+                    let spec = &s[abs_start..abs_start + block_len];
+                    return (
+                        Some(OdinDirective { name: name.to_string(), value: Some(DirectiveValue::String(spec.to_string())) }),
+                        abs_start + block_len,
+                    );
+                }
+            }
+            return (Some(OdinDirective { name: name.to_string(), value: None }), s.len());
+        }
+        // Validation directives — single token (quoted for `:validate`).
+        "validate" | "enum" | "range" => {
+            let mut consumed = name_end;
+            while consumed < s.len() && s.as_bytes()[consumed].is_ascii_whitespace() {
+                consumed += 1;
+            }
+            if consumed >= s.len() {
+                return (Some(OdinDirective { name: name.to_string(), value: None }), consumed);
+            }
+            if s.as_bytes()[consumed] == b'"' {
+                let (qstr, qconsumed) = parse_quoted_string_arg(&s[consumed..]);
+                consumed += qconsumed;
+                return (Some(OdinDirective { name: name.to_string(), value: Some(DirectiveValue::String(qstr)) }), consumed);
+            }
+            let val_end = s[consumed..].find(char::is_whitespace).map_or(s.len(), |p| p + consumed);
+            let val_str = s[consumed..val_end].to_string();
+            return (Some(OdinDirective { name: name.to_string(), value: Some(DirectiveValue::String(val_str)) }), val_end);
+        }
+        _ => {}
+    }
 
     // Only consume directives that are recognized extraction/type/formatting directives
     let recognized = matches!(name, "pos" | "len" | "field" | "trim" | "type"
@@ -1183,6 +1268,37 @@ fn find_number_end(s: &str) -> usize {
         }
     }
     if i == 0 { s.len().min(1) } else { i }
+}
+
+/// Length of a balanced `{...}` block at the start of `s` (including braces),
+/// respecting nested braces and quoted strings. Returns `None` if unbalanced.
+fn balanced_brace_len(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_string => escape = true,
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => depth += 1,
+            b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse a quoted string argument, handling escape sequences.
@@ -1271,7 +1387,7 @@ fn value_to_field_expression_with_directives(value: &OdinValue) -> (FieldExpress
         // Verb expressions (%verb ...) must be bare (unquoted) to be treated as verbs.
         OdinValue::String { value: s, .. } => {
             let trimmed = s.trim();
-            if trimmed.starts_with('@') {
+            if trimmed.starts_with('@') || trimmed.starts_with('%') || trimmed.starts_with(':') {
                 parse_string_expression_with_directives(trimmed)
             } else {
                 (FieldExpression::Literal(value.clone()), Vec::new())
@@ -1753,6 +1869,7 @@ mod tests {
             deprecated: false,
             attr: false,
             ns: None,
+            cdata: false,
         };
         let doc = OdinDocumentBuilder::new()
             .set_with_modifiers(

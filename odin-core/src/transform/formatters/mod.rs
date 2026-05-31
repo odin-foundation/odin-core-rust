@@ -527,12 +527,34 @@ fn xml_write_element_full(
                 }
             }
             output.push('>');
-            output.push_str(&xml_value_text(value));
+            // :cdata wraps the text in a CDATA section instead of escaping it.
+            let is_cdata = modifiers.get(section_key).is_some_and(|m| m.cdata);
+            if is_cdata {
+                output.push_str(&xml_cdata_text(value));
+            } else {
+                output.push_str(&xml_value_text(value));
+            }
             output.push_str("</");
             output.push_str(tag);
             output.push_str(">\n");
         }
     }
+}
+
+/// Render scalar text wrapped in a CDATA section, splitting any embedded
+/// terminator so the section stays well-formed.
+fn xml_cdata_text(value: &DynValue) -> String {
+    let raw = match value {
+        DynValue::String(s) | DynValue::Reference(s) | DynValue::Binary(s)
+        | DynValue::Date(s) | DynValue::Timestamp(s) | DynValue::Time(s)
+        | DynValue::Duration(s) | DynValue::FloatRaw(s) | DynValue::CurrencyRaw(s, _, _) => s.clone(),
+        DynValue::Integer(n) => n.to_string(),
+        DynValue::Float(n) | DynValue::Percent(n) => format_float(*n),
+        DynValue::Currency(n, dp, _) => format!("{:.prec$}", n, prec = *dp as usize),
+        DynValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        DynValue::Null | DynValue::Array(_) | DynValue::Object(_) => String::new(),
+    };
+    format!("<![CDATA[{}]]>", raw.replace("]]>", "]]]]><![CDATA[>"))
 }
 
 fn xml_escape(s: &str) -> String {
@@ -786,6 +808,8 @@ pub fn format_fixed_width_from_segments(
 ) -> String {
     let line_ending = options.get("lineEnding").map_or("\n", std::string::String::as_str);
     let default_pad = options.get("padChar").map_or(" ", std::string::String::as_str);
+    // Optional fixed record width: each line is padded to `lineWidth` with padChar.
+    let line_width: Option<usize> = options.get("lineWidth").and_then(|v| v.parse().ok());
     let mut lines: Vec<String> = Vec::new();
 
     for segment in segments {
@@ -809,12 +833,12 @@ pub fn format_fixed_width_from_segments(
             Some(DynValue::Array(items)) => {
                 for item in items {
                     if let DynValue::Object(fields) = &item {
-                        lines.push(format_fwf_line(&segment.mappings, fields, default_pad));
+                        lines.push(pad_fwf_line(format_fwf_line(&segment.mappings, fields, default_pad), line_width, default_pad));
                     }
                 }
             }
             Some(DynValue::Object(fields)) => {
-                lines.push(format_fwf_line(&segment.mappings, fields, default_pad));
+                lines.push(pad_fwf_line(format_fwf_line(&segment.mappings, fields, default_pad), line_width, default_pad));
             }
             _ => {
                 // Try to get data from output directly (segment name is the top-level key)
@@ -824,12 +848,12 @@ pub fn format_fixed_width_from_segments(
                             DynValue::Array(items) => {
                                 for item in items {
                                     if let DynValue::Object(fields) = item {
-                                        lines.push(format_fwf_line(&segment.mappings, fields, default_pad));
+                                        lines.push(pad_fwf_line(format_fwf_line(&segment.mappings, fields, default_pad), line_width, default_pad));
                                     }
                                 }
                             }
                             DynValue::Object(fields) => {
-                                lines.push(format_fwf_line(&segment.mappings, fields, default_pad));
+                                lines.push(pad_fwf_line(format_fwf_line(&segment.mappings, fields, default_pad), line_width, default_pad));
                             }
                             _ => {}
                         }
@@ -840,6 +864,21 @@ pub fn format_fixed_width_from_segments(
     }
 
     lines.join(line_ending)
+}
+
+/// Pad (or truncate) a fixed-width line to the configured record width.
+fn pad_fwf_line(mut line: String, line_width: Option<usize>, pad_char: &str) -> String {
+    if let Some(width) = line_width {
+        let pad = pad_char.chars().next().unwrap_or(' ');
+        if line.len() < width {
+            for _ in 0..width - line.len() {
+                line.push(pad);
+            }
+        } else if line.len() > width {
+            line.truncate(width);
+        }
+    }
+    line
 }
 
 /// Resolve segment data from the output object.
