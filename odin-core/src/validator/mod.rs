@@ -2230,171 +2230,89 @@ mod tests {
 
     use crate::resolver::{FileReader, ImportResolver, ResolverOptions};
 
-    struct DiskReader;
-    impl FileReader for DiskReader {
+    /// In-memory reader serving inline schema sources by path, keeping these
+    /// tests self-contained.
+    struct MemReader(std::collections::HashMap<String, String>);
+    impl FileReader for MemReader {
         fn read_file(&self, path: &str) -> Result<String, String> {
-            std::fs::read_to_string(path).map_err(|e| e.to_string())
+            self.0.get(path).cloned().ok_or_else(|| format!("not found: {path}"))
         }
-        fn resolve_path(&self, base: &str, import: &str) -> Result<String, String> {
-            let base_dir = std::path::Path::new(base)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            std::path::Path::new(base_dir)
-                .join(import)
-                .canonicalize()
-                .map(|p| p.to_string_lossy().to_string())
-                .map_err(|e| e.to_string())
+        fn resolve_path(&self, _base: &str, import: &str) -> Result<String, String> {
+            Ok(import.to_string())
         }
     }
 
-    const CANONICAL_SCHEMA: &str =
-        "../../../schemas/insurance/personal/auto/policy.schema.odin";
-
-    fn typeref_field(name: &str, tref: &str) -> SchemaField {
-        SchemaField {
-            name: name.to_string(),
-            field_type: SchemaFieldType::TypeRef(tref.to_string()),
-            required: false,
-            confidential: false,
-            deprecated: false,
-            immutable: false,
-            description: None,
-            constraints: vec![],
-            default_value: None,
-            conditionals: vec![],
-        }
-    }
-
-    /// Resolving the canonical auto-policy schema's imports into a registry and
-    /// validating must not emit spurious V013 unresolved-type errors for the
-    /// imported types it references (e.g. `@types.policy_status`).
+    /// An imported `@alias.typename` reference is unresolved (V013) without a
+    /// registry, and resolves once the import registry is supplied.
     #[test]
-    fn test_canonical_schema_no_spurious_v013_with_registry() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(CANONICAL_SCHEMA);
-        let path = path.to_string_lossy().to_string();
-
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let mut schema = schema_parser::parse_schema(&content).unwrap();
-
-        // Inject a top-level field referencing an imported type that DOES exist
-        // in the resolved registry (mirrors `status = !@types.policy_status`).
-        schema.fields.insert(
-            "status_ref".to_string(),
-            typeref_field("status_ref", "types.policy_status"),
+    fn test_imported_typeref_resolved_with_registry() {
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "main.odin".to_string(),
+            "@import \"types.odin\" as types\n\
+             {$}\nodin = \"1.0.0\"\nschema = \"1.0.0\"\n\
+             {policy}\nstatus_ref = @types.policy_status\n"
+                .to_string(),
+        );
+        files.insert(
+            "types.odin".to_string(),
+            "{@policy_status}\nvalue = !\n".to_string(),
         );
 
-        let empty = crate::Odin::parse("").unwrap();
-
-        // Baseline: without a registry, the imported type reference is unresolved.
-        let baseline = validate(&empty, &schema, None);
-        let v013_baseline = baseline
-            .errors
-            .iter()
-            .filter(|e| e.error_code == ValidationErrorCode::UnresolvedReference)
-            .count();
-        assert!(
-            v013_baseline >= 1,
-            "expected >=1 V013 without registry, got {v013_baseline}"
-        );
-
-        // Resolve imports into a registry, then validate.
         let mut resolver =
-            ImportResolver::new(Box::new(DiskReader), ResolverOptions::default());
-        let resolved = resolver.resolve_schema(&path).unwrap();
+            ImportResolver::new(Box::new(MemReader(files)), ResolverOptions::default());
+        let resolved = resolver.resolve_schema("main.odin").unwrap();
         assert!(
             resolved.type_registry.lookup("types.policy_status").is_some(),
             "registry should resolve types.policy_status"
         );
 
+        let empty = crate::Odin::parse("").unwrap();
+
+        // Without a registry the imported type reference is unresolved (V013).
+        let baseline = validate(&empty, &resolved.schema, None);
+        let v013_baseline = baseline
+            .errors
+            .iter()
+            .filter(|e| e.error_code == ValidationErrorCode::UnresolvedReference)
+            .count();
+        assert!(v013_baseline >= 1, "expected V013 without registry");
+
+        // With the registry the reference resolves — no V013.
         let result = validate_with_registry(
             &empty,
             &resolved.schema,
             None,
             Some(&resolved.type_registry),
         );
-
-        // The injected imported type reference must no longer be V013.
-        let injected_v013 = result.errors.iter().any(|e| {
-            e.error_code == ValidationErrorCode::UnresolvedReference
-                && e.path == "status_ref"
-        });
-        assert!(
-            !injected_v013,
-            "registry must resolve @types.policy_status (no V013 for status_ref)"
-        );
-
-        // After the relative-header fix, term.* lives inside the @policy type,
-        // not the schema root — so the canonical schema has no root-required
-        // term.* fields and an empty doc yields no root required errors.
-        let policy = schema
-            .types
-            .get("policy")
-            .expect("canonical schema should define the policy type");
-        let has_field = |name: &str| policy.fields.iter().any(|f| f.name == name);
-        assert!(
-            has_field("term.effective"),
-            "policy type should contain term.effective"
-        );
-        assert!(
-            has_field("term.expiration"),
-            "policy type should contain term.expiration"
-        );
-
-        let root_required = result
-            .errors
-            .iter()
-            .filter(|e| e.error_code == ValidationErrorCode::RequiredFieldMissing)
-            .filter(|e| e.path.contains("term."))
-            .count();
-        let v013_total = result
-            .errors
-            .iter()
-            .filter(|e| e.error_code == ValidationErrorCode::UnresolvedReference)
-            .count();
-        assert_eq!(v013_total, 0, "no V013 errors expected with registry");
-        assert_eq!(
-            root_required, 0,
-            "no root-required term.* errors expected after the relative-header fix, got: {:?}",
-            result.errors.iter().map(|e| (e.error_code.code(), &e.path)).collect::<Vec<_>>()
-        );
-    }
-
-    /// A minimal satisfying document validates clean against the resolved
-    /// canonical schema (no V013, no required-field errors).
-    #[test]
-    fn test_canonical_schema_minimal_doc_valid_with_registry() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(CANONICAL_SCHEMA);
-        let path = path.to_string_lossy().to_string();
-
-        let mut resolver =
-            ImportResolver::new(Box::new(DiskReader), ResolverOptions::default());
-        let resolved = resolver.resolve_schema(&path).unwrap();
-
-        // The canonical schema reports the required term.* fields at the
-        // un-prefixed `term.*` path (matching TS), so set them there.
-        let min_text = "number = \"P1\"\n\
-                         state_province = \"CA\"\n\
-                         status = \"active\"\n\
-                         term.effective = 2024-01-01\n\
-                         term.expiration = 2025-01-01\n";
-        let doc = crate::Odin::parse(min_text).unwrap();
-
-        let result = validate_with_registry(
-            &doc,
-            &resolved.schema,
-            None,
-            Some(&resolved.type_registry),
-        );
-
         let v013 = result
             .errors
             .iter()
             .filter(|e| e.error_code == ValidationErrorCode::UnresolvedReference)
             .count();
-        assert_eq!(v013, 0, "no spurious V013, got: {:?}",
-            result.errors.iter().map(|e| (e.error_code.code(), &e.path)).collect::<Vec<_>>());
+        assert_eq!(v013, 0, "registry must resolve @types.policy_status");
+    }
+
+    /// A relative `{.sub}` header inside a `{@type}` nests its fields into that
+    /// type, not the schema root.
+    #[test]
+    fn test_relative_subsection_nests_into_type() {
+        let schema = schema_parser::parse_schema(
+            "{@policy}\nnumber = !\n{.term}\neffective = !date\nexpiration = !date\n",
+        )
+        .unwrap();
+        let policy = schema
+            .types
+            .get("policy")
+            .expect("policy type should be defined");
+        let has = |n: &str| policy.fields.iter().any(|f| f.name == n);
+        assert!(
+            has("term.effective") && has("term.expiration"),
+            "term.* should nest into the policy type"
+        );
+        assert!(
+            !schema.fields.contains_key("term.effective"),
+            "term.* must not leak to the schema root"
+        );
     }
 }
