@@ -9,7 +9,7 @@ use super::VerbContext;
 // Helper: compare two DynValues with a comparison operator string
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn dyn_values_equal_cmp(a: &DynValue, b: &DynValue) -> bool {
+pub(crate) fn dyn_values_equal_cmp(a: &DynValue, b: &DynValue) -> bool {
     match (a, b) {
         (DynValue::Integer(x), DynValue::Float(y)) => (*x as f64) == *y,
         (DynValue::Float(x), DynValue::Integer(y)) => *x == (*y as f64),
@@ -19,7 +19,7 @@ fn dyn_values_equal_cmp(a: &DynValue, b: &DynValue) -> bool {
     }
 }
 
-fn compare_values(a: &DynValue, op: &str, b: &DynValue) -> bool {
+pub(crate) fn compare_values(a: &DynValue, op: &str, b: &DynValue) -> bool {
     match op {
         "=" | "==" | "eq" => dyn_values_equal_cmp(a, b),
         "!=" | "<>" | "ne" => !dyn_values_equal_cmp(a, b),

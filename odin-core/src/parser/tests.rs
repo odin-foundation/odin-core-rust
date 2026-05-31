@@ -146,6 +146,18 @@ use crate::Odin;
     assert_eq!(d.get_string("rows[1].name"), Some("Bob"));
     assert_eq!(d.get_integer("rows[0].id"), Some(0));
 }
+// Header-inline `:if` emits a synthetic `<section>._if` assignment.
+#[test] fn header_inline_if_directive() {
+    let d = Odin::parse("{DuiDetails :if \"@driver.hasDui = true\"}\nstate = \"TX\"\n").unwrap();
+    assert_eq!(d.get_string("DuiDetails._if"), Some("@driver.hasDui = true"));
+    assert_eq!(d.get_string("DuiDetails.state"), Some("TX"));
+}
+// Header-inline `:type` emits a synthetic `<section>._type` assignment.
+#[test] fn header_inline_type_directive() {
+    let d = Odin::parse("{Vehicle :type \"car\"}\nmake = \"Honda\"\n").unwrap();
+    assert_eq!(d.get_string("Vehicle._type"), Some("car"));
+    assert_eq!(d.get_string("Vehicle.make"), Some("Honda"));
+}
 #[test] fn multiple_newlines() { let d = Odin::parse("x = ##1\n\n\n\ny = ##2\n").unwrap(); assert_eq!(d.get_integer("x"), Some(1)); assert_eq!(d.get_integer("y"), Some(2)); }
 #[test] fn trailing_whitespace() { let d = Odin::parse("x = ##42   \n").unwrap(); assert_eq!(d.get_integer("x"), Some(42)); }
 #[test] fn leading_whitespace() { let d = Odin::parse("  x = ##42\n").unwrap(); assert_eq!(d.get_integer("x"), Some(42)); }

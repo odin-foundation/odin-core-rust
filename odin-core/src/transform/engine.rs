@@ -487,10 +487,9 @@ fn order_segments_by_pass(segments: &[TransformSegment]) -> Vec<&TransformSegmen
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn process_segment(segment: &TransformSegment, ctx: &mut ExecContext, output: &mut DynValue, path_prefix: &str) {
-    // Check condition (simple truthy evaluation of a source path)
+    // Check condition: comparison expression or truthy path.
     if let Some(ref condition) = segment.condition {
-        let cond_val = resolve_path(ctx.source, condition, &ctx.constants, &ctx.accumulators);
-        if !is_truthy(&cond_val) {
+        if !evaluate_condition(condition, ctx.source, &ctx.constants, &ctx.accumulators) {
             return;
         }
     }
@@ -1914,6 +1913,85 @@ fn is_truthy(val: &DynValue) -> bool {
     }
 }
 
+/// Comparison operators recognized in condition expressions, longest first so
+/// `<=`/`>=`/`==`/`!=`/`<>` match before their single-char prefixes.
+const CONDITION_OPERATORS: [&str; 8] = ["==", "!=", "<>", "<=", ">=", "=", "<", ">"];
+
+/// Split a condition into `(path, operator, value)` at the first top-level
+/// comparison operator outside quotes.
+fn split_condition(condition: &str) -> Option<(&str, &str, &str)> {
+    let bytes = condition.as_bytes();
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_quote {
+            Some(q) => {
+                if b == q { in_quote = None; }
+                i += 1;
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    in_quote = Some(b);
+                    i += 1;
+                    continue;
+                }
+                for op in CONDITION_OPERATORS {
+                    if condition[i..].starts_with(op) {
+                        let path = condition[..i].trim();
+                        let value = condition[i + op.len()..].trim();
+                        if path.is_empty() { return None; }
+                        return Some((path, op, value));
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Parse the right-hand literal of a condition into a `DynValue`.
+fn parse_condition_literal(raw: &str) -> DynValue {
+    let trimmed = raw.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        return DynValue::String(trimmed[1..trimmed.len() - 1].to_string());
+    }
+    match trimmed {
+        "true" => return DynValue::Bool(true),
+        "false" => return DynValue::Bool(false),
+        "null" | "nil" => return DynValue::Null,
+        _ => {}
+    }
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return DynValue::Integer(n);
+    }
+    if let Ok(n) = trimmed.parse::<f64>() {
+        return DynValue::Float(n);
+    }
+    DynValue::String(trimmed.to_string())
+}
+
+/// Evaluate a segment condition: a `path <op> value` comparison, or a truthy
+/// check on the resolved path when no operator is present.
+fn evaluate_condition(
+    condition: &str,
+    source: &DynValue,
+    constants: &HashMap<String, DynValue>,
+    accumulators: &HashMap<String, DynValue>,
+) -> bool {
+    let trimmed = condition.trim();
+    if let Some((path, op, value_part)) = split_condition(trimmed) {
+        let left = resolve_path(source, path, constants, accumulators);
+        let right = parse_condition_literal(value_part);
+        return crate::transform::verbs::compare_values(&left, op, &right);
+    }
+    let resolved = resolve_path(source, trimmed, constants, accumulators);
+    is_truthy(&resolved)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2379,6 +2457,47 @@ mod tests {
         let formatted = result.formatted.unwrap();
         assert!(formatted.contains("\"x\""));
         assert!(formatted.contains('1'));
+    }
+
+    #[test]
+    fn test_evaluate_condition_truthy_true() {
+        let src = DynValue::Object(vec![("hasDui".to_string(), DynValue::Bool(true))]);
+        assert!(evaluate_condition("@.hasDui", &src, &HashMap::new(), &HashMap::new()));
+    }
+
+    #[test]
+    fn test_evaluate_condition_truthy_false() {
+        let src = DynValue::Object(vec![("hasDui".to_string(), DynValue::Bool(false))]);
+        assert!(!evaluate_condition("@.hasDui", &src, &HashMap::new(), &HashMap::new()));
+    }
+
+    #[test]
+    fn test_evaluate_condition_eq_true() {
+        let src = DynValue::Object(vec![("hasDui".to_string(), DynValue::Bool(true))]);
+        assert!(evaluate_condition("@.hasDui = true", &src, &HashMap::new(), &HashMap::new()));
+    }
+
+    #[test]
+    fn test_evaluate_condition_eq_false() {
+        let src = DynValue::Object(vec![("hasDui".to_string(), DynValue::Bool(false))]);
+        assert!(!evaluate_condition("@.hasDui = true", &src, &HashMap::new(), &HashMap::new()));
+    }
+
+    #[test]
+    fn test_evaluate_condition_numeric_gt() {
+        let src = DynValue::Object(vec![("bac".to_string(), DynValue::Float(0.12))]);
+        assert!(evaluate_condition("@.bac > 0.08", &src, &HashMap::new(), &HashMap::new()));
+        assert!(!evaluate_condition("@.bac > 0.2", &src, &HashMap::new(), &HashMap::new()));
+    }
+
+    #[test]
+    fn test_evaluate_condition_at_prefixed_path() {
+        let src = DynValue::Object(vec![(
+            "driver".to_string(),
+            DynValue::Object(vec![("state".to_string(), DynValue::String("TX".to_string()))]),
+        )]);
+        assert!(evaluate_condition("@driver.state = \"TX\"", &src, &HashMap::new(), &HashMap::new()));
+        assert!(!evaluate_condition("@driver.state = \"CA\"", &src, &HashMap::new(), &HashMap::new()));
     }
 
     #[test]
@@ -12106,6 +12225,51 @@ mod extended_tests_2 {
         let r = execute(&t, &json_obj(vec![("a", i(3)), ("b", i(5))]));
         assert!(r.success);
         assert_eq!(r.output.unwrap().get("Val"), Some(&b(true)));
+    }
+
+    // Header-inline `:if` includes a whole section when its condition is truthy.
+    #[test]
+    fn header_inline_if_includes_section() {
+        let transform_text = format!(
+            "{}{}",
+            header(),
+            "{Quote}\ndriverName = @driver.name\n\n{DuiDetails :if \"@driver.hasDui\"}\nstate = @driver.dui.state\n",
+        );
+        let source = json_obj(vec![(
+            "driver",
+            json_obj(vec![
+                ("name", s("Pat Lee")),
+                ("hasDui", b(true)),
+                ("dui", json_obj(vec![("state", s("TX"))])),
+            ]),
+        )]);
+        let r = parse_and_exec(&transform_text, &source);
+        assert!(r.success);
+        let out = r.output.unwrap();
+        assert!(out.get("DuiDetails").is_some());
+        assert_eq!(
+            out.get("DuiDetails").and_then(|d| d.get("state")),
+            Some(&s("TX")),
+        );
+    }
+
+    // Header-inline `:if` omits a whole section when its condition is falsy.
+    #[test]
+    fn header_inline_if_omits_section() {
+        let transform_text = format!(
+            "{}{}",
+            header(),
+            "{Quote}\ndriverName = @driver.name\n\n{DuiDetails :if \"@driver.hasDui\"}\nstate = @driver.dui.state\n",
+        );
+        let source = json_obj(vec![(
+            "driver",
+            json_obj(vec![("name", s("Sam Cruz")), ("hasDui", b(false))]),
+        )]);
+        let r = parse_and_exec(&transform_text, &source);
+        assert!(r.success);
+        let out = r.output.unwrap();
+        assert!(out.get("DuiDetails").is_none());
+        assert!(out.get("Quote").is_some());
     }
 }
 

@@ -84,6 +84,23 @@ fn find_comment_start_quote_aware(s: &str) -> Option<usize> {
     None
 }
 
+/// Match an inline header directive `name :type "value"` / `name :if "expr"`.
+/// Returns `(name, "_<directive>", value)` on success.
+fn parse_inline_header_directive(header: &str) -> Option<(&str, String, String)> {
+    let colon = header.find(" :")?;
+    let name = header[..colon].trim();
+    if name.is_empty() { return None; }
+    let after_colon = &header[colon + 2..];
+    let kw_end = after_colon
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(after_colon.len());
+    let keyword = &after_colon[..kw_end];
+    if keyword != "type" && keyword != "if" { return None; }
+    let rest = after_colon[kw_end..].trim_start();
+    let value = rest.strip_prefix('"')?.strip_suffix('"')?;
+    Some((name, format!("_{keyword}"), value.to_string()))
+}
+
 struct Parser<'a> {
     source: &'a str,
     bytes: &'a [u8],
@@ -322,6 +339,46 @@ impl<'a> Parser<'a> {
             ));
         }
         let header = &self.source[content_start..close_pos];
+
+        // Inline directive header `{name :type "value"}` / `{name :if "expr"}`.
+        // Emits a synthetic assignment `<name>._<directive> = "value"`.
+        if let Some((name_part, key, dir_value)) = parse_inline_header_directive(header) {
+            self.pos = close_pos + 1;
+            let resolved = if let Some(rel) = name_part.strip_prefix('.') {
+                match (&self.previous_header, rel.is_empty()) {
+                    (Some(base), false) => format!("{base}.{rel}"),
+                    (Some(base), true) => base.clone(),
+                    (None, false) => rel.to_string(),
+                    (None, true) => String::new(),
+                }
+            } else if let Some(rest) = name_part.strip_prefix('@') {
+                rest.to_string()
+            } else {
+                name_part.to_string()
+            };
+            self.in_metadata = false;
+            self.current_header = Some(resolved.clone());
+            if !name_part.starts_with('.') {
+                self.previous_header = Some(resolved.clone());
+            }
+            let full_path = if resolved.is_empty() { key } else { format!("{resolved}.{key}") };
+            let synthetic = OdinValues::string(dir_value);
+            if self.options.allow_duplicates {
+                self.assignments.insert(full_path, synthetic);
+            } else {
+                match self.assignments.entry(full_path) {
+                    indexmap::map::Entry::Occupied(o) => {
+                        return StepResult::Err(ParseError::with_message(
+                            ParseErrorCode::DuplicatePathAssignment,
+                            start_line as usize, start_col as usize,
+                            o.key(),
+                        ));
+                    }
+                    indexmap::map::Entry::Vacant(e) => { e.insert(synthetic); }
+                }
+            }
+            return self.skip_to_line_end(start_line, start_col);
+        }
 
         // Tabular header `{name[] : col1, col2, ...}` (absolute or relative).
         if let Some(colon_pos) = header.find(" : ") {

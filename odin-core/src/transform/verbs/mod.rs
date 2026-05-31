@@ -19,6 +19,8 @@ mod string_verbs;
 mod collection_verbs;
 mod numeric_verbs;
 
+pub(crate) use collection_verbs::compare_values;
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use crate::types::transform::DynValue;
