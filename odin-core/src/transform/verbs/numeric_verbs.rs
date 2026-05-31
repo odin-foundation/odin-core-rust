@@ -1655,17 +1655,13 @@ pub(super) fn next_business_day(args: &[DynValue], _ctx: &VerbContext) -> Result
         Some(t) => t,
         None => return Ok(DynValue::Null),
     };
-    let dow = day_of_week_ymd(year, month, day);
-    let advance = match dow {
-        6 => 2, // Saturday -> Monday
-        0 => 1, // Sunday -> Monday
-        _ => 0,
-    };
-    if advance == 0 {
-        return Ok(DynValue::String(format_ymd(year, month, day)));
-    }
-    let mut cur = (year, month, day);
-    for _ in 0..advance {
+    // Always advance at least one day, then skip weekends.
+    let mut cur = add_days_ymd((year, month, day), 1);
+    loop {
+        let dow = day_of_week_ymd(cur.0, cur.1, cur.2);
+        if dow != 0 && dow != 6 { // 0=Sun, 6=Sat
+            break;
+        }
         cur = add_days_ymd(cur, 1);
     }
     Ok(DynValue::String(format_ymd(cur.0, cur.1, cur.2)))
@@ -1727,6 +1723,13 @@ fn day_of_week_ymd(year: i32, month: u32, day: u32) -> u32 {
 pub(super) fn format_duration(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.is_empty() {
         return Ok(DynValue::Null);
+    }
+    // Numeric seconds (numeric value or numeric string): expand into d/h/m/s.
+    if let Some(total) = numeric_seconds(&args[0]) {
+        if !total.is_finite() || total < 0.0 {
+            return Ok(DynValue::Null);
+        }
+        return Ok(DynValue::String(format_seconds(total)));
     }
     let iso = match &args[0] {
         DynValue::String(s) => s.as_str(),
@@ -1800,6 +1803,47 @@ fn format_duration_part(n: f64, unit: &str) -> String {
         format!("1 {unit}")
     } else {
         format!("{n} {unit}s")
+    }
+}
+
+/// Interpret a value as a number of seconds (numeric variant or numeric string).
+fn numeric_seconds(v: &DynValue) -> Option<f64> {
+    match v {
+        DynValue::Integer(n) => Some(*n as f64),
+        DynValue::Float(n) => Some(*n),
+        DynValue::Currency(n, ..) | DynValue::Percent(n) => Some(*n),
+        DynValue::String(s) => {
+            let t = s.trim();
+            if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                t.parse().ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Expand a duration in seconds into a human-readable day/hour/minute/second string.
+fn format_seconds(total: f64) -> String {
+    let mut rem = total;
+    let days = (rem / 86400.0).floor();
+    rem -= days * 86400.0;
+    let hours = (rem / 3600.0).floor();
+    rem -= hours * 3600.0;
+    let minutes = (rem / 60.0).floor();
+    let seconds = rem - minutes * 60.0;
+
+    let mut parts: Vec<String> = Vec::new();
+    if days > 0.0 { parts.push(format_duration_part(days, "day")); }
+    if hours > 0.0 { parts.push(format_duration_part(hours, "hour")); }
+    if minutes > 0.0 { parts.push(format_duration_part(minutes, "minute")); }
+    if seconds > 0.0 { parts.push(format_duration_part(seconds, "second")); }
+
+    if parts.is_empty() {
+        "0 seconds".to_string()
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -2823,6 +2867,86 @@ mod tests {
         ];
         // std=0, should return null
         assert_eq!(zscore(&args, &ctx()).unwrap(), DynValue::Null);
+    }
+
+    // ─── next_business_day tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_next_business_day_weekday() {
+        // Wednesday 2024-01-17 -> Thursday 2024-01-18
+        let args = vec![DynValue::String("2024-01-17".to_string())];
+        assert_eq!(next_business_day(&args, &ctx()).unwrap(), DynValue::String("2024-01-18".to_string()));
+    }
+
+    #[test]
+    fn test_next_business_day_friday() {
+        // Friday 2024-01-19 -> Monday 2024-01-22
+        let args = vec![DynValue::String("2024-01-19".to_string())];
+        assert_eq!(next_business_day(&args, &ctx()).unwrap(), DynValue::String("2024-01-22".to_string()));
+    }
+
+    #[test]
+    fn test_next_business_day_weekend() {
+        // Saturday and Sunday both -> Monday 2024-01-22
+        let sat = vec![DynValue::String("2024-01-20".to_string())];
+        assert_eq!(next_business_day(&sat, &ctx()).unwrap(), DynValue::String("2024-01-22".to_string()));
+        let sun = vec![DynValue::String("2024-01-21".to_string())];
+        assert_eq!(next_business_day(&sun, &ctx()).unwrap(), DynValue::String("2024-01-22".to_string()));
+    }
+
+    // ─── format_duration tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_format_duration_seconds() {
+        let args = vec![DynValue::Integer(90061)];
+        assert_eq!(
+            format_duration(&args, &ctx()).unwrap(),
+            DynValue::String("1 day, 1 hour, 1 minute, 1 second".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_duration_sub_day_seconds() {
+        let args = vec![DynValue::Integer(3661)];
+        assert_eq!(
+            format_duration(&args, &ctx()).unwrap(),
+            DynValue::String("1 hour, 1 minute, 1 second".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_duration_numeric_string() {
+        let args = vec![DynValue::String("3661".to_string())];
+        assert_eq!(
+            format_duration(&args, &ctx()).unwrap(),
+            DynValue::String("1 hour, 1 minute, 1 second".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_duration_iso() {
+        let args = vec![DynValue::String("PT2H30M".to_string())];
+        assert_eq!(
+            format_duration(&args, &ctx()).unwrap(),
+            DynValue::String("2 hours, 30 minutes".to_string())
+        );
+        let day = vec![DynValue::String("P1DT6H".to_string())];
+        assert_eq!(
+            format_duration(&day, &ctx()).unwrap(),
+            DynValue::String("1 day, 6 hours".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_duration_zero_seconds() {
+        let args = vec![DynValue::Integer(0)];
+        assert_eq!(format_duration(&args, &ctx()).unwrap(), DynValue::String("0 seconds".to_string()));
+    }
+
+    #[test]
+    fn test_format_duration_negative_seconds() {
+        let args = vec![DynValue::Integer(-5)];
+        assert_eq!(format_duration(&args, &ctx()).unwrap(), DynValue::Null);
     }
 }
 #[cfg(test)]
