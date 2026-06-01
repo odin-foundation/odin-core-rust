@@ -277,6 +277,7 @@ impl SchemaFlattener {
             description: schema_type.description.clone(),
             fields: updated_fields,
             parents: schema_type.parents.clone(),
+            override_bases: schema_type.override_bases.clone(),
         });
     }
 
@@ -370,6 +371,7 @@ impl SchemaFlattener {
             description: schema_type.description.clone(),
             fields: merged_fields,
             parents: schema_type.parents.clone(),
+            override_bases: schema_type.override_bases.clone(),
         }
     }
 
@@ -988,6 +990,7 @@ mod tests {
             description: None,
             fields,
             parents: vec![],
+            override_bases: vec![],
         }
     }
 
@@ -1956,6 +1959,8 @@ mod tests {
                 min_items: Some(1),
                 max_items: Some(10),
                 unique: false,
+                columns: Vec::new(),
+                item_fields: std::collections::HashMap::new(),
             },
         );
 
@@ -2375,6 +2380,8 @@ mod tests {
                 min_items: Some(0),
                 max_items: Some(50),
                 unique: true,
+                columns: Vec::new(),
+                item_fields: std::collections::HashMap::new(),
             },
         );
 

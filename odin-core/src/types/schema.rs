@@ -52,6 +52,8 @@ pub struct SchemaType {
     pub fields: Vec<SchemaField>,
     /// Parent types for composition (from `@Child : @Parent & @Other`).
     pub parents: Vec<String>,
+    /// Base type names this type overrides (from `= @base :override`).
+    pub override_bases: Vec<String>,
 }
 
 /// A field definition in a schema.
@@ -248,6 +250,10 @@ pub struct SchemaArray {
     pub max_items: Option<usize>,
     /// Whether items must be unique.
     pub unique: bool,
+    /// Tabular column names declared in the header (`{path[] : a, b}`).
+    pub columns: Vec<String>,
+    /// Per-item field definitions, keyed by item field name.
+    pub item_fields: HashMap<String, SchemaField>,
 }
 
 /// An object-level constraint.

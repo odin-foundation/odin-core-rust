@@ -4,6 +4,10 @@
 //! producing a `ValidationResult` with errors and warnings.
 
 mod format_validators;
+mod invariant_evaluator;
+mod schema_definition;
+#[cfg(test)]
+mod schema_enforcement_tests;
 pub mod schema_parser;
 pub mod schema_serializer;
 pub mod validate_redos;
@@ -51,10 +55,21 @@ pub fn validate_with_registry(
         return ValidationResult::invalid(errors);
     }
 
+    // Schema-definition well-formedness (V017): override/intersection/tabular/default.
+    schema_definition::validate_schema_definition(&schema, registry, &mut errors);
+    if opts.fail_fast && !errors.is_empty() {
+        return ValidationResult::invalid(errors);
+    }
+
     // 1. Validate fields defined in schema (including fields synthesized from
     //    section `_composition` intersections and field-level `@TypeRef`s).
     let expanded_fields = expand_field_compositions(doc, &schema, registry);
     for (path, field) in &expanded_fields {
+        // Array item-field templates (`path[].field`) are not literal document
+        // paths; they are validated per-row, not against the template path.
+        if path.contains("[].") {
+            continue;
+        }
         validate_field(doc, path, field, &opts, &mut errors);
         if opts.fail_fast && !errors.is_empty() {
             return ValidationResult::invalid(errors);
@@ -208,6 +223,22 @@ fn validate_field(
                     path: path.to_string(),
                     error_code: ValidationErrorCode::ValueOutOfBounds,
                     message: format!("Decimal places mismatch: expected exactly {places}, got {actual}"),
+                    expected: Some(places.to_string()),
+                    actual: Some(actual.to_string()),
+                    schema_path: None,
+                });
+            }
+        }
+    }
+
+    // Currency places: enforce exactly N places (#$.N).
+    if let SchemaFieldType::Currency { decimal_places: Some(places) } = field.field_type {
+        if let OdinValue::Currency { decimal_places: actual, .. } = value {
+            if *actual != places {
+                errors.push(ValidationError {
+                    path: path.to_string(),
+                    error_code: ValidationErrorCode::ValueOutOfBounds,
+                    message: format!("Currency decimal places mismatch: expected exactly {places}, got {actual}"),
                     expected: Some(places.to_string()),
                     actual: Some(actual.to_string()),
                     schema_path: None,
@@ -651,205 +682,35 @@ fn validate_invariant(
 ) {
     let expr = expr.trim();
 
-    // Spec: any present-but-null operand makes the expression evaluate to false.
-    if has_null_operand(doc, path, expr) {
-        errors.push(ValidationError::new(
-            ValidationErrorCode::InvariantViolation,
-            path,
-            format!("Invariant '{expr}' violated: null operand"),
-        ));
-        return;
-    }
+    let resolve = |name: &str| -> Option<OdinValue> {
+        let full = if path.is_empty() { name.to_string() } else { format!("{path}.{name}") };
+        doc.get(&full).cloned()
+    };
 
-    // Arithmetic equality: lhs = a op b (e.g. "total = subtotal + tax").
-    if let Some((lhs, a, arith, b)) = parse_arithmetic(expr) {
-        let lhs_v = resolve_numeric(doc, path, lhs);
-        let a_v = resolve_numeric(doc, path, a);
-        let b_v = resolve_numeric(doc, path, b);
-        let (Some(lhs_v), Some(a_v), Some(b_v)) = (lhs_v, a_v, b_v) else {
-            return; // operand missing — invariant does not apply
-        };
-        let rhs = match arith {
-            '+' => a_v + b_v,
-            '-' => a_v - b_v,
-            '*' => a_v * b_v,
-            '/' => if b_v != 0.0 { a_v / b_v } else { f64::NAN },
-            _ => return,
-        };
-        if (lhs_v - rhs).abs() > 0.001 {
+    let result = match invariant_evaluator::evaluate_invariant(expr, resolve) {
+        Ok(r) => r,
+        Err(()) => {
             errors.push(ValidationError::new(
                 ValidationErrorCode::InvariantViolation,
                 path,
-                format!("Invariant '{expr}' violated"),
+                format!("Invalid invariant expression: {expr}"),
             ));
+            return;
         }
+    };
+
+    // Absent operands: invariant does not apply.
+    if result.value.is_none() && !result.null_operand {
         return;
     }
 
-    // Simple comparison: field op value_or_field.
-    let ops = [">=", "<=", "!=", "==", ">", "<", "="];
-    for op in &ops {
-        if let Some(pos) = expr.find(op) {
-            let field_name = expr[..pos].trim();
-            let compare = expr[pos + op.len()..].trim();
-            if field_name.is_empty() || compare.is_empty() {
-                continue;
-            }
-
-            let full_path = if path.is_empty() {
-                field_name.to_string()
-            } else {
-                format!("{path}.{field_name}")
-            };
-            let Some(val) = doc.get(&full_path) else { return };
-
-            // Field-to-field or literal comparison.
-            let compare_path = if path.is_empty() {
-                compare.to_string()
-            } else {
-                format!("{path}.{compare}")
-            };
-            let passes = if let Some(other) = doc.get(&compare_path) {
-                evaluate_field_comparison(val, op, other)
-            } else {
-                evaluate_comparison(val, op, compare)
-            };
-            if !passes {
-                errors.push(ValidationError::new(
-                    ValidationErrorCode::InvariantViolation,
-                    path,
-                    format!("Invariant '{expr}' violated"),
-                ));
-            }
-            return;
-        }
+    if result.value == Some(false) {
+        errors.push(ValidationError::new(
+            ValidationErrorCode::InvariantViolation,
+            path,
+            format!("Invariant '{expr}' violated"),
+        ));
     }
-}
-
-/// Whether any identifier operand of `expr` is present in the document with a
-/// null value. Absent operands are left to required-field validation.
-fn has_null_operand(doc: &OdinDocument, path: &str, expr: &str) -> bool {
-    let mut token = String::new();
-    let mut tokens = Vec::new();
-    for ch in expr.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
-            token.push(ch);
-        } else if !token.is_empty() {
-            tokens.push(std::mem::take(&mut token));
-        }
-    }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    for tok in tokens {
-        if tok == "true" || tok == "false" || tok.parse::<f64>().is_ok() {
-            continue;
-        }
-        let full = if path.is_empty() { tok.clone() } else { format!("{path}.{tok}") };
-        if let Some(OdinValue::Null { .. }) = doc.get(&full) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Parse an arithmetic invariant `lhs = a op b`, returning the operand names.
-fn parse_arithmetic(expr: &str) -> Option<(&str, &str, char, &str)> {
-    let eq = expr.find('=')?;
-    // Reject comparison operators masquerading as `=` (e.g. ">=", "==").
-    if expr.as_bytes().get(eq + 1) == Some(&b'=') {
-        return None;
-    }
-    if eq > 0 {
-        let prev = expr.as_bytes()[eq - 1];
-        if matches!(prev, b'>' | b'<' | b'!') {
-            return None;
-        }
-    }
-    let lhs = expr[..eq].trim();
-    let rhs = expr[eq + 1..].trim();
-    for op in ['+', '-', '*', '/'] {
-        if let Some(pos) = rhs.find(op) {
-            let a = rhs[..pos].trim();
-            let b = rhs[pos + 1..].trim();
-            if is_identifier(lhs) && is_identifier(a) && is_identifier(b) {
-                return Some((lhs, a, op, b));
-            }
-        }
-    }
-    None
-}
-
-/// Whether `s` is a single bare identifier (word characters only).
-fn is_identifier(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-}
-
-/// Resolve a numeric value from a field name or numeric literal.
-fn resolve_numeric(doc: &OdinDocument, path: &str, name: &str) -> Option<f64> {
-    let full = if path.is_empty() { name.to_string() } else { format!("{path}.{name}") };
-    if let Some(v) = doc.get(&full) {
-        return v.as_f64();
-    }
-    name.parse::<f64>().ok()
-}
-
-/// Evaluate a field-to-field comparison.
-fn evaluate_field_comparison(left: &OdinValue, op: &str, right: &OdinValue) -> bool {
-    if let (Some(l), Some(r)) = (left.as_f64(), right.as_f64()) {
-        return match op {
-            ">" => l > r,
-            "<" => l < r,
-            ">=" => l >= r,
-            "<=" => l <= r,
-            "==" | "=" => (l - r).abs() < 0.001,
-            "!=" => (l - r).abs() >= 0.001,
-            _ => true,
-        };
-    }
-    if let (Some(l), Some(r)) = (left.as_str(), right.as_str()) {
-        return match op {
-            ">" => l > r,
-            "<" => l < r,
-            ">=" => l >= r,
-            "<=" => l <= r,
-            "==" | "=" => l == r,
-            "!=" => l != r,
-            _ => true,
-        };
-    }
-    true
-}
-
-fn evaluate_comparison(value: &OdinValue, op: &str, compare: &str) -> bool {
-    // Try numeric comparison
-    if let Some(num) = value.as_f64() {
-        if let Ok(cmp) = compare.parse::<f64>() {
-            return match op {
-                ">" => num > cmp,
-                "<" => num < cmp,
-                ">=" => num >= cmp,
-                "<=" => num <= cmp,
-                "==" | "=" => (num - cmp).abs() < f64::EPSILON,
-                "!=" => (num - cmp).abs() >= f64::EPSILON,
-                _ => true,
-            };
-        }
-    }
-    // Try string comparison
-    if let Some(s) = value.as_str() {
-        let cmp = compare.trim_matches('"');
-        return match op {
-            "==" | "=" => s == cmp,
-            "!=" => s != cmp,
-            ">" => s > cmp,
-            "<" => s < cmp,
-            ">=" => s >= cmp,
-            "<=" => s <= cmp,
-            _ => true,
-        };
-    }
-    true // Can't evaluate — skip
 }
 
 fn validate_cardinality(
@@ -1548,6 +1409,7 @@ mod tests {
                 },
             ],
             parents: vec![],
+            override_bases: vec![],
         });
 
         schema.types.insert("Child".to_string(), SchemaType {
@@ -1569,6 +1431,7 @@ mod tests {
                 },
             ],
             parents: vec!["@Parent".to_string()],
+            override_bases: vec![],
         });
 
         let expanded = expand_type_composition(&schema);
@@ -2473,7 +2336,7 @@ mod tests {
             .build().unwrap();
         let mut schema = make_empty_schema();
         schema.types.insert("SomeType".to_string(), SchemaType {
-            name: "SomeType".to_string(), description: None, fields: vec![], parents: vec![],
+            name: "SomeType".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![],
         });
         schema.fields.insert("val".to_string(), make_field("val", SchemaFieldType::TypeRef("SomeType".to_string()), false));
         let result = validate(&doc, &schema, None);

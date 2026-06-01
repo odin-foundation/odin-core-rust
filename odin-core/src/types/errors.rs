@@ -151,6 +151,14 @@ pub enum ValidationErrorCode {
     CircularReference,
     /// V013: Unresolved reference.
     UnresolvedReference,
+    /// V014: Unsafe regex pattern.
+    UnsafeRegexPattern,
+    /// V015: Invalid regex pattern.
+    InvalidRegexPattern,
+    /// V016: Pattern validation timeout.
+    PatternValidationTimeout,
+    /// V017: Schema definition error.
+    SchemaDefinitionError,
 }
 
 impl ValidationErrorCode {
@@ -170,6 +178,10 @@ impl ValidationErrorCode {
             Self::UnknownField => "V011",
             Self::CircularReference => "V012",
             Self::UnresolvedReference => "V013",
+            Self::UnsafeRegexPattern => "V014",
+            Self::InvalidRegexPattern => "V015",
+            Self::PatternValidationTimeout => "V016",
+            Self::SchemaDefinitionError => "V017",
         }
     }
 
@@ -189,6 +201,10 @@ impl ValidationErrorCode {
             Self::UnknownField => "Unknown field",
             Self::CircularReference => "Circular reference",
             Self::UnresolvedReference => "Unresolved reference",
+            Self::UnsafeRegexPattern => "Unsafe regex pattern",
+            Self::InvalidRegexPattern => "Invalid regex pattern",
+            Self::PatternValidationTimeout => "Pattern validation timeout",
+            Self::SchemaDefinitionError => "Schema definition error",
         }
     }
 
@@ -208,6 +224,10 @@ impl ValidationErrorCode {
             "V011" => Some(Self::UnknownField),
             "V012" => Some(Self::CircularReference),
             "V013" => Some(Self::UnresolvedReference),
+            "V014" => Some(Self::UnsafeRegexPattern),
+            "V015" => Some(Self::InvalidRegexPattern),
+            "V016" => Some(Self::PatternValidationTimeout),
+            "V017" => Some(Self::SchemaDefinitionError),
             _ => None,
         }
     }

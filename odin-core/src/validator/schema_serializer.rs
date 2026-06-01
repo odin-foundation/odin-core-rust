@@ -312,6 +312,7 @@ mod tests {
                         },
                     ],
                     parents: vec![],
+                    override_bases: vec![],
                 });
                 types
             },

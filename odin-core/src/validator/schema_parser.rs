@@ -32,6 +32,7 @@ struct SchemaParserState {
     current_context: ParserContext,
     current_type_name: String,
     current_type_parents: Vec<String>,
+    current_type_override_bases: Vec<String>,
     current_type_fields: Vec<SchemaField>,
     current_section_path: String,
 
@@ -63,6 +64,7 @@ impl SchemaParserState {
             current_context: ParserContext::None,
             current_type_name: String::new(),
             current_type_parents: Vec::new(),
+            current_type_override_bases: Vec::new(),
             current_type_fields: Vec::new(),
             current_section_path: String::new(),
             previous_header_path: String::new(),
@@ -133,11 +135,17 @@ impl SchemaParserState {
         if self.current_context == ParserContext::TypeDef && !self.current_type_name.is_empty() {
             let name = std::mem::take(&mut self.current_type_name);
             let fields = std::mem::take(&mut self.current_type_fields);
+            let override_bases = std::mem::take(&mut self.current_type_override_bases);
 
             // Merge into existing type if present (for multi-line `= ...` defs)
             if let Some(existing) = self.types.get_mut(&name) {
                 for f in fields {
                     existing.fields.push(f);
+                }
+                for b in override_bases {
+                    if !existing.override_bases.contains(&b) {
+                        existing.override_bases.push(b);
+                    }
                 }
             } else {
                 self.types.insert(name.clone(), SchemaType {
@@ -145,6 +153,7 @@ impl SchemaParserState {
                     description: None,
                     fields,
                     parents: std::mem::take(&mut self.current_type_parents),
+                    override_bases,
                 });
             }
         }
@@ -214,8 +223,27 @@ impl SchemaParserState {
             return;
         }
 
-        if let Some(array_inner) = inner.strip_suffix("[]") {
-            let path = array_inner.trim().to_string();
+        // Array header: `{path[]}` or tabular `{path[] : col1, col2}`.
+        if let Some(bracket) = inner.find("[]") {
+            let path = inner[..bracket].trim().to_string();
+            let after = inner[bracket + 2..].trim();
+            let columns: Vec<String> = if let Some(cols) = after.strip_prefix(':') {
+                cols.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            self.arrays.entry(path.clone()).or_insert_with(|| SchemaArray {
+                name: path.clone(),
+                item_type: SchemaFieldType::String,
+                min_items: None,
+                max_items: None,
+                unique: false,
+                columns: Vec::new(),
+                item_fields: HashMap::new(),
+            }).columns = columns;
             self.current_context = ParserContext::ArrayDef;
             self.current_section_path = path.clone();
             self.previous_header_path = path;
@@ -266,10 +294,13 @@ impl SchemaParserState {
         //   = @TypeA & @TypeB (intersection)
         //   = :(20)  (exact length/value)
         let value = value.trim();
-        // Capture a type-level intersection (`= @A & @B`) as parent references
-        // so type-composition expansion merges both members.
-        if let Some(refs) = parse_type_intersection(value) {
+        // Separate any trailing `:override` directive from the `@`-references.
+        let (refs_part, is_override) = split_override(value);
+        if let Some(refs) = parse_type_intersection(refs_part) {
             for r in refs {
+                if is_override && !self.current_type_override_bases.contains(&r) {
+                    self.current_type_override_bases.push(r.clone());
+                }
                 if !self.current_type_parents.contains(&r) {
                     self.current_type_parents.push(r);
                 }
@@ -280,7 +311,8 @@ impl SchemaParserState {
     /// Parse a section-level composition `= @A & @B`, recording a `_composition`
     /// field whose `TypeRef` name carries every `&`-joined member.
     fn parse_section_composition(&mut self, value: &str) {
-        let Some(refs) = parse_type_intersection(value.trim()) else { return };
+        let (refs_part, is_override) = split_override(value.trim());
+        let Some(refs) = parse_type_intersection(refs_part) else { return };
         if refs.is_empty() {
             return;
         }
@@ -298,7 +330,9 @@ impl SchemaParserState {
             deprecated: false,
             immutable: false,
             computed: false,
-            description: None,
+            // Mark section overrides so schema-definition checks distinguish
+            // them from intersections.
+            description: if is_override { Some("override".to_string()) } else { None },
             constraints: Vec::new(),
             default_value: None,
             conditionals: Vec::new(),
@@ -406,8 +440,12 @@ impl SchemaParserState {
                 self.fields.insert(full_path, field);
             }
             ParserContext::ArrayDef => {
-                let full_path = format!("{}[].{}", self.current_section_path, key);
-                let field = parse_field_def(key, value);
+                let clean_key = key.strip_suffix("[]").unwrap_or(key);
+                let full_path = format!("{}[].{}", self.current_section_path, clean_key);
+                let field = parse_field_def(clean_key, value);
+                if let Some(array) = self.arrays.get_mut(&self.current_section_path) {
+                    array.item_fields.insert(clean_key.to_string(), field.clone());
+                }
                 self.fields.insert(full_path, field);
             }
             ParserContext::None => {
@@ -471,6 +509,14 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
         }
     }
 
+    // Leading `~` nullable modifier on a typed field (e.g. `~#`, `~##`).
+    // A lone `~` is the null type and is handled below.
+    let mut nullable_prefix = false;
+    if rest.starts_with('~') && rest.len() > 1 {
+        nullable_prefix = true;
+        rest = rest[1..].trim_start();
+    }
+
     // Detect type from prefix. A trailing default value (e.g. `##3`, `#$5.00`)
     // is captured here; union members (e.g. `#|~`) extend the base type.
     let mut parsed_default: Option<SchemaDefault> = None;
@@ -494,7 +540,8 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
         } else {
             let (def, after) = take_numeric_default(after.trim_start(), "currency");
             parsed_default = def;
-            field_type = SchemaFieldType::Currency { decimal_places: None };
+            // Currency defaults to two decimal places when unspecified.
+            field_type = SchemaFieldType::Currency { decimal_places: Some(2) };
             rest = after;
         }
     } else if rest.starts_with('#') && !rest.starts_with("#(") {
@@ -559,12 +606,59 @@ fn parse_field_def(name: &str, value: &str) -> SchemaField {
         rest = rest[type_ref.len()..].trim_start();
     }
 
+    // A leading `~` makes the field nullable: admit the null type alongside it.
+    if nullable_prefix && !matches!(field_type, SchemaFieldType::Null) {
+        field_type = match field_type {
+            SchemaFieldType::Union(mut members) => {
+                if !members.iter().any(|m| matches!(m, SchemaFieldType::Null)) {
+                    members.insert(0, SchemaFieldType::Null);
+                }
+                SchemaFieldType::Union(members)
+            }
+            other => SchemaFieldType::Union(vec![SchemaFieldType::Null, other]),
+        };
+    }
+
     // Parse constraint directives
     let mut remaining = rest;
     loop {
         remaining = remaining.trim_start();
         if remaining.is_empty() {
             break;
+        }
+
+        // A bare leading `(...)` is an enum/bounds constraint (no `:` prefix).
+        if remaining.starts_with('(') {
+            if let Some(paren_end) = remaining.find(')') {
+                let inner = &remaining[1..paren_end];
+                if inner.contains("..") {
+                    let (min, max) = parse_bounds_pair(inner);
+                    constraints.push(SchemaConstraint::Bounds {
+                        min,
+                        max,
+                        min_exclusive: false,
+                        max_exclusive: false,
+                    });
+                } else if inner.contains(',') {
+                    let values: Vec<String> = inner.split(',')
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    constraints.push(SchemaConstraint::Enum(values));
+                } else {
+                    let v = inner.trim();
+                    if !v.is_empty() {
+                        constraints.push(SchemaConstraint::Bounds {
+                            min: Some(v.to_string()),
+                            max: Some(v.to_string()),
+                            min_exclusive: false,
+                            max_exclusive: false,
+                        });
+                    }
+                }
+                remaining = remaining[paren_end + 1..].trim_start();
+                continue;
+            }
         }
 
         if let Some(after) = remaining.strip_prefix(':') {
@@ -920,6 +1014,10 @@ fn parse_default_literal(word: &str, field_type: &SchemaFieldType) -> Option<Sch
     if w == "true" || w == "false" {
         return Some(SchemaDefault::Bool(w == "true"));
     }
+    // Quoted string default (e.g. `"a"`).
+    if w.len() >= 2 && w.starts_with('"') && w.ends_with('"') {
+        return Some(SchemaDefault::String(w[1..w.len() - 1].to_string()));
+    }
     // Bare numeric default — tag to the field's declared type.
     if let Ok(n) = w.parse::<f64>() {
         return Some(match field_type {
@@ -983,6 +1081,16 @@ fn parse_bounds_pair(inner: &str) -> (Option<String>, Option<String>) {
     let min = parts.first().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
     let max = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
     (min, max)
+}
+
+/// Split a composition value into its `@`-reference part and whether it carries
+/// an `:override` directive.
+fn split_override(value: &str) -> (&str, bool) {
+    if let Some(pos) = value.find(":override") {
+        (value[..pos].trim_end(), true)
+    } else {
+        (value, false)
+    }
 }
 
 /// Parse an intersection of type references (`@A & @B`) into bare type names.

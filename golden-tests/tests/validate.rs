@@ -221,3 +221,8 @@ fn golden_validate_conformance() {
 fn golden_validate_conditional_binary_decimal() {
     run_conformance_suite("conformance/conditional-binary-decimal.json");
 }
+
+#[test]
+fn golden_validate_schema_definition() {
+    run_conformance_suite("conformance/schema-definition.json");
+}
