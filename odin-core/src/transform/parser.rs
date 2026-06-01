@@ -794,6 +794,7 @@ fn build_field_mapping(
             expression: FieldExpression::Copy(path),
             directives,
             modifiers: merged_mods,
+            flags_memo: Default::default(),
         };
     }
 
@@ -816,6 +817,7 @@ fn build_field_mapping(
         expression: expr,
         directives: dirs,
         modifiers: merged_mods,
+        flags_memo: Default::default(),
     }
 }
 
@@ -1429,6 +1431,7 @@ fn value_to_field_expression_with_directives(value: &OdinValue) -> (FieldExpress
                         expression: value_to_field_expression(val),
                         directives: val.directives().to_vec(),
                         modifiers,
+                        flags_memo: Default::default(),
                     }
                 })
                 .collect();

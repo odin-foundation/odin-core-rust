@@ -228,12 +228,22 @@ pub struct FieldMapping {
     pub modifiers: Option<crate::types::values::OdinModifiers>,
     /// Directives attached to this field (e.g., `:type integer`, `:date`, `:pos 3`).
     pub directives: Vec<crate::types::values::OdinDirective>,
+    /// Memoized directive presence flags, computed once per mapping object and
+    /// reused across every value the mapping processes. Populated lazily by the
+    /// engine; never read or written by callers.
+    pub(crate) flags_memo: crate::types::schema::ClonableMemo<crate::transform::MappingFlags>,
 }
 
 impl FieldMapping {
     /// Create a new field mapping with no directives.
     pub fn new(target: String, expression: FieldExpression, modifiers: Option<crate::types::values::OdinModifiers>) -> Self {
-        Self { target, expression, modifiers, directives: Vec::new() }
+        Self {
+            target,
+            expression,
+            modifiers,
+            directives: Vec::new(),
+            flags_memo: Default::default(),
+        }
     }
 }
 

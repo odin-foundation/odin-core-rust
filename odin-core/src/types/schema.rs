@@ -1,6 +1,38 @@
 //! ODIN Schema types for document validation.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// A once-initialized memo that resets to empty when its owner is cloned.
+///
+/// A clone is a distinct object that may diverge from its source, so it must
+/// recompute its own memo rather than inherit a value derived from the original.
+pub struct ClonableMemo<T>(OnceLock<T>);
+
+impl<T> Default for ClonableMemo<T> {
+    fn default() -> Self {
+        Self(OnceLock::new())
+    }
+}
+
+impl<T> ClonableMemo<T> {
+    /// Get the memoized value, initializing it once with `init` if empty.
+    pub fn get_or_init<F: FnOnce() -> T>(&self, init: F) -> &T {
+        self.0.get_or_init(init)
+    }
+}
+
+impl<T> Clone for ClonableMemo<T> {
+    fn clone(&self) -> Self {
+        Self(OnceLock::new())
+    }
+}
+
+impl<T> std::fmt::Debug for ClonableMemo<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClonableMemo")
+    }
+}
 
 /// A parsed ODIN schema.
 #[derive(Debug, Clone)]
@@ -17,6 +49,10 @@ pub struct OdinSchemaDefinition {
     pub arrays: HashMap<String, SchemaArray>,
     /// Object-level constraints.
     pub constraints: HashMap<String, Vec<SchemaObjectConstraint>>,
+    /// Memoized schema-only validation work, computed once per schema object and
+    /// reused across every document validated against it. Never read or written
+    /// by callers; populated lazily inside validation.
+    pub(crate) validation_memo: ClonableMemo<std::sync::Arc<crate::validator::SchemaValidationMemo>>,
 }
 
 /// Schema metadata from the `{$}` header.

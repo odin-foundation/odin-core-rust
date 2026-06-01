@@ -259,6 +259,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
 
         let text = serialize_schema(&schema);
@@ -319,6 +320,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
 
         let text = serialize_schema(&schema);

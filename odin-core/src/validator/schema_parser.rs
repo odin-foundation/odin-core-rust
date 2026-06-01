@@ -464,6 +464,7 @@ impl SchemaParserState {
             fields: self.fields,
             arrays: self.arrays,
             constraints: self.constraints,
+            validation_memo: Default::default(),
         }
     }
 }

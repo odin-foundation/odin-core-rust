@@ -12,6 +12,8 @@ pub mod source_parsers;
 pub mod parser;
 pub mod engine;
 
+pub(crate) use engine::MappingFlags;
+
 use crate::types::transform::{OdinTransform, TransformResult, DynValue, ExecuteOptions};
 use crate::types::document::OdinDocument;
 use crate::types::values::{OdinValue, OdinArrayItem};

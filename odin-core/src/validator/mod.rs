@@ -14,12 +14,11 @@ pub mod validate_redos;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::types::document::OdinDocument;
 use crate::types::schema::{
-    OdinSchemaDefinition, SchemaArray, SchemaConstraint, SchemaDefault, SchemaField,
+    OdinSchemaDefinition, SchemaConstraint, SchemaField,
     SchemaFieldType, SchemaObjectConstraint, SchemaType, ConditionalOperator, ConditionalValue,
     ValidationResult,
 };
@@ -34,235 +33,86 @@ use crate::resolver::TypeRegistry;
 
 /// Schema-only results, independent of any document: the composition-expanded
 /// schema and the schema-level errors (V013 type references, V017 well-formedness).
-struct SchemaMemo {
+///
+/// Computed once per schema object and stored on it (see
+/// [`OdinSchemaDefinition::validation_memo`]), then reused across every document
+/// validated against that schema — no per-call key computation.
+pub(crate) struct SchemaValidationMemo {
     expanded: OdinSchemaDefinition,
+    /// Address of the registry this memo was computed against (`None` = no
+    /// registry). Stored as a `usize` so the memo stays `Send + Sync`; used only
+    /// to detect a registry change between calls, never dereferenced.
+    registry_addr: Option<usize>,
     /// V013 schema-level type-reference errors (computed before V017).
     type_ref_errors: Vec<ValidationError>,
     /// V017 schema-definition well-formedness errors.
     definition_errors: Vec<ValidationError>,
+    /// Document-independent field set: section `_composition` intersections plus
+    /// the schema's explicit fields. Reused directly when the schema has no
+    /// field-level `@TypeRef`/`@Reference` augmentation to apply.
+    base_fields: Vec<(String, SchemaField)>,
+    /// Whether any field carries a defined-type `@TypeRef`/`@Reference` whose
+    /// fields must be enforced per-document (the only document-dependent part of
+    /// field-composition expansion). When false, `base_fields` is the final set.
+    has_typeref_augmentation: bool,
 }
 
-/// Process-global cache of schema-only work, keyed by a content fingerprint of
-/// the schema combined with the registry identity.
-fn schema_memo_cache() -> &'static Mutex<HashMap<u64, Arc<SchemaMemo>>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<SchemaMemo>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// The address of an optional registry, used as an identity key.
+fn registry_addr(registry: Option<&TypeRegistry>) -> Option<usize> {
+    registry.map(|r| r as *const TypeRegistry as usize)
 }
 
-/// Compute (or reuse) the schema-only results for `schema`/`registry`: the
-/// expanded schema plus schema-level errors. Reused across every document
-/// validated against the same schema and registry.
-fn get_schema_memo(
+/// Build the schema-only memo for `schema`/`registry`.
+fn build_schema_memo(
     schema: &OdinSchemaDefinition,
     registry: Option<&TypeRegistry>,
-) -> Arc<SchemaMemo> {
-    let key = schema_fingerprint(schema, registry);
-
-    if let Ok(cache) = schema_memo_cache().lock() {
-        if let Some(memo) = cache.get(&key) {
-            return Arc::clone(memo);
-        }
-    }
-
-    // Compute outside the lock.
+) -> SchemaValidationMemo {
     let expanded = expand_type_composition(schema).into_owned();
     let mut type_ref_errors = Vec::new();
     validate_schema_type_references(&expanded, registry, &mut type_ref_errors);
     let mut definition_errors = Vec::new();
     schema_definition::validate_schema_definition(&expanded, registry, &mut definition_errors);
-    let memo = Arc::new(SchemaMemo { expanded, type_ref_errors, definition_errors });
-
-    if let Ok(mut cache) = schema_memo_cache().lock() {
-        return Arc::clone(cache.entry(key).or_insert(memo));
-    }
-    memo
-}
-
-/// A deterministic content fingerprint of a schema and the registry it resolves
-/// against. Map entries are hashed order-independently (XOR of per-entry hashes)
-/// so the unordered `HashMap` storage does not affect the result.
-fn schema_fingerprint(schema: &OdinSchemaDefinition, registry: Option<&TypeRegistry>) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-
-    schema.metadata.id.hash(&mut h);
-    schema.metadata.title.hash(&mut h);
-    schema.metadata.description.hash(&mut h);
-    schema.metadata.version.hash(&mut h);
-
-    for imp in &schema.imports {
-        imp.path.hash(&mut h);
-        imp.alias.hash(&mut h);
-    }
-
-    hash_type_map(schema.types.iter(), &mut h);
-    hash_field_map(schema.fields.iter(), &mut h);
-
-    let mut arrays_acc: u64 = 0;
-    for (name, arr) in &schema.arrays {
-        let mut eh = std::collections::hash_map::DefaultHasher::new();
-        name.hash(&mut eh);
-        hash_array(arr, &mut eh);
-        arrays_acc ^= eh.finish();
-    }
-    arrays_acc.hash(&mut h);
-
-    let mut constraints_acc: u64 = 0;
-    for (path, list) in &schema.constraints {
-        let mut eh = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut eh);
-        for c in list {
-            hash_object_constraint(c, &mut eh);
-        }
-        constraints_acc ^= eh.finish();
-    }
-    constraints_acc.hash(&mut h);
-
-    if let Some(reg) = registry {
-        1u8.hash(&mut h);
-        hash_type_map(reg.local_types.iter(), &mut h);
-        let mut ns_acc: u64 = 0;
-        for (ns, types) in &reg.namespaces {
-            let mut eh = std::collections::hash_map::DefaultHasher::new();
-            ns.hash(&mut eh);
-            hash_type_map(types.iter(), &mut eh);
-            ns_acc ^= eh.finish();
-        }
-        ns_acc.hash(&mut h);
-    } else {
-        0u8.hash(&mut h);
-    }
-
-    h.finish()
-}
-
-fn hash_type_map<'a, I>(types: I, h: &mut impl Hasher)
-where
-    I: Iterator<Item = (&'a String, &'a SchemaType)>,
-{
-    let mut acc: u64 = 0;
-    for (name, t) in types {
-        let mut eh = std::collections::hash_map::DefaultHasher::new();
-        name.hash(&mut eh);
-        t.name.hash(&mut eh);
-        t.description.hash(&mut eh);
-        t.parents.hash(&mut eh);
-        t.override_bases.hash(&mut eh);
-        for f in &t.fields {
-            hash_field(f, &mut eh);
-        }
-        acc ^= eh.finish();
-    }
-    acc.hash(h);
-}
-
-fn hash_field_map<'a, I>(fields: I, h: &mut impl Hasher)
-where
-    I: Iterator<Item = (&'a String, &'a SchemaField)>,
-{
-    let mut acc: u64 = 0;
-    for (path, f) in fields {
-        let mut eh = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut eh);
-        hash_field(f, &mut eh);
-        acc ^= eh.finish();
-    }
-    acc.hash(h);
-}
-
-fn hash_field(f: &SchemaField, h: &mut impl Hasher) {
-    f.name.hash(h);
-    hash_field_type(&f.field_type, h);
-    f.required.hash(h);
-    f.confidential.hash(h);
-    f.deprecated.hash(h);
-    f.immutable.hash(h);
-    f.computed.hash(h);
-    f.description.hash(h);
-    for c in &f.constraints {
-        hash_constraint(c, h);
-    }
-    match &f.default_value {
-        None => 0u8.hash(h),
-        Some(d) => {
-            d.type_name().hash(h);
-            match d {
-                SchemaDefault::String(s) => s.hash(h),
-                SchemaDefault::Integer(n) => n.hash(h),
-                SchemaDefault::Bool(b) => b.hash(h),
-                SchemaDefault::Number(n)
-                | SchemaDefault::Currency(n)
-                | SchemaDefault::Percent(n) => n.to_bits().hash(h),
-            }
-        }
-    }
-    for cond in &f.conditionals {
-        cond.field.hash(h);
-        cond.operator.hash(h);
-        cond.unless.hash(h);
-        match &cond.value {
-            ConditionalValue::String(s) => s.hash(h),
-            ConditionalValue::Number(n) => n.to_bits().hash(h),
-            ConditionalValue::Bool(b) => b.hash(h),
-        }
+    let base_fields = base_field_compositions(&expanded, registry);
+    let has_typeref_augmentation = base_fields.iter().any(|(_, field)| {
+        let name = match &field.field_type {
+            SchemaFieldType::TypeRef(n) | SchemaFieldType::Reference(n) => n,
+            _ => return false,
+        };
+        name.split('&')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .any(|m| lookup_type(&expanded, registry, m).is_some())
+    });
+    SchemaValidationMemo {
+        registry_addr: registry_addr(registry),
+        type_ref_errors,
+        definition_errors,
+        base_fields,
+        has_typeref_augmentation,
+        expanded,
     }
 }
 
-fn hash_field_type(t: &SchemaFieldType, h: &mut impl Hasher) {
-    std::mem::discriminant(t).hash(h);
-    match t {
-        SchemaFieldType::Number { decimal_places }
-        | SchemaFieldType::Decimal { decimal_places }
-        | SchemaFieldType::Currency { decimal_places } => decimal_places.hash(h),
-        SchemaFieldType::Enum(values) => values.hash(h),
-        SchemaFieldType::Union(members) => {
-            for m in members {
-                hash_field_type(m, h);
-            }
-        }
-        SchemaFieldType::Reference(s) | SchemaFieldType::TypeRef(s) => s.hash(h),
-        _ => {}
+/// Get (computing once) the schema-only results for `schema`/`registry`.
+///
+/// The memo is stored on the schema object, so the schema-only walk runs exactly
+/// once per schema and is read in O(1) thereafter, with no per-call hashing.
+/// In the rare case the same schema is later validated against a *different*
+/// registry, the memo is rebuilt transiently for that call without disturbing
+/// the stored one.
+fn get_schema_memo(
+    schema: &OdinSchemaDefinition,
+    registry: Option<&TypeRegistry>,
+) -> Arc<SchemaValidationMemo> {
+    let req_addr = registry_addr(registry);
+    let memo = schema
+        .validation_memo
+        .get_or_init(|| Arc::new(build_schema_memo(schema, registry)));
+    if memo.registry_addr == req_addr {
+        return Arc::clone(memo);
     }
-}
-
-fn hash_constraint(c: &SchemaConstraint, h: &mut impl Hasher) {
-    std::mem::discriminant(c).hash(h);
-    match c {
-        SchemaConstraint::Bounds { min, max, min_exclusive, max_exclusive } => {
-            min.hash(h);
-            max.hash(h);
-            min_exclusive.hash(h);
-            max_exclusive.hash(h);
-        }
-        SchemaConstraint::Pattern(p) | SchemaConstraint::Format(p) => p.hash(h),
-        SchemaConstraint::Enum(values) => values.hash(h),
-        SchemaConstraint::Unique => {}
-        SchemaConstraint::Size { min, max } => {
-            min.hash(h);
-            max.hash(h);
-        }
-    }
-}
-
-fn hash_array(arr: &SchemaArray, h: &mut impl Hasher) {
-    arr.name.hash(h);
-    hash_field_type(&arr.item_type, h);
-    arr.min_items.hash(h);
-    arr.max_items.hash(h);
-    arr.unique.hash(h);
-    arr.columns.hash(h);
-    hash_field_map(arr.item_fields.iter(), h);
-}
-
-fn hash_object_constraint(c: &SchemaObjectConstraint, h: &mut impl Hasher) {
-    std::mem::discriminant(c).hash(h);
-    match c {
-        SchemaObjectConstraint::Invariant(e) => e.hash(h),
-        SchemaObjectConstraint::Cardinality { fields, min, max } => {
-            fields.hash(h);
-            min.hash(h);
-            max.hash(h);
-        }
-    }
+    // Registry differs from the one the stored memo was computed against.
+    Arc::new(build_schema_memo(schema, registry))
 }
 
 /// Validate a document against a schema.
@@ -308,9 +158,17 @@ pub fn validate_with_registry(
     }
 
     // 1. Validate fields defined in schema (including fields synthesized from
-    //    section `_composition` intersections and field-level `@TypeRef`s).
-    let expanded_fields = expand_field_compositions(doc, schema, registry);
-    for (path, field) in &expanded_fields {
+    //    section `_composition` intersections and field-level `@TypeRef`s). The
+    //    document-independent base set is memoized; only schemas with field-level
+    //    `@TypeRef`/`@Reference` types pay the per-document augmentation cost.
+    let augmented;
+    let expanded_fields: &[(String, SchemaField)] = if memo.has_typeref_augmentation {
+        augmented = augment_typeref_fields(&memo.base_fields, doc, schema, registry);
+        &augmented
+    } else {
+        &memo.base_fields
+    };
+    for (path, field) in expanded_fields {
         // Array item-field templates (`path[].field`) are not literal document
         // paths; they are validated per-row, not against the template path.
         if path.contains("[].") {
@@ -1181,8 +1039,10 @@ fn is_object_present(doc: &OdinDocument, path: &str) -> bool {
 /// Build the effective field set for validation: the schema's own fields plus
 /// fields synthesized from section `_composition` intersections and field-level
 /// `@TypeRef`s (which enforce the referenced type's fields under the sub-path).
-fn expand_field_compositions(
-    doc: &OdinDocument,
+/// Build the document-independent field set: section `_composition`
+/// intersections plus the schema's explicit fields. Computed once per schema
+/// (stored in the memo) and reused across documents.
+fn base_field_compositions(
     schema: &OdinSchemaDefinition,
     registry: Option<&TypeRegistry>,
 ) -> Vec<(String, SchemaField)> {
@@ -1217,11 +1077,24 @@ fn expand_field_compositions(
         result.insert(path.clone(), field.clone());
     }
 
-    // Field-level `@TypeRef`: enforce the referenced type's fields under the
-    // field path when the sub-object is present or the field is required.
-    let snapshot: Vec<(String, SchemaField)> =
-        result.iter().map(|(p, f)| (p.clone(), f.clone())).collect();
-    for (path, field) in &snapshot {
+    result.into_iter().collect()
+}
+
+/// Apply field-level `@TypeRef`/`@Reference` augmentation to a base field set:
+/// enforce the referenced type's fields under the field path when the sub-object
+/// is present or the field is required. This is the only document-dependent part
+/// of field-composition expansion, so it runs per call only when such fields exist.
+fn augment_typeref_fields(
+    base: &[(String, SchemaField)],
+    doc: &OdinDocument,
+    schema: &OdinSchemaDefinition,
+    registry: Option<&TypeRegistry>,
+) -> Vec<(String, SchemaField)> {
+    use std::collections::HashMap as Map;
+    let mut result: Map<String, SchemaField> =
+        base.iter().map(|(p, f)| (p.clone(), f.clone())).collect();
+
+    for (path, field) in base {
         let name = match &field.field_type {
             SchemaFieldType::TypeRef(n) => n.clone(),
             SchemaFieldType::Reference(n) => n.clone(),
@@ -1570,6 +1443,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         }
     }
 

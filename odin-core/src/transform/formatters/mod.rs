@@ -803,7 +803,7 @@ fn collect_expr_directives(expr: &crate::types::transform::FieldExpression, dirs
 /// segment definitions, matching the TypeScript `formatFixedWidthLine()`.
 pub fn format_fixed_width_from_segments(
     output: &DynValue,
-    segments: &[crate::types::transform::TransformSegment],
+    segments: &[&crate::types::transform::TransformSegment],
     options: &std::collections::HashMap<String, String>,
 ) -> String {
     let line_ending = options.get("lineEnding").map_or("\n", std::string::String::as_str);

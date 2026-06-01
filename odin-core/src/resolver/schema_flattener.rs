@@ -144,6 +144,7 @@ impl SchemaFlattener {
             fields: merged_fields,
             arrays: merged_arrays,
             constraints: merged_constraints,
+            validation_memo: Default::default(),
         };
 
         FlattenedResult {
@@ -1019,6 +1020,7 @@ mod tests {
                 fields: HashMap::new(),
                 arrays: HashMap::new(),
                 constraints: HashMap::new(),
+                validation_memo: Default::default(),
             },
             resolved_paths: vec![],
             type_registry: super::super::TypeRegistry::new(),
@@ -1070,6 +1072,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported_schema.types.insert(
             "Address".to_string(),
@@ -1139,6 +1142,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported_schema.types.insert(
             "Address".to_string(),
@@ -1185,6 +1189,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported_schema.types.insert(
             "Address".to_string(),
@@ -1226,6 +1231,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported_schema.types.insert(
             "Unused".to_string(),
@@ -1308,6 +1314,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported_schema.types.insert(
             "Address".to_string(),
@@ -1478,6 +1485,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         schema_a.types.insert(
             "TypeA".to_string(),
@@ -1491,6 +1499,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         schema_b.types.insert(
             "TypeB".to_string(),
@@ -1531,6 +1540,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Imported".to_string(),
@@ -1566,6 +1576,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Dup".to_string(),
@@ -1602,6 +1613,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Address".to_string(),
@@ -1754,6 +1766,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Orphan".to_string(),
@@ -1790,6 +1803,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "B".to_string(),
@@ -1834,6 +1848,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert("A".to_string(), make_schema_type("A", vec![]));
         imported.types.insert("B".to_string(), make_schema_type("B", vec![]));
@@ -1877,6 +1892,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Address".to_string(),
@@ -1918,6 +1934,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.fields.insert(
             "addr.line1".to_string(),
@@ -1950,6 +1967,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.arrays.insert(
             "items".to_string(),
@@ -1997,6 +2015,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.fields.insert(
             "shared_path".to_string(),
@@ -2047,6 +2066,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Imported".to_string(),
@@ -2125,6 +2145,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imp_a.types.insert("A".to_string(), make_schema_type("A", vec![]));
 
@@ -2135,6 +2156,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imp_b.types.insert("B".to_string(), make_schema_type("B", vec![]));
 
@@ -2273,6 +2295,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
 
         resolved.imports.push(super::super::ResolvedImport {
@@ -2315,6 +2338,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         let mut ext = make_schema_type("Ext", vec![make_field("v", SchemaFieldType::String)]);
         ext.description = Some("External type".to_string());
@@ -2351,6 +2375,7 @@ mod tests {
                 fields: HashMap::new(),
                 arrays: HashMap::new(),
                 constraints: HashMap::new(),
+                validation_memo: Default::default(),
             };
             imp.types.insert(name.to_string(), make_schema_type(name, vec![
                 make_field("val", SchemaFieldType::String),
@@ -2477,6 +2502,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Imp".to_string(),
@@ -2511,6 +2537,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Remote".to_string(),
@@ -2618,6 +2645,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.constraints.insert(
             "age_range".to_string(),
@@ -2714,6 +2742,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Helper".to_string(),
@@ -2746,6 +2775,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert(
             "Dup".to_string(),
@@ -2819,6 +2849,7 @@ mod tests {
             fields: HashMap::new(),
             arrays: HashMap::new(),
             constraints: HashMap::new(),
+            validation_memo: Default::default(),
         };
         imported.types.insert("R".to_string(), make_schema_type("R", vec![]));
 

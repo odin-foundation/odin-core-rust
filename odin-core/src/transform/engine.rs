@@ -99,9 +99,12 @@ fn compile_check(kind: u8, value: &str) -> CompiledCheck {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Boolean presence flags derived once from a mapping's directives, which are
-/// data-independent and rescanned for every value the mapping processes.
+/// data-independent and otherwise rescanned for every value the mapping processes.
+///
+/// Stored on the mapping itself (see [`FieldMapping::flags_memo`]) and computed
+/// exactly once per mapping object — no per-call key computation.
 #[derive(Clone, Copy, Default)]
-struct MappingFlags {
+pub(crate) struct MappingFlags {
     has_if: bool,
     has_unless: bool,
     has_object: bool,
@@ -111,51 +114,24 @@ struct MappingFlags {
     has_validation: bool,
 }
 
-fn flags_cache() -> &'static Mutex<HashMap<u64, MappingFlags>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, MappingFlags>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// A content fingerprint over a mapping's directive names (presence flags depend
-/// only on which directives are attached, not their values or order).
-fn mapping_flags_key(mapping: &FieldMapping) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut acc: u64 = 0;
-    for d in &mapping.directives {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        d.name.hash(&mut h);
-        acc ^= h.finish();
-    }
-    acc
-}
-
-/// Compute (or reuse) the directive presence flags for a mapping.
+/// Get (computing once) the directive presence flags for a mapping.
 fn mapping_flags(mapping: &FieldMapping) -> MappingFlags {
-    let key = mapping_flags_key(mapping);
-    if let Ok(cache) = flags_cache().lock() {
-        if let Some(f) = cache.get(&key) {
-            return *f;
+    *mapping.flags_memo.get_or_init(|| {
+        let mut f = MappingFlags::default();
+        for d in &mapping.directives {
+            match d.name.as_str() {
+                "if" => f.has_if = true,
+                "unless" => f.has_unless = true,
+                "object" => f.has_object = true,
+                "default" => f.has_default = true,
+                "raw" => f.has_raw = true,
+                "array" => f.has_array = true,
+                "validate" | "enum" | "range" => f.has_validation = true,
+                _ => {}
+            }
         }
-    }
-
-    let mut f = MappingFlags::default();
-    for d in &mapping.directives {
-        match d.name.as_str() {
-            "if" => f.has_if = true,
-            "unless" => f.has_unless = true,
-            "object" => f.has_object = true,
-            "default" => f.has_default = true,
-            "raw" => f.has_raw = true,
-            "array" => f.has_array = true,
-            "validate" | "enum" | "range" => f.has_validation = true,
-            _ => {}
-        }
-    }
-
-    if let Ok(mut cache) = flags_cache().lock() {
-        cache.entry(key).or_insert(f);
-    }
-    f
+        f
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -362,15 +338,20 @@ pub fn execute_with_options(
     let mut output = DynValue::Object(Vec::new());
 
     // Combine local segments with imported mapping segments. Local segments win:
-    // an imported segment whose name collides with a local one is dropped.
+    // an imported segment whose name collides with a local one is dropped. Local
+    // segments are borrowed from the transform (no clone) so each mapping's memo
+    // persists across executions; only the imported extras are owned here.
     let local_names: std::collections::HashSet<&str> =
         transform.segments.iter().map(|s| s.name.as_str()).collect();
-    let mut all_segments: Vec<TransformSegment> = transform.segments.clone();
-    for seg in imported_segments {
-        if !local_names.contains(seg.name.as_str()) {
-            all_segments.push(seg);
-        }
-    }
+    let extra_segments: Vec<TransformSegment> = imported_segments
+        .into_iter()
+        .filter(|seg| !local_names.contains(seg.name.as_str()))
+        .collect();
+    let all_segments: Vec<&TransformSegment> = transform
+        .segments
+        .iter()
+        .chain(extra_segments.iter())
+        .collect();
 
     // 3. Order segments by pass: pass 1 first, then 2, ..., then 0/None last
     let ordered = order_segments_by_pass(&all_segments);
@@ -706,6 +687,7 @@ fn execute_multi_record(
                                 expression: child_mapping.expression.clone(),
                                 directives: child_mapping.directives.clone(),
                                 modifiers: child_mapping.modifiers.clone(),
+                                flags_memo: Default::default(),
                             };
                             process_mapping(&wrapper, &mut ctx, &record_source, &mut record_output, "");
                         }
@@ -727,6 +709,7 @@ fn execute_multi_record(
                         expression: child_mapping.expression.clone(),
                         directives: child_mapping.directives.clone(),
                         modifiers: child_mapping.modifiers.clone(),
+                        flags_memo: Default::default(),
                     };
                     process_mapping(&wrapper, &mut ctx, &record_source, &mut record_output, "");
                 }
@@ -777,7 +760,8 @@ fn execute_multi_record(
         let include_header = transform.target.options.get("header").is_some_and(|v| v == "true");
         formatters::format_odin_with_modifiers(&output, &ctx.field_modifiers, include_header)
     } else if transform.target.format.eq_ignore_ascii_case("fixed-width") {
-        formatters::format_fixed_width_from_segments(&output, &transform.segments, &transform.target.options)
+        let seg_refs: Vec<&TransformSegment> = transform.segments.iter().collect();
+        formatters::format_fixed_width_from_segments(&output, &seg_refs, &transform.target.options)
     } else if transform.target.format.eq_ignore_ascii_case("xml") {
         formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers, &transform.target.namespaces)
     } else {
@@ -802,8 +786,8 @@ fn execute_multi_record(
 
 /// Return references to segments sorted by pass number.
 /// Pass 1 comes first, then 2, etc. Pass 0 or None comes last.
-fn order_segments_by_pass(segments: &[TransformSegment]) -> Vec<&TransformSegment> {
-    let mut refs: Vec<&TransformSegment> = segments.iter().collect();
+fn order_segments_by_pass<'a>(segments: &[&'a TransformSegment]) -> Vec<&'a TransformSegment> {
+    let mut refs: Vec<&TransformSegment> = segments.to_vec();
     refs.sort_by_key(|seg| {
         match seg.pass {
             Some(0) | None => usize::MAX,
@@ -2781,12 +2765,14 @@ fn odin_value_to_dyn(val: &OdinValue) -> DynValue {
 /// Walk the segment tree and collect target fields marked as confidential,
 /// then apply the enforcement mode to those fields in the output.
 fn apply_confidential_enforcement(
-    segments: &[TransformSegment],
+    segments: &[&TransformSegment],
     mode: &ConfidentialMode,
     output: &mut DynValue,
 ) {
     let mut confidential_paths: Vec<String> = Vec::new();
-    collect_confidential_paths(segments, "", &mut confidential_paths);
+    for seg in segments {
+        collect_confidential_paths(std::slice::from_ref(*seg), "", &mut confidential_paths);
+    }
 
     for path in &confidential_paths {
         if let Some(val) = resolve_mut_path(output, path) {
@@ -2863,7 +2849,7 @@ fn resolve_mut_path<'a>(output: &'a mut DynValue, path: &str) -> Option<&'a mut 
 /// Scan fixed-width segment mappings for a field whose `:pos` + `:len` exceeds
 /// the declared `lineWidth`, surfacing a T010 warning for each.
 fn check_fixed_width_overflow(
-    segments: &[TransformSegment],
+    segments: &[&TransformSegment],
     options: &HashMap<String, String>,
     warnings: &mut Vec<TransformWarning>,
 ) {
@@ -2898,7 +2884,7 @@ fn check_fixed_width_overflow(
 
 /// Surface T010 if a mapping carries `:pos`/`:len` on a non-fixed-width target.
 fn check_invalid_positional_modifiers(
-    segments: &[TransformSegment],
+    segments: &[&TransformSegment],
     format: &str,
     warnings: &mut Vec<TransformWarning>,
 ) {
@@ -3442,6 +3428,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -3462,6 +3449,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.address.city".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -3484,6 +3472,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("1.0")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -3506,6 +3495,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -3534,6 +3524,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -3558,6 +3549,7 @@ mod tests {
                 expression: FieldExpression::Copy("$const.version".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants = constants;
@@ -3577,6 +3569,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.items[0].name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -3604,6 +3597,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.nonexistent.field".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -3625,16 +3619,19 @@ mod tests {
                         expression: FieldExpression::Copy("@.street".to_string()),
                         directives: vec![],
                 modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "City".to_string(),
                         expression: FieldExpression::Copy("@.city".to_string()),
                         directives: vec![],
                 modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ]),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -3676,6 +3673,7 @@ mod tests {
                         expression: FieldExpression::Copy("@_item.name".to_string()),
                         directives: vec![],
                 modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -3719,12 +3717,14 @@ mod tests {
                     ns: None,
                     cdata: false,
                 }),
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Name".to_string(),
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -3758,6 +3758,7 @@ mod tests {
                     ns: None,
                     cdata: false,
                 }),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -3781,12 +3782,14 @@ mod tests {
                 expression: FieldExpression::Copy("@.city".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "address.state".to_string(),
                 expression: FieldExpression::Copy("@.state".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -3850,6 +3853,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::integer(1)),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -3926,6 +3930,7 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::string("nope")),
                         directives: vec![],
                 modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -3975,6 +3980,7 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::integer(2)),
                         directives: vec![],
                 modifiers: None,
+                        flags_memo: Default::default(),
                     }],
                     children: Vec::new(),
                     items: Vec::new(),
@@ -3993,6 +3999,7 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::integer(1)),
                         directives: vec![],
                 modifiers: None,
+                        flags_memo: Default::default(),
                     }],
                     children: Vec::new(),
                     items: Vec::new(),
@@ -4035,6 +4042,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4060,6 +4068,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -4193,6 +4202,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4211,6 +4221,7 @@ mod tests {
             expression: FieldExpression::Literal(OdinValues::string("${@.name}")),
             directives: vec![],
             modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let source = DynValue::Object(vec![("name".to_string(), DynValue::String("Alice".to_string()))]);
         let out = execute(&transform, &source).output.unwrap();
@@ -4225,6 +4236,7 @@ mod tests {
             expression: FieldExpression::Literal(OdinValues::string("Total: $${@.amount}")),
             directives: vec![],
             modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let source = DynValue::Object(vec![("amount".to_string(), DynValue::String("42.00".to_string()))]);
         let out = execute(&transform, &source).output.unwrap();
@@ -4239,6 +4251,7 @@ mod tests {
             expression: FieldExpression::Literal(OdinValues::string("Use \\${@.field} here")),
             directives: vec![],
             modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let source = DynValue::Object(vec![("field".to_string(), DynValue::String("X".to_string()))]);
         let out = execute(&transform, &source).output.unwrap();
@@ -4260,6 +4273,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4286,6 +4300,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -4319,6 +4334,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4348,6 +4364,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -4377,6 +4394,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4404,6 +4422,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4431,6 +4450,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -4456,6 +4476,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4483,6 +4504,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4510,6 +4532,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4537,6 +4560,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4567,6 +4591,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4597,6 +4622,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4627,6 +4653,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4655,6 +4682,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4680,6 +4708,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("yes")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(),
             items: Vec::new(),
@@ -4709,6 +4738,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("nope")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(),
             items: Vec::new(),
@@ -4736,6 +4766,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("yes")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(),
             items: Vec::new(),
@@ -4765,6 +4796,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("nope")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(),
             items: Vec::new(),
@@ -4792,6 +4824,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(true, false, false)),
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4813,6 +4846,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.old".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, false, true)),
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4832,6 +4866,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.secret".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -4851,6 +4886,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("value")),
                 directives: vec![],
                 modifiers: Some(make_modifiers(true, true, true)),
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -4870,6 +4906,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("value")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -4886,6 +4923,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.pin".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -4906,6 +4944,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.pin".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -4927,6 +4966,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.flag".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -4947,6 +4987,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.ssn".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         // No enforce_confidential set
@@ -4975,6 +5016,7 @@ mod tests {
                         expression: FieldExpression::Copy("@.name".to_string()),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "address".to_string(),
@@ -4984,6 +5026,7 @@ mod tests {
                                 expression: FieldExpression::Copy("@.street".to_string()),
                                 directives: vec![],
                                 modifiers: None,
+                                flags_memo: Default::default(),
                             },
                             FieldMapping {
                                 target: "geo".to_string(),
@@ -4993,24 +5036,29 @@ mod tests {
                                         expression: FieldExpression::Literal(OdinValues::number(45.5)),
                                         directives: vec![],
                                         modifiers: None,
+                                        flags_memo: Default::default(),
                                     },
                                     FieldMapping {
                                         target: "lng".to_string(),
                                         expression: FieldExpression::Literal(OdinValues::number(-122.6)),
                                         directives: vec![],
                                         modifiers: None,
+                                        flags_memo: Default::default(),
                                     },
                                 ]),
                                 directives: vec![],
                                 modifiers: None,
+                                flags_memo: Default::default(),
                             },
                         ]),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ]),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5044,6 +5092,7 @@ mod tests {
                         }),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "lower_name".to_string(),
@@ -5054,10 +5103,12 @@ mod tests {
                         }),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ]),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5082,16 +5133,19 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::integer(1)),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "format".to_string(),
                         expression: FieldExpression::Literal(OdinValues::string("json")),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ]),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -5111,6 +5165,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("deep")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -5130,18 +5185,21 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("Jane")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "person.last".to_string(),
                 expression: FieldExpression::Literal(OdinValues::string("Doe")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "person.age".to_string(),
                 expression: FieldExpression::Literal(OdinValues::integer(30)),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -5166,6 +5224,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.items[1].name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5188,6 +5247,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.items[99]".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5209,6 +5269,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.tags[0]".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5231,6 +5292,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.people[0].address.city".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5256,6 +5318,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.name[0]".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5275,18 +5338,21 @@ mod tests {
                 expression: FieldExpression::Copy("@.items[0]".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "B".to_string(),
                 expression: FieldExpression::Copy("@.items[1]".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "C".to_string(),
                 expression: FieldExpression::Copy("@.items[2]".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5325,6 +5391,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -5350,6 +5417,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5370,6 +5438,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.nonexistent".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -5396,6 +5465,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -5421,6 +5491,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5457,6 +5528,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5486,6 +5558,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5522,6 +5595,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5563,6 +5637,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5596,6 +5671,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5629,6 +5705,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -5660,12 +5737,14 @@ mod tests {
                     expression: FieldExpression::Copy("@_item.name".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
                 FieldMapping {
                     target: "Index".to_string(),
                     expression: FieldExpression::Copy("@_index".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -5705,6 +5784,7 @@ mod tests {
                     expression: FieldExpression::Copy("@_length".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -5742,6 +5822,7 @@ mod tests {
                     expression: FieldExpression::Copy("@_item.name".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -5774,6 +5855,7 @@ mod tests {
                     expression: FieldExpression::Copy("@_item.address.city".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -5822,6 +5904,7 @@ mod tests {
                     }),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -5858,6 +5941,7 @@ mod tests {
                     expression: FieldExpression::Copy("@_item".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -5893,6 +5977,7 @@ mod tests {
                 expression: FieldExpression::Copy("$const.app_name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants = constants;
@@ -5914,6 +5999,7 @@ mod tests {
                 expression: FieldExpression::Copy("$const.max_retries".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants = constants;
@@ -5935,6 +6021,7 @@ mod tests {
                 expression: FieldExpression::Copy("$const.debug".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants = constants;
@@ -5956,6 +6043,7 @@ mod tests {
                 expression: FieldExpression::Copy("$constants.label".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants = constants;
@@ -5974,6 +6062,7 @@ mod tests {
                 expression: FieldExpression::Copy("$const.nonexistent".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants = HashMap::new();
@@ -6002,6 +6091,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants = constants;
@@ -6028,18 +6118,21 @@ mod tests {
                 expression: FieldExpression::Copy("$const.first".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "B".to_string(),
                 expression: FieldExpression::Copy("$const.second".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "C".to_string(),
                 expression: FieldExpression::Copy("$const.third".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants = constants;
@@ -6068,6 +6161,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6089,6 +6183,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6109,6 +6204,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6131,6 +6227,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6148,6 +6245,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.a.b.c.d.e.f".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -6176,6 +6274,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -6194,12 +6293,14 @@ mod tests {
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "B".to_string(),
                 expression: FieldExpression::Copy("@.age".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6222,6 +6323,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "B".to_string(),
@@ -6232,6 +6334,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6255,6 +6358,7 @@ mod tests {
                 expression: FieldExpression::Copy("@".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -6275,6 +6379,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::integer(42)),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6292,6 +6397,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::boolean(false)),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6309,6 +6415,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::null()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6326,6 +6433,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::number(3.14)),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6343,30 +6451,35 @@ mod tests {
                 expression: FieldExpression::Copy("@.s".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "I".to_string(),
                 expression: FieldExpression::Copy("@.i".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "F".to_string(),
                 expression: FieldExpression::Copy("@.f".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "B".to_string(),
                 expression: FieldExpression::Copy("@.b".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "N".to_string(),
                 expression: FieldExpression::Copy("@.n".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -6394,6 +6507,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.meta.tags".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -6431,6 +6545,7 @@ mod tests {
                     expression: FieldExpression::Copy("@.name".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -6466,6 +6581,7 @@ mod tests {
                     expression: FieldExpression::Copy("@.name".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -6529,6 +6645,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::integer(3)),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -6547,6 +6664,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::integer(2)),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -6565,6 +6683,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::integer(1)),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -6596,12 +6715,14 @@ mod tests {
                     expression: FieldExpression::Copy("@.name".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
                 FieldMapping {
                     target: "Age".to_string(),
                     expression: FieldExpression::Copy("@.age".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -6672,6 +6793,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -6691,6 +6813,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("test")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6710,6 +6833,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("ok")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6727,6 +6851,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("ok")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Bad".to_string(),
@@ -6737,6 +6862,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(Vec::new());
@@ -6768,12 +6894,14 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::string("HDR")),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "Data".to_string(),
                         expression: FieldExpression::Copy("@._raw".to_string()),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -6794,12 +6922,14 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::string("DTL")),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "Data".to_string(),
                         expression: FieldExpression::Copy("@._raw".to_string()),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -6844,12 +6974,14 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::string("A")),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "Value".to_string(),
                         expression: FieldExpression::Copy("@.1".to_string()),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -6870,12 +7002,14 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::string("B")),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "Value".to_string(),
                         expression: FieldExpression::Copy("@.1".to_string()),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -6940,6 +7074,7 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::string("REC")),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -6979,6 +7114,7 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::string("AAA")),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -7026,6 +7162,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("first")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7044,6 +7181,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("second")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7074,6 +7212,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("last")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7092,6 +7231,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("first")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7121,6 +7261,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::integer(1)),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7139,6 +7280,7 @@ mod tests {
                     expression: FieldExpression::Copy("$accumulator.counter".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7173,6 +7315,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::integer(1)),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7191,6 +7334,7 @@ mod tests {
                     expression: FieldExpression::Copy("$accumulator.persist_counter".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7225,6 +7369,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::integer(3)),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7243,6 +7388,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::integer(1)),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7261,6 +7407,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::integer(2)),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7288,18 +7435,21 @@ mod tests {
                 expression: FieldExpression::Copy("@.ssn".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "DOB".to_string(),
                 expression: FieldExpression::Copy("@.dob".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Name".to_string(),
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -7324,6 +7474,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.secret".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -7344,6 +7495,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.flag".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -7364,6 +7516,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.salary".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -7384,6 +7537,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.token".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -7404,6 +7558,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.val".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(true, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -7432,6 +7587,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("deep")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -7451,18 +7607,21 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("John")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "person.last".to_string(),
                 expression: FieldExpression::Literal(OdinValues::string("Doe")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "person.age".to_string(),
                 expression: FieldExpression::Literal(OdinValues::integer(30)),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -7489,6 +7648,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("outer_val")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: vec![TransformSegment {
@@ -7504,6 +7664,7 @@ mod tests {
                         expression: FieldExpression::Literal(OdinValues::string("inner_val")),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(),
@@ -7538,14 +7699,17 @@ mod tests {
                                 expression: FieldExpression::Literal(OdinValues::string("deep")),
                                 directives: vec![],
                                 modifiers: None,
+                                flags_memo: Default::default(),
                             },
                         ]),
                         directives: vec![],
                         modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ]),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -7579,6 +7743,7 @@ mod tests {
                     }),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -7615,6 +7780,7 @@ mod tests {
                     expression: FieldExpression::Copy("@_item".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -7653,6 +7819,7 @@ mod tests {
                     expression: FieldExpression::Copy("@_item".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -7683,12 +7850,14 @@ mod tests {
                     expression: FieldExpression::Copy("@_index".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
                 FieldMapping {
                     target: "Len".to_string(),
                     expression: FieldExpression::Copy("@_length".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ],
             children: Vec::new(),
@@ -7730,6 +7899,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants.insert("suffix".to_string(), OdinValues::string("_v2"));
@@ -7750,6 +7920,7 @@ mod tests {
                 expression: FieldExpression::Copy("$const.rate".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants.insert("rate".to_string(), OdinValue::Number { value: 0.05, decimal_places: None, raw: Some("0.05".to_string()), modifiers: Default::default(), directives: Vec::new() });
@@ -7767,6 +7938,7 @@ mod tests {
                 expression: FieldExpression::Copy("$const.active".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants.insert("active".to_string(), OdinValues::boolean(true));
@@ -7784,18 +7956,21 @@ mod tests {
                 expression: FieldExpression::Copy("$const.alpha".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "B".to_string(),
                 expression: FieldExpression::Copy("$const.beta".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "C".to_string(),
                 expression: FieldExpression::Copy("$const.gamma".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.constants.insert("alpha".to_string(), OdinValues::string("a"));
@@ -7825,6 +8000,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "B".to_string(),
@@ -7835,6 +8011,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -7854,12 +8031,14 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Good".to_string(),
                 expression: FieldExpression::Literal(OdinValues::string("ok")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -7876,6 +8055,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("Alice")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Err".to_string(),
@@ -7886,6 +8066,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -7916,6 +8097,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("matched")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7950,6 +8132,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("yes")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -7984,6 +8167,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("yes")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(),
                 items: Vec::new(),
@@ -8018,6 +8202,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("should not appear")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(),
             items: Vec::new(),
@@ -8047,6 +8232,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("data")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(),
             items: Vec::new(),
@@ -8076,6 +8262,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("yes")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(),
             items: Vec::new(),
@@ -8103,6 +8290,7 @@ mod tests {
                 expression: FieldExpression::Copy("@".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Object(vec![
@@ -8234,7 +8422,8 @@ mod tests {
             TransformSegment { name: "A".to_string(), path: String::new(), source_path: None, discriminator: None, is_array: false, directives: Vec::new(), mappings: Vec::new(), children: Vec::new(), items: Vec::new(), pass: None, condition: None },
             TransformSegment { name: "B".to_string(), path: String::new(), source_path: None, discriminator: None, is_array: false, directives: Vec::new(), mappings: Vec::new(), children: Vec::new(), items: Vec::new(), pass: None, condition: None },
         ];
-        let ordered = order_segments_by_pass(&segs);
+        let seg_refs: Vec<&TransformSegment> = segs.iter().collect();
+        let ordered = order_segments_by_pass(&seg_refs);
         assert_eq!(ordered.len(), 2);
     }
 
@@ -8244,7 +8433,8 @@ mod tests {
             TransformSegment { name: "Last".to_string(), path: String::new(), source_path: None, discriminator: None, is_array: false, directives: Vec::new(), mappings: Vec::new(), children: Vec::new(), items: Vec::new(), pass: Some(0), condition: None },
             TransformSegment { name: "First".to_string(), path: String::new(), source_path: None, discriminator: None, is_array: false, directives: Vec::new(), mappings: Vec::new(), children: Vec::new(), items: Vec::new(), pass: Some(1), condition: None },
         ];
-        let ordered = order_segments_by_pass(&segs);
+        let seg_refs: Vec<&TransformSegment> = segs.iter().collect();
+        let ordered = order_segments_by_pass(&seg_refs);
         assert_eq!(ordered[0].name, "First");
         assert_eq!(ordered[1].name, "Last");
     }
@@ -8257,6 +8447,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::null()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -8273,6 +8464,7 @@ mod tests {
                 expression: FieldExpression::Copy("@[1]".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let source = DynValue::Array(vec![
@@ -8305,6 +8497,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -8330,6 +8523,7 @@ mod tests {
                 expression: FieldExpression::Literal(OdinValues::string("value")),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&transform, &DynValue::Object(Vec::new()));
@@ -8381,6 +8575,7 @@ mod tests {
             expression: FieldExpression::Literal(OdinValues::string(type_val)),
             directives: vec![],
             modifiers: None,
+            flags_memo: Default::default(),
         }];
         let items: Vec<crate::types::transform::SegmentItem> = all_mappings.iter()
             .chain(mappings.iter())
@@ -8410,6 +8605,7 @@ mod tests {
             expression: FieldExpression::Literal(OdinValues::string(type_val)),
             directives: vec![],
             modifiers: None,
+            flags_memo: Default::default(),
         }];
         let items: Vec<crate::types::transform::SegmentItem> = all_mappings.iter()
             .chain(mappings.iter())
@@ -8440,6 +8636,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("header")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8460,6 +8657,7 @@ mod tests {
                     expression: FieldExpression::Copy("@.1".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8484,6 +8682,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("header")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
             mr_segment("Detail", "DTL", vec![
@@ -8492,6 +8691,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("detail")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8518,6 +8718,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("item")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8538,6 +8739,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("header")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8573,6 +8775,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("found")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8595,6 +8798,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("yes")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8614,6 +8818,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("a")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
             mr_segment("B_Rec", "B", vec![
@@ -8622,6 +8827,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("b")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8642,6 +8848,7 @@ mod tests {
                     expression: FieldExpression::Copy("@.2".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8677,6 +8884,7 @@ mod tests {
                     expression: FieldExpression::Copy("@.x".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8698,6 +8906,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("yes")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8730,6 +8939,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("found")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8749,6 +8959,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("header")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
             mr_segment("Details", "D", vec![
@@ -8757,6 +8968,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("detail")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
             mr_segment("Trailers", "T", vec![
@@ -8765,6 +8977,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("trailer")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8789,6 +9002,7 @@ mod tests {
                     expression: FieldExpression::Copy("@._raw".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8811,12 +9025,14 @@ mod tests {
                     expression: FieldExpression::Copy("@.1".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
                 FieldMapping {
                     target: "Col2".to_string(),
                     expression: FieldExpression::Copy("@.2".to_string()),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8841,6 +9057,7 @@ mod tests {
                     expression: FieldExpression::Literal(OdinValues::string("matched")),
                     directives: vec![],
                     modifiers: None,
+                    flags_memo: Default::default(),
                 },
             ]),
         ]);
@@ -8865,6 +9082,7 @@ mod tests {
                     target: "Third".to_string(),
                     expression: FieldExpression::Literal(OdinValues::integer(3)),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(3), condition: None,
@@ -8876,6 +9094,7 @@ mod tests {
                     target: "First".to_string(),
                     expression: FieldExpression::Literal(OdinValues::integer(1)),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -8887,6 +9106,7 @@ mod tests {
                     target: "Second".to_string(),
                     expression: FieldExpression::Literal(OdinValues::integer(2)),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(2), condition: None,
@@ -8911,6 +9131,7 @@ mod tests {
                     target: "Late".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("last")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: None, condition: None,
@@ -8922,6 +9143,7 @@ mod tests {
                     target: "Early".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("first")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -8944,6 +9166,7 @@ mod tests {
                     target: "A".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("a")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -8955,6 +9178,7 @@ mod tests {
                     target: "B".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("b")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -8978,6 +9202,7 @@ mod tests {
                     target: "P3".to_string(),
                     expression: FieldExpression::Literal(OdinValues::integer(3)),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(3), condition: None,
@@ -8989,6 +9214,7 @@ mod tests {
                     target: "P1".to_string(),
                     expression: FieldExpression::Literal(OdinValues::integer(1)),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -9012,6 +9238,7 @@ mod tests {
                     target: "Base".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("hello")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -9023,6 +9250,7 @@ mod tests {
                     target: "Derived".to_string(),
                     expression: FieldExpression::Copy("Base".to_string()),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(2), condition: None,
@@ -9045,6 +9273,7 @@ mod tests {
                     target: "PassZero".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("last")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(0), condition: None,
@@ -9056,6 +9285,7 @@ mod tests {
                     target: "PassOne".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("first")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -9080,6 +9310,7 @@ mod tests {
                     target: "Name".to_string(),
                     expression: FieldExpression::Copy("@_item.name".to_string()),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -9112,6 +9343,7 @@ mod tests {
                 target: format!("P{}", i),
                 expression: FieldExpression::Literal(OdinValues::integer(i as i64)),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(), items: Vec::new(),
             pass: Some(i), condition: None,
@@ -9135,6 +9367,7 @@ mod tests {
                     target: "FromNone".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("none")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: None, condition: None,
@@ -9146,6 +9379,7 @@ mod tests {
                     target: "FromZero".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("zero")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(0), condition: None,
@@ -9157,6 +9391,7 @@ mod tests {
                     target: "Early".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("early")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -9180,6 +9415,7 @@ mod tests {
                     target: "Val".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("from_pass1")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1), condition: None,
@@ -9191,6 +9427,7 @@ mod tests {
                     target: "Val".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("from_pass2")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(2), condition: None,
@@ -9214,6 +9451,7 @@ mod tests {
                     target: "Skipped".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("no")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(1),
@@ -9226,6 +9464,7 @@ mod tests {
                     target: "Included".to_string(),
                     expression: FieldExpression::Literal(OdinValues::string("yes")),
                     directives: vec![], modifiers: None,
+                    flags_memo: Default::default(),
                 }],
                 children: Vec::new(), items: Vec::new(),
                 pass: Some(2), condition: None,
@@ -9252,11 +9491,13 @@ mod tests {
                         target: "A".to_string(),
                         expression: FieldExpression::Literal(OdinValues::integer(1)),
                         directives: vec![], modifiers: None,
+                        flags_memo: Default::default(),
                     },
                     FieldMapping {
                         target: "B".to_string(),
                         expression: FieldExpression::Literal(OdinValues::integer(2)),
                         directives: vec![], modifiers: None,
+                        flags_memo: Default::default(),
                     },
                 ],
                 children: Vec::new(), items: Vec::new(),
@@ -9282,6 +9523,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.secret".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -9302,6 +9544,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.salary".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -9322,6 +9565,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.access".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -9342,12 +9586,14 @@ mod tests {
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Private".to_string(),
                 expression: FieldExpression::Copy("@.ssn".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -9370,6 +9616,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.pw".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -9390,12 +9637,14 @@ mod tests {
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Token".to_string(),
                 expression: FieldExpression::Copy("@.token".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -9418,6 +9667,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.secret".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         // enforce_confidential is None by default
@@ -9439,12 +9689,14 @@ mod tests {
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "info.ssn".to_string(),
                 expression: FieldExpression::Copy("@.ssn".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -9469,18 +9721,21 @@ mod tests {
                 expression: FieldExpression::Copy("@.ssn".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "DOB".to_string(),
                 expression: FieldExpression::Copy("@.dob".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Name".to_string(),
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -9505,6 +9760,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.flag".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -9526,6 +9782,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.val".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -9547,6 +9804,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.missing".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -9565,6 +9823,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.val".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(true, true, false)), // required AND confidential
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -9589,6 +9848,7 @@ mod tests {
                 expression: FieldExpression::Copy("@.amount".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
@@ -9625,12 +9885,14 @@ mod tests {
                 expression: FieldExpression::Copy("$const.ver".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Author".to_string(),
                 expression: FieldExpression::Copy("$const.author".to_string()),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ])]);
         t.constants.insert("ver".to_string(), OdinValues::string("3.0"));
@@ -9657,6 +9919,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ])]);
         t.tables.insert("states".to_string(), LookupTable {
@@ -9692,6 +9955,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ])]);
         t.tables.insert("states".to_string(), LookupTable {
@@ -9721,6 +9985,7 @@ mod tests {
                 target: "Premium".to_string(),
                 expression: FieldExpression::Literal(OdinValues::string("yes")),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(), items: Vec::new(),
             pass: None,
@@ -9745,6 +10010,7 @@ mod tests {
                 target: "Premium".to_string(),
                 expression: FieldExpression::Literal(OdinValues::string("yes")),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(), items: Vec::new(),
             pass: None,
@@ -9774,6 +10040,7 @@ mod tests {
                     args: vec![VerbArg::Reference("@_item.name".to_string(), Vec::new())],
                 }),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             }],
             children: Vec::new(), items: Vec::new(),
             pass: None, condition: None,
@@ -9808,6 +10075,7 @@ mod tests {
                     ],
                 }),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             },
         ])]);
         t.constants.insert("prefix".to_string(), OdinValues::string("Hello"));
@@ -9825,21 +10093,25 @@ mod tests {
                 target: "A".to_string(),
                 expression: FieldExpression::Literal(OdinValues::string("alpha")),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "B".to_string(),
                 expression: FieldExpression::Literal(OdinValues::integer(42)),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "C".to_string(),
                 expression: FieldExpression::Literal(OdinValues::boolean(true)),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "D".to_string(),
                 expression: FieldExpression::Literal(OdinValues::null()),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         let result = execute(&t, &DynValue::Object(Vec::new()));
@@ -9866,6 +10138,7 @@ mod tests {
                 }),
                 directives: vec![],
                 modifiers: None,
+                flags_memo: Default::default(),
             },
         ])]);
         t.tables.insert("colors".to_string(), LookupTable {
@@ -9973,6 +10246,7 @@ mod extended_tests {
             target: target.to_string(),
             expression: FieldExpression::Copy(src.to_string()),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }
     }
 
@@ -9981,6 +10255,7 @@ mod extended_tests {
             target: target.to_string(),
             expression: FieldExpression::Literal(val),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }
     }
 
@@ -9991,6 +10266,7 @@ mod extended_tests {
                 verb: verb.to_string(), is_custom: false, args,
             }),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }
     }
 
@@ -10023,6 +10299,7 @@ mod extended_tests {
             target: target.to_string(),
             expression: FieldExpression::Copy(src.to_string()),
             directives: vec![], modifiers: Some(mods),
+            flags_memo: Default::default(),
         }
     }
 
@@ -11241,6 +11518,7 @@ mod extended_tests {
                 copy_field("city", "@.city"),
             ]),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let result = execute(&t, &src_obj(vec![("name", s("Bob")), ("city", s("NYC"))]));
         assert!(result.success);
@@ -11258,6 +11536,7 @@ mod extended_tests {
                 verb_field("upperName", "upper", vec![ref_arg("@.name")]),
             ]),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let result = execute(&t, &src_obj(vec![("name", s("alice"))]));
         assert!(result.success);
@@ -12140,6 +12419,7 @@ mod extended_tests {
             target: "Empty".to_string(),
             expression: FieldExpression::Object(vec![]),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let result = execute(&t, &src_obj(vec![]));
         assert!(result.success);
@@ -12371,6 +12651,7 @@ mod extended_tests_2 {
             }),
             directives: vec![],
             modifiers: None,
+            flags_memo: Default::default(),
         }
     }
 
@@ -12380,6 +12661,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy(source_path.to_string()),
             directives: vec![],
             modifiers: None,
+            flags_memo: Default::default(),
         }
     }
 
@@ -12389,6 +12671,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Literal(val),
             directives: vec![],
             modifiers: None,
+            flags_memo: Default::default(),
         }
     }
 
@@ -12591,6 +12874,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.ssn".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![("ssn", s("123-45-6789"))]));
@@ -12605,6 +12889,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.pin".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![("pin", i(1234))]));
@@ -12619,6 +12904,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.flag".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![("flag", b(true))]));
@@ -12633,6 +12919,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.bal".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![("bal", f(1234.56))]));
@@ -12647,6 +12934,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.ssn".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
         let r = execute(&t, &json_obj(vec![("ssn", s("123-45-6789"))]));
@@ -12669,6 +12957,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.pin".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
         let r = execute(&t, &json_obj(vec![("pin", i(1234))]));
@@ -12683,6 +12972,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.flag".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
         let r = execute(&t, &json_obj(vec![("flag", b(false))]));
@@ -12697,6 +12987,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.ssn".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         // enforce_confidential defaults to None
         let r = execute(&t, &json_obj(vec![("ssn", s("123-45-6789"))]));
@@ -12711,6 +13002,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.ssn".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![("ssn", s("123"))]));
@@ -12726,17 +13018,20 @@ mod extended_tests_2 {
                 target: "Name".to_string(),
                 expression: FieldExpression::Copy("@.name".to_string()),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "SSN".to_string(),
                 expression: FieldExpression::Copy("@.ssn".to_string()),
                 directives: vec![],
                 modifiers: Some(make_modifiers(false, true, false)),
+                flags_memo: Default::default(),
             },
             FieldMapping {
                 target: "Email".to_string(),
                 expression: FieldExpression::Copy("@.email".to_string()),
                 directives: vec![], modifiers: None,
+                flags_memo: Default::default(),
             },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
@@ -12758,6 +13053,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.key".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(true, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![("key", s("secret"))]));
@@ -12774,6 +13070,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.old".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, true)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![("old", s("legacy"))]));
@@ -12790,6 +13087,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.missing".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![]));
@@ -12804,6 +13102,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.val".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
         let r = execute(&t, &json_obj(vec![("val", s(""))]));
@@ -12819,6 +13118,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.val".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
         let r = execute(&t, &json_obj(vec![("val", s("X"))]));
@@ -12833,6 +13133,7 @@ mod extended_tests_2 {
             expression: FieldExpression::Copy("@.amt".to_string()),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Mask);
         let r = execute(&t, &json_obj(vec![("amt", f(99.99))]));
@@ -12851,6 +13152,7 @@ mod extended_tests_2 {
             }),
             directives: vec![],
             modifiers: Some(make_modifiers(false, true, false)),
+            flags_memo: Default::default(),
         }]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let r = execute(&t, &json_obj(vec![("ssn", s("abc"))]));
@@ -12863,11 +13165,11 @@ mod extended_tests_2 {
     fn ext_confidential_three_confidential_fields_all_redacted() {
         let mut t = minimal_transform(vec![
             FieldMapping { target: "A".into(), expression: FieldExpression::Copy("@.a".into()),
-                directives: vec![], modifiers: Some(make_modifiers(false, true, false)) },
+                directives: vec![], modifiers: Some(make_modifiers(false, true, false)), flags_memo: Default::default() },
             FieldMapping { target: "B".into(), expression: FieldExpression::Copy("@.b".into()),
-                directives: vec![], modifiers: Some(make_modifiers(false, true, false)) },
+                directives: vec![], modifiers: Some(make_modifiers(false, true, false)), flags_memo: Default::default() },
             FieldMapping { target: "C".into(), expression: FieldExpression::Copy("@.c".into()),
-                directives: vec![], modifiers: Some(make_modifiers(false, true, false)) },
+                directives: vec![], modifiers: Some(make_modifiers(false, true, false)), flags_memo: Default::default() },
         ]);
         t.enforce_confidential = Some(ConfidentialMode::Redact);
         let src = json_obj(vec![("a", s("1")), ("b", s("2")), ("c", s("3"))]);
@@ -13118,6 +13420,7 @@ mod extended_tests_2 {
                 })],
             }),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let r = execute(&t, &json_obj(vec![("a", s("hello")), ("b", s("world"))]));
         assert!(r.success);
@@ -13138,6 +13441,7 @@ mod extended_tests_2 {
                 })],
             }),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let r = execute(&t, &json_obj(vec![("name", s("  hello  "))]));
         assert!(r.success);
@@ -13161,6 +13465,7 @@ mod extended_tests_2 {
                 })],
             }),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let r = execute(&t, &DynValue::Object(Vec::new()));
         assert!(r.success);
@@ -13187,6 +13492,7 @@ mod extended_tests_2 {
                 ],
             }),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let r = execute(&t, &json_obj(vec![("a", i(5)), ("b", i(3))]));
         assert!(r.success);
@@ -13206,6 +13512,7 @@ mod extended_tests_2 {
                 ],
             }),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let r = execute(&t, &json_obj(vec![]));
         assert!(r.success);
@@ -13226,6 +13533,7 @@ mod extended_tests_2 {
                 ],
             }),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let r = execute(&t, &json_obj(vec![("flag", b(true))]));
         assert!(r.success);
@@ -13246,6 +13554,7 @@ mod extended_tests_2 {
                 ],
             }),
             directives: vec![], modifiers: None,
+            flags_memo: Default::default(),
         }]);
         let r = execute(&t, &json_obj(vec![("flag", b(false))]));
         assert!(r.success);
