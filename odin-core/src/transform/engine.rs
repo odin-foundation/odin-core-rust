@@ -199,11 +199,10 @@ impl ErrorPolicy {
 /// Known output formats. An unrecognized format triggers a T006 error rather
 /// than a silent JSON fallback.
 fn is_known_output_format(format: &str) -> bool {
-    matches!(
-        format.to_ascii_lowercase().as_str(),
-        "odin" | "json" | "xml" | "csv" | "fixed-width" | "fwf"
-            | "flat" | "properties" | "delimited"
-    )
+    const KNOWN: [&str; 9] = [
+        "odin", "json", "xml", "csv", "fixed-width", "fwf", "flat", "properties", "delimited",
+    ];
+    KNOWN.iter().any(|k| format.eq_ignore_ascii_case(k))
 }
 
 /// Policy applied when a `%lookup` reports a miss.
@@ -301,9 +300,14 @@ pub fn execute_with_options(
     }).collect::<HashMap<_, _>>();
 
     // Merge imported declarations ($table, constants, accumulators, named
-    // segments). Local declarations win.
-    let (constants, accumulators, tables, imported_segments) =
-        merge_imports(transform, options, constants, accumulators);
+    // segments) only when imports are actually resolvable. The common no-import
+    // path skips the table clone and segment-merge bookkeeping entirely.
+    let has_imports = options.import_resolver.is_some() && !transform.imports.is_empty();
+    let (constants, accumulators, tables, imported_segments) = if has_imports {
+        merge_imports(transform, options, constants, accumulators)
+    } else {
+        (constants, accumulators, transform.tables.clone(), Vec::new())
+    };
 
     // Determine source format from source config or direction string
     let source_format = transform.source.as_ref().map(|s| s.format.clone())
@@ -340,48 +344,69 @@ pub fn execute_with_options(
     // Combine local segments with imported mapping segments. Local segments win:
     // an imported segment whose name collides with a local one is dropped. Local
     // segments are borrowed from the transform (no clone) so each mapping's memo
-    // persists across executions; only the imported extras are owned here.
-    let local_names: std::collections::HashSet<&str> =
-        transform.segments.iter().map(|s| s.name.as_str()).collect();
-    let extra_segments: Vec<TransformSegment> = imported_segments
-        .into_iter()
-        .filter(|seg| !local_names.contains(seg.name.as_str()))
-        .collect();
+    // persists across executions; only the imported extras are owned here. The
+    // no-import path borrows `transform.segments` directly with no allocation.
+    let extra_segments: Vec<TransformSegment> = if imported_segments.is_empty() {
+        Vec::new()
+    } else {
+        let local_names: std::collections::HashSet<&str> =
+            transform.segments.iter().map(|s| s.name.as_str()).collect();
+        imported_segments
+            .into_iter()
+            .filter(|seg| !local_names.contains(seg.name.as_str()))
+            .collect()
+    };
     let all_segments: Vec<&TransformSegment> = transform
         .segments
         .iter()
         .chain(extra_segments.iter())
         .collect();
 
-    // 3. Order segments by pass: pass 1 first, then 2, ..., then 0/None last
-    let ordered = order_segments_by_pass(&all_segments);
+    // 3. Order segments by pass: pass 1 first, then 2, ..., then 0/None last.
+    // Single-pass transforms (the common case) need no reordering or grouping:
+    // process every segment in one run and skip the per-pass snapshot/reset.
+    let single_pass = all_segments
+        .first()
+        .map(|f| f.pass)
+        .map_or(true, |p| all_segments.iter().all(|s| s.pass == p));
 
-    // Group ordered segments into runs of equal pass. Conditional chains are
-    // resolved within each pass run, so a chain never spans a pass boundary.
-    let mut is_first_pass = true;
-    let mut start = 0;
-    while start < ordered.len() {
-        let pass = ordered[start].pass;
-        let mut end = start + 1;
-        while end < ordered.len() && ordered[end].pass == pass {
-            end += 1;
-        }
+    if single_pass {
+        process_segment_list(&all_segments, &mut ctx, &mut output);
+    } else {
+        let ordered = order_segments_by_pass(&all_segments);
 
-        // Reset non-persist accumulators at each pass transition. The first
-        // pass never resets; all subsequent pass transitions do.
-        if !is_first_pass {
-            for (name, def) in &transform.accumulators {
-                if !def.persist {
-                    let initial = odin_value_to_dyn(&def.initial);
-                    ctx.accumulators.insert(name.clone(), initial);
+        // Group ordered segments into runs of equal pass. Conditional chains are
+        // resolved within each pass run, so a chain never spans a pass boundary.
+        let mut is_first_pass = true;
+        let mut start = 0;
+        let last = ordered.len();
+        while start < last {
+            let pass = ordered[start].pass;
+            let mut end = start + 1;
+            while end < last && ordered[end].pass == pass {
+                end += 1;
+            }
+
+            // Reset non-persist accumulators at each pass transition. The first
+            // pass never resets; all subsequent pass transitions do.
+            if !is_first_pass {
+                for (name, def) in &transform.accumulators {
+                    if !def.persist {
+                        let initial = odin_value_to_dyn(&def.initial);
+                        ctx.accumulators.insert(name.clone(), initial);
+                    }
                 }
             }
-        }
-        is_first_pass = false;
+            is_first_pass = false;
 
-        process_segment_list(&ordered[start..end], &mut ctx, &mut output);
-        ctx.global_output = output.clone();
-        start = end;
+            process_segment_list(&ordered[start..end], &mut ctx, &mut output);
+            // Snapshot the global output only when a subsequent pass remains;
+            // the final pass discards the snapshot, so cloning it is wasted work.
+            if end < last {
+                ctx.global_output = output.clone();
+            }
+            start = end;
+        }
     }
 
     // 4. Apply confidential enforcement to the entire output tree
@@ -392,27 +417,33 @@ pub fn execute_with_options(
     // 5. Format the output. The effective format is the explicit `target.format`,
     // or the direction's target side, defaulting to JSON. An unknown explicit
     // format is a T006 error and yields no formatted output (no silent fallback).
-    let effective_format = if transform.target.format.is_empty() {
+    // Borrowed from the transform — no per-execute allocation.
+    let effective_format: &str = if transform.target.format.is_empty() {
         transform.metadata.direction.as_deref()
             .and_then(|d| d.split("->").nth(1))
             .filter(|f| !f.is_empty())
             .unwrap_or("json")
-            .to_string()
     } else {
-        transform.target.format.clone()
+        transform.target.format.as_str()
     };
+
+    let is_fixed_width = effective_format.eq_ignore_ascii_case("fixed-width");
 
     // Positional directives (:pos/:len) only apply to fixed-width output; on any
     // other format they are invalid modifiers — report T007 (warn by default).
-    if is_known_output_format(&effective_format) && !effective_format.eq_ignore_ascii_case("fixed-width") {
-        check_invalid_positional_modifiers(&all_segments, &effective_format, &mut ctx.warnings);
+    // Skip the segment walk entirely unless some mapping actually carries one.
+    if is_known_output_format(effective_format)
+        && !is_fixed_width
+        && all_segments.iter().any(|s| segment_has_positional_directive(s))
+    {
+        check_invalid_positional_modifiers(&all_segments, effective_format, &mut ctx.warnings);
     }
 
-    let formatted = if is_known_output_format(&effective_format) {
+    let formatted = if is_known_output_format(effective_format) {
         if effective_format.eq_ignore_ascii_case("odin") {
             let include_header = transform.target.options.get("header").is_some_and(|v| v == "true");
             formatters::format_odin_with_modifiers(&output, &ctx.field_modifiers, include_header)
-        } else if effective_format.eq_ignore_ascii_case("fixed-width") {
+        } else if is_fixed_width {
             // Fixed-width export uses segment mapping directives for positioning.
             // A field whose :pos + :len exceeds the declared lineWidth overflows
             // the line — report T010 (warn by default).
@@ -421,10 +452,10 @@ pub fn execute_with_options(
         } else if effective_format.eq_ignore_ascii_case("xml") {
             formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers, &transform.target.namespaces)
         } else {
-            format_output(&output, &effective_format, &transform.target.options)
+            format_output(&output, effective_format, &transform.target.options)
         }
     } else {
-        ctx.errors.push(invalid_output_format_error(&effective_format));
+        ctx.errors.push(invalid_output_format_error(effective_format));
         String::new()
     };
 
@@ -2042,23 +2073,26 @@ fn execute_verb_call(
 
     // Stateful sequence verbs are handled here so the counter persists across
     // mappings. `%sequence` returns 1 on first use then increments; an optional
-    // second argument sets the starting value. `%resetSequence` clears it.
-    if call.verb == "sequence" {
-        if let Some(name) = evaluated_args.first().and_then(DynValue::as_str) {
-            let name = name.to_string();
-            let start = evaluated_args.get(1).and_then(DynValue::as_i64).unwrap_or(1);
-            let next = match ctx.sequence_counters.get(&name) {
-                Some(cur) => cur + 1,
-                None => start,
-            };
-            ctx.sequence_counters.insert(name, next);
-            return Ok(DynValue::Integer(next));
+    // second argument sets the starting value. `%resetSequence` clears it. Gated
+    // on the leading byte so non-sequence verbs skip both name comparisons.
+    if matches!(call.verb.as_bytes().first(), Some(b's' | b'r')) {
+        if call.verb == "sequence" {
+            if let Some(name) = evaluated_args.first().and_then(DynValue::as_str) {
+                let name = name.to_string();
+                let start = evaluated_args.get(1).and_then(DynValue::as_i64).unwrap_or(1);
+                let next = match ctx.sequence_counters.get(&name) {
+                    Some(cur) => cur + 1,
+                    None => start,
+                };
+                ctx.sequence_counters.insert(name, next);
+                return Ok(DynValue::Integer(next));
+            }
         }
-    }
-    if call.verb == "resetSequence" {
-        if let Some(name) = evaluated_args.first().and_then(DynValue::as_str) {
-            ctx.sequence_counters.remove(name);
-            return Ok(DynValue::Integer(0));
+        if call.verb == "resetSequence" {
+            if let Some(name) = evaluated_args.first().and_then(DynValue::as_str) {
+                ctx.sequence_counters.remove(name);
+                return Ok(DynValue::Integer(0));
+            }
         }
     }
 
@@ -2216,6 +2250,10 @@ fn evaluate_verb_arg(
 /// accumulator-style reference (`@$accumulator.rownum`) that the spec allows
 /// for reading a loop counter.
 fn lookup_loop_var(loop_vars: &HashMap<String, DynValue>, path: &str) -> Option<DynValue> {
+    // No loop/alias bindings in scope: skip the path parsing entirely.
+    if loop_vars.is_empty() {
+        return None;
+    }
     let clean = path.strip_prefix('@').unwrap_or(path);
     let name = clean
         .strip_prefix("$accumulator.")
@@ -2232,6 +2270,10 @@ fn lookup_loop_var(loop_vars: &HashMap<String, DynValue>, path: &str) -> Option<
 /// alias (a `:as` binding). Returns `None` when the first segment is not a bound
 /// alias, or when the path has no sub-path.
 fn lookup_alias_path(loop_vars: &HashMap<String, DynValue>, path: &str) -> Option<DynValue> {
+    // No alias bindings in scope: nothing to resolve against.
+    if loop_vars.is_empty() {
+        return None;
+    }
     let clean = path.strip_prefix('@').unwrap_or(path);
     let first = clean.split(['.', '[']).next()?;
     if first.is_empty() || first == clean {
@@ -2908,6 +2950,28 @@ fn check_invalid_positional_modifiers(
     for seg in segments {
         walk(seg, format, warnings);
     }
+}
+
+/// Cheap, non-allocating check: does any mapping in this segment subtree carry a
+/// `:pos`/`:len` directive (directly or on a verb-arg reference)? Used to gate the
+/// T007 scan so non-positional transforms skip the directive walk.
+fn segment_has_positional_directive(seg: &TransformSegment) -> bool {
+    use crate::types::transform::{FieldExpression, VerbArg};
+    for mapping in &seg.mappings {
+        if mapping.directives.iter().any(|d| d.name == "pos" || d.name == "len") {
+            return true;
+        }
+        if let FieldExpression::Transform(call) = &mapping.expression {
+            for arg in &call.args {
+                if let VerbArg::Reference(_, ref_dirs) = arg {
+                    if ref_dirs.iter().any(|d| d.name == "pos" || d.name == "len") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    seg.children.iter().any(segment_has_positional_directive)
 }
 
 /// Gather `:pos`/`:len` directives for a mapping (direct or on verb-arg references).
