@@ -8,14 +8,27 @@ pub fn validate_format(value: &str, format: &str) -> Option<Result<(), String>> 
     match format.to_ascii_lowercase().as_str() {
         "email" => Some(validate_email(value)),
         "url" => Some(validate_url(value)),
+        "uri" => Some(validate_uri(value)),
         "uuid" => Some(validate_uuid(value)),
         "ssn" => Some(validate_ssn(value)),
         "vin" => Some(validate_vin(value)),
         "phone" => Some(validate_phone(value)),
         "zip" => Some(validate_zip(value)),
+        "hostname" => Some(validate_hostname(value)),
         "ipv4" => Some(validate_ipv4(value)),
         "ipv6" => Some(validate_ipv6(value)),
-        "creditcard" => Some(validate_creditcard(value)),
+        "datetime" | "date-time" => Some(validate_datetime(value)),
+        "creditcard" | "credit-card" => Some(validate_creditcard(value)),
+        "iban" => Some(validate_iban(value)),
+        "bic" | "swift" => Some(validate_bic(value)),
+        "routing" => Some(validate_routing(value)),
+        "cusip" => Some(validate_cusip(value)),
+        "isin" => Some(validate_isin(value)),
+        "lei" => Some(validate_lei(value)),
+        "npi" => Some(validate_npi(value)),
+        "dea" => Some(validate_dea(value)),
+        "imei" => Some(validate_imei(value)),
+        "iccid" => Some(validate_iccid(value)),
         "date-iso" => {
             let b = value.as_bytes();
             let valid = b.len() == 10
@@ -82,6 +95,74 @@ fn validate_url(value: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("Invalid URL format".to_string())
+    }
+}
+
+fn validate_uri(value: &str) -> Result<(), String> {
+    // scheme ":" ... — scheme: alpha followed by alpha/digit/+/-/.
+    let bytes = value.as_bytes();
+    let Some(colon) = value.find(':') else {
+        return Err("Invalid URI format".to_string());
+    };
+    if colon == 0 || !bytes[0].is_ascii_alphabetic() {
+        return Err("Invalid URI format".to_string());
+    }
+    for &b in &bytes[1..colon] {
+        if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.') {
+            return Err("Invalid URI format".to_string());
+        }
+    }
+    // Remainder must contain no whitespace.
+    for &b in &bytes[colon + 1..] {
+        if b.is_ascii_whitespace() {
+            return Err("Invalid URI format".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_hostname(value: &str) -> Result<(), String> {
+    // Dot-separated labels; each label alphanumeric, may contain hyphens but not
+    // start or end with one. 1-63 chars per label.
+    if value.is_empty() {
+        return Err("Invalid hostname format".to_string());
+    }
+    for label in value.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("Invalid hostname format".to_string());
+        }
+        let bytes = label.as_bytes();
+        if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+            return Err("Invalid hostname format".to_string());
+        }
+        for &b in bytes {
+            if !(b.is_ascii_alphanumeric() || b == b'-') {
+                return Err("Invalid hostname format".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_datetime(value: &str) -> Result<(), String> {
+    // ISO 8601: YYYY-MM-DDTHH:MM:SS with optional trailing content.
+    let b = value.as_bytes();
+    let valid = b.len() >= 19
+        && b[0..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+        && b[10] == b'T'
+        && b[11..13].iter().all(u8::is_ascii_digit)
+        && b[13] == b':'
+        && b[14..16].iter().all(u8::is_ascii_digit)
+        && b[16] == b':'
+        && b[17..19].iter().all(u8::is_ascii_digit);
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("Value '{}' does not match datetime format (ISO 8601)", value))
     }
 }
 
@@ -356,6 +437,132 @@ fn luhn_check(digits: &[u8]) -> bool {
         sum += n;
     }
     sum % 10 == 0
+}
+
+fn validate_iban(value: &str) -> Result<(), String> {
+    // 2 letters, 2 digits, then 4-30 alphanumerics.
+    let b = value.as_bytes();
+    if b.len() < 8 || b.len() > 34 {
+        return Err("Invalid IBAN format".to_string());
+    }
+    if !b[0].is_ascii_alphabetic() || !b[1].is_ascii_alphabetic() {
+        return Err("Invalid IBAN format".to_string());
+    }
+    if !b[2].is_ascii_digit() || !b[3].is_ascii_digit() {
+        return Err("Invalid IBAN format".to_string());
+    }
+    for &byte in &b[4..] {
+        if !byte.is_ascii_alphanumeric() {
+            return Err("Invalid IBAN format".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_bic(value: &str) -> Result<(), String> {
+    // 6 letters, 2 alphanumerics, optional 3 alphanumeric branch code (8 or 11).
+    let b = value.as_bytes();
+    if b.len() != 8 && b.len() != 11 {
+        return Err("Invalid BIC format".to_string());
+    }
+    for &byte in &b[0..6] {
+        if !byte.is_ascii_alphabetic() {
+            return Err("Invalid BIC format".to_string());
+        }
+    }
+    for &byte in &b[6..] {
+        if !byte.is_ascii_alphanumeric() {
+            return Err("Invalid BIC format".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_routing(value: &str) -> Result<(), String> {
+    if value.len() == 9 && value.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err("Invalid routing number format".to_string())
+    }
+}
+
+fn validate_cusip(value: &str) -> Result<(), String> {
+    if value.len() == 9 && value.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        Ok(())
+    } else {
+        Err("Invalid CUSIP format".to_string())
+    }
+}
+
+fn validate_isin(value: &str) -> Result<(), String> {
+    // 2 letters, 9 alphanumerics, 1 digit.
+    let b = value.as_bytes();
+    if b.len() != 12 {
+        return Err("Invalid ISIN format".to_string());
+    }
+    if !b[0].is_ascii_alphabetic() || !b[1].is_ascii_alphabetic() {
+        return Err("Invalid ISIN format".to_string());
+    }
+    for &byte in &b[2..11] {
+        if !byte.is_ascii_alphanumeric() {
+            return Err("Invalid ISIN format".to_string());
+        }
+    }
+    if !b[11].is_ascii_digit() {
+        return Err("Invalid ISIN format".to_string());
+    }
+    Ok(())
+}
+
+fn validate_lei(value: &str) -> Result<(), String> {
+    if value.len() == 20 && value.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        Ok(())
+    } else {
+        Err("Invalid LEI format".to_string())
+    }
+}
+
+fn validate_npi(value: &str) -> Result<(), String> {
+    if value.len() == 10 && value.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err("Invalid NPI format".to_string())
+    }
+}
+
+fn validate_dea(value: &str) -> Result<(), String> {
+    // 2 letters followed by 7 digits.
+    let b = value.as_bytes();
+    if b.len() != 9 {
+        return Err("Invalid DEA format".to_string());
+    }
+    if !b[0].is_ascii_alphabetic() || !b[1].is_ascii_alphabetic() {
+        return Err("Invalid DEA format".to_string());
+    }
+    for &byte in &b[2..] {
+        if !byte.is_ascii_digit() {
+            return Err("Invalid DEA format".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_imei(value: &str) -> Result<(), String> {
+    if value.len() == 15 && value.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err("Invalid IMEI format".to_string())
+    }
+}
+
+fn validate_iccid(value: &str) -> Result<(), String> {
+    if (value.len() == 19 || value.len() == 20)
+        && value.bytes().all(|b| b.is_ascii_digit())
+    {
+        Ok(())
+    } else {
+        Err("Invalid ICCID format".to_string())
+    }
 }
 
 fn validate_naic(value: &str) -> Result<(), String> {
@@ -1256,5 +1463,189 @@ mod tests {
     #[test]
     fn luhn_known_invalid() {
         assert!(!luhn_check(&[7, 9, 9, 2, 7, 3, 9, 8, 7, 1, 4]));
+    }
+
+    // ── uri ─────────────────────────────────────────────────────────────
+    #[test]
+    fn uri_valid_urn() {
+        assert!(validate_format("urn:isbn:0451450523", "uri").unwrap().is_ok());
+    }
+
+    #[test]
+    fn uri_invalid_no_scheme() {
+        assert!(validate_format("/relative/path", "uri").unwrap().is_err());
+    }
+
+    // ── hostname ────────────────────────────────────────────────────────
+    #[test]
+    fn hostname_valid() {
+        assert!(validate_format("sub.example.co.uk", "hostname").unwrap().is_ok());
+    }
+
+    #[test]
+    fn hostname_invalid_leading_hyphen() {
+        assert!(validate_format("-bad.example.com", "hostname").unwrap().is_err());
+    }
+
+    #[test]
+    fn hostname_invalid_underscore() {
+        assert!(validate_format("bad_underscore.com", "hostname").unwrap().is_err());
+    }
+
+    // ── datetime / date-time ────────────────────────────────────────────
+    #[test]
+    fn datetime_valid_zulu() {
+        assert!(validate_format("2024-06-15T10:30:00Z", "datetime").unwrap().is_ok());
+    }
+
+    #[test]
+    fn datetime_invalid_space_separator() {
+        assert!(validate_format("2024-06-15 10:30:00", "datetime").unwrap().is_err());
+    }
+
+    #[test]
+    fn date_time_alias_valid() {
+        assert!(validate_format("2024-06-15T10:30:00Z", "date-time").unwrap().is_ok());
+    }
+
+    #[test]
+    fn date_time_alias_invalid_slashes() {
+        assert!(validate_format("06/15/2024", "date-time").unwrap().is_err());
+    }
+
+    // ── credit-card alias ───────────────────────────────────────────────
+    #[test]
+    fn credit_card_alias_valid() {
+        assert!(validate_format("4111111111111111", "credit-card").unwrap().is_ok());
+    }
+
+    #[test]
+    fn credit_card_alias_bad_checksum() {
+        assert!(validate_format("4111111111111112", "credit-card").unwrap().is_err());
+    }
+
+    // ── iban ────────────────────────────────────────────────────────────
+    #[test]
+    fn iban_valid_gb() {
+        assert!(validate_format("GB82WEST12345698765432", "iban").unwrap().is_ok());
+    }
+
+    #[test]
+    fn iban_invalid_no_country() {
+        assert!(validate_format("1234WEST", "iban").unwrap().is_err());
+    }
+
+    // ── bic / swift ─────────────────────────────────────────────────────
+    #[test]
+    fn bic_valid_8() {
+        assert!(validate_format("DEUTDEFF", "bic").unwrap().is_ok());
+    }
+
+    #[test]
+    fn bic_valid_11() {
+        assert!(validate_format("DEUTDEFF500", "bic").unwrap().is_ok());
+    }
+
+    #[test]
+    fn bic_invalid_9_chars() {
+        assert!(validate_format("DEUTDEFF5", "bic").unwrap().is_err());
+    }
+
+    #[test]
+    fn swift_valid() {
+        assert!(validate_format("BOFAUS3N", "swift").unwrap().is_ok());
+    }
+
+    #[test]
+    fn swift_invalid_too_short() {
+        assert!(validate_format("BOFAUS3", "swift").unwrap().is_err());
+    }
+
+    // ── routing ─────────────────────────────────────────────────────────
+    #[test]
+    fn routing_valid() {
+        assert!(validate_format("021000021", "routing").unwrap().is_ok());
+    }
+
+    #[test]
+    fn routing_invalid_8_digits() {
+        assert!(validate_format("12345678", "routing").unwrap().is_err());
+    }
+
+    // ── cusip ───────────────────────────────────────────────────────────
+    #[test]
+    fn cusip_valid() {
+        assert!(validate_format("037833100", "cusip").unwrap().is_ok());
+    }
+
+    #[test]
+    fn cusip_invalid_symbol() {
+        assert!(validate_format("037833$00", "cusip").unwrap().is_err());
+    }
+
+    // ── isin ────────────────────────────────────────────────────────────
+    #[test]
+    fn isin_valid() {
+        assert!(validate_format("US0378331005", "isin").unwrap().is_ok());
+    }
+
+    #[test]
+    fn isin_invalid_non_digit_check() {
+        assert!(validate_format("US037833100X", "isin").unwrap().is_err());
+    }
+
+    // ── lei ─────────────────────────────────────────────────────────────
+    #[test]
+    fn lei_valid() {
+        assert!(validate_format("529900T8BM49AURSDO55", "lei").unwrap().is_ok());
+    }
+
+    #[test]
+    fn lei_invalid_symbol() {
+        assert!(validate_format("529900T8BM49AURSDO5$", "lei").unwrap().is_err());
+    }
+
+    // ── npi ─────────────────────────────────────────────────────────────
+    #[test]
+    fn npi_valid() {
+        assert!(validate_format("1234567890", "npi").unwrap().is_ok());
+    }
+
+    #[test]
+    fn npi_invalid_too_long() {
+        assert!(validate_format("12345678901", "npi").unwrap().is_err());
+    }
+
+    // ── dea ─────────────────────────────────────────────────────────────
+    #[test]
+    fn dea_valid() {
+        assert!(validate_format("AB1234567", "dea").unwrap().is_ok());
+    }
+
+    #[test]
+    fn dea_invalid_one_letter() {
+        assert!(validate_format("A1234567", "dea").unwrap().is_err());
+    }
+
+    // ── imei ────────────────────────────────────────────────────────────
+    #[test]
+    fn imei_valid() {
+        assert!(validate_format("490154203237518", "imei").unwrap().is_ok());
+    }
+
+    #[test]
+    fn imei_invalid_too_long() {
+        assert!(validate_format("4901542032375189", "imei").unwrap().is_err());
+    }
+
+    // ── iccid ───────────────────────────────────────────────────────────
+    #[test]
+    fn iccid_valid_19() {
+        assert!(validate_format("8901234567890123456", "iccid").unwrap().is_ok());
+    }
+
+    #[test]
+    fn iccid_invalid_letter() {
+        assert!(validate_format("8901234567890123456X", "iccid").unwrap().is_err());
     }
 }
