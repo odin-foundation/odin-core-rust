@@ -239,6 +239,11 @@ impl<'a> Parser<'a> {
                     StepResult::Bail => return Err(bail_to_err(line, col)),
                     StepResult::Err(e) => return Err(e),
                 },
+                b'"' if self.peek_eq(b"\"\"\"") => match self.parse_bare_literal_block() {
+                    StepResult::Ok => {}
+                    StepResult::Bail => return Err(bail_to_err(line, col)),
+                    StepResult::Err(e) => return Err(e),
+                },
                 _ => match self.parse_assignment() {
                     StepResult::Ok => {}
                     StepResult::Bail => return Err(bail_to_err(line, col)),
@@ -662,9 +667,23 @@ impl<'a> Parser<'a> {
         let value = self.source[val_start..self.pos].trim();
         let value = if value.is_empty() { "true".to_string() } else { value.to_string() };
 
-        let full_path = match &self.current_header {
-            Some(h) if !h.is_empty() => format!("{h}._{name}"),
-            _ => format!("_{name}"),
+        let prefix = match &self.current_header {
+            Some(h) if !h.is_empty() => format!("{h}."),
+            _ => String::new(),
+        };
+        // Repeated `:loop` lines each take a distinct key (`_loop`, `_loop2`, …)
+        // so all survive into the transform layer as a nested cross-product.
+        let full_path = if name == "loop" {
+            let mut n = 1;
+            loop {
+                let key = if n == 1 { format!("{prefix}_loop") } else { format!("{prefix}_loop{n}") };
+                if !self.assignments.contains_key(&key) {
+                    break key;
+                }
+                n += 1;
+            }
+        } else {
+            format!("{prefix}_{name}")
         };
 
         // Trailing whitespace / comment / newline.
@@ -684,6 +703,41 @@ impl<'a> Parser<'a> {
             match self.assignments.entry(full_path) {
                 indexmap::map::Entry::Occupied(_) => {} // first occurrence wins
                 indexmap::map::Entry::Vacant(e) => { e.insert(synthetic); }
+            }
+        }
+        StepResult::Ok
+    }
+
+    /// Capture a bare `"""..."""` line as a synthetic `<header>._literalBody`
+    /// assignment so the transform layer can pair it with a `:literal` directive.
+    fn parse_bare_literal_block(&mut self) -> StepResult {
+        let line = self.line as usize;
+        let col = self.col() as usize;
+        let value = match self.parse_multiline_string() {
+            ValueStep::Ok(v) => v,
+            ValueStep::Bail => return StepResult::Bail,
+            ValueStep::Err(e) => return StepResult::Err(e),
+        };
+        // Trailing whitespace / comment / newline.
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b' ' | b'\t' | b'\r' => self.pos += 1,
+                b';' => self.skip_comment(),
+                b'\n' => break,
+                _ => return StepResult::Bail,
+            }
+        }
+        let full_path = match &self.current_header {
+            Some(h) if !h.is_empty() => format!("{h}._literalBody"),
+            _ => "_literalBody".to_string(),
+        };
+        let _ = (line, col);
+        if self.options.allow_duplicates {
+            self.assignments.insert(full_path, value);
+        } else {
+            match self.assignments.entry(full_path) {
+                indexmap::map::Entry::Occupied(_) => {} // first occurrence wins
+                indexmap::map::Entry::Vacant(e) => { e.insert(value); }
             }
         }
         StepResult::Ok
@@ -1344,6 +1398,10 @@ impl<'a> Parser<'a> {
 
     fn parse_quoted_string(&mut self, line: usize, col: usize) -> ValueStep {
         debug_assert_eq!(self.bytes[self.pos], b'"');
+        // Triple-quoted multiline string: content captured verbatim across newlines.
+        if self.bytes.get(self.pos + 1) == Some(&b'"') && self.bytes.get(self.pos + 2) == Some(&b'"') {
+            return self.parse_multiline_string();
+        }
         let start_line = self.line;
         let start_col = self.col();
         self.pos += 1;
@@ -1375,6 +1433,34 @@ impl<'a> Parser<'a> {
                 start_line as usize, start_col as usize,
             )),
         }
+    }
+
+    /// Scan a triple-quoted multiline string. Content is captured verbatim
+    /// (no escape decoding) and may span newlines; closes at the next `"""`.
+    fn parse_multiline_string(&mut self, ) -> ValueStep {
+        let start_line = self.line;
+        let start_col = self.col();
+        self.pos += 3; // consume opening """
+        let content_start = self.pos;
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] == b'"'
+                && self.bytes.get(self.pos + 1) == Some(&b'"')
+                && self.bytes.get(self.pos + 2) == Some(&b'"')
+            {
+                let s = &self.source[content_start..self.pos];
+                self.pos += 3; // consume closing """
+                return ValueStep::Ok(OdinValues::string(s));
+            }
+            if self.bytes[self.pos] == b'\n' {
+                self.line += 1;
+                self.line_start = self.pos + 1;
+            }
+            self.pos += 1;
+        }
+        ValueStep::Err(ParseError::new(
+            ParseErrorCode::UnterminatedString,
+            start_line as usize, start_col as usize,
+        ))
     }
 
     /// Walk to the closing quote, validating each escape, then unescape.

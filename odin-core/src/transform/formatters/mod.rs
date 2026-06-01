@@ -815,6 +815,12 @@ pub fn format_fixed_width_from_segments(
     for segment in segments {
         let seg_name = segment.name.strip_suffix("[]").unwrap_or(&segment.name);
 
+        // Literal segment: emit pre-rendered interpolated lines verbatim.
+        if let Some(literal) = resolve_segment_data(output, seg_name).and_then(literal_lines) {
+            lines.extend(literal.iter().cloned());
+            continue;
+        }
+
         // Check if any mapping has :pos/:len directives (in mapping.directives or verb arg refs)
         let has_positional = segment.mappings.iter().any(|m| {
             let dirs = collect_all_fwf_directives(m);
@@ -879,6 +885,22 @@ fn pad_fwf_line(mut line: String, line_width: Option<usize>, pad_char: &str) -> 
         }
     }
     line
+}
+
+/// Extract pre-rendered literal-block lines from a segment's marker object.
+fn literal_lines(data: &DynValue) -> Option<Vec<String>> {
+    if let DynValue::Object(entries) = data {
+        if let Some((_, DynValue::Array(items))) =
+            entries.iter().find(|(k, _)| k == "__literalLines")
+        {
+            return Some(
+                items.iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect(),
+            );
+        }
+    }
+    None
 }
 
 /// Resolve segment data from the output object.

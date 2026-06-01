@@ -146,6 +146,52 @@ use crate::Odin;
     assert_eq!(d.get_string("rows[1].name"), Some("Bob"));
     assert_eq!(d.get_integer("rows[0].id"), Some(0));
 }
+
+// ─── Typed tabular cells in every column position ────────────────────────────
+
+#[test] fn tabular_typed_integer_first_column_keeps_trailing() {
+    let d = Odin::parse("{rows[] : qty, name}\n##5, \"widget\"\n##12, \"gadget\"").unwrap();
+    assert_eq!(d.get_integer("rows[0].qty"), Some(5));
+    assert_eq!(d.get_string("rows[0].name"), Some("widget"));
+    assert_eq!(d.get_integer("rows[1].qty"), Some(12));
+    assert_eq!(d.get_string("rows[1].name"), Some("gadget"));
+}
+
+#[test] fn tabular_typed_negative_integer_last_column() {
+    let d = Odin::parse("{temps[] : label, value}\n\"low\", ##-5\n\"high\", ##42").unwrap();
+    assert_eq!(d.get_string("temps[0].label"), Some("low"));
+    assert_eq!(d.get_integer("temps[0].value"), Some(-5));
+    assert_eq!(d.get_integer("temps[1].value"), Some(42));
+}
+
+#[test] fn tabular_all_typed_row_keeps_every_column() {
+    let d = Odin::parse("{points[] : x, y, z}\n##1, ##2, ##3\n##-4, ##5, ##-6").unwrap();
+    assert_eq!(d.get_integer("points[0].x"), Some(1));
+    assert_eq!(d.get_integer("points[0].y"), Some(2));
+    assert_eq!(d.get_integer("points[0].z"), Some(3));
+    assert_eq!(d.get_integer("points[1].x"), Some(-4));
+    assert_eq!(d.get_integer("points[1].z"), Some(-6));
+}
+
+#[test] fn tabular_single_integer_column_is_object_array() {
+    let d = Odin::parse("{counts[] : value}\n##42\n##0").unwrap();
+    assert_eq!(d.get_integer("counts[0].value"), Some(42));
+    assert_eq!(d.get_integer("counts[1].value"), Some(0));
+}
+
+#[test] fn tabular_mixed_typed_order_middle_currency() {
+    let d = Odin::parse("{items[] : qty, name, price}\n##10, \"Widget\", #$5.99\n##5, \"Gadget\", #$12.50").unwrap();
+    assert_eq!(d.get_integer("items[0].qty"), Some(10));
+    assert_eq!(d.get_string("items[0].name"), Some("Widget"));
+    assert!(d.get("items[0].price").unwrap().is_currency());
+    assert_eq!(d.get_integer("items[1].qty"), Some(5));
+}
+
+#[test] fn tabular_large_integer_cell_keeps_precision() {
+    let d = Odin::parse("{big[] : label, n}\n\"max\", ##9007199254740991").unwrap();
+    assert_eq!(d.get_string("big[0].label"), Some("max"));
+    assert_eq!(d.get_integer("big[0].n"), Some(9007199254740991));
+}
 // Header-inline `:if` emits a synthetic `<section>._if` assignment capturing
 // the unquoted expression text up to the closing brace.
 #[test] fn header_inline_if_directive() {
@@ -582,4 +628,78 @@ fn dollar_escape_before_interpolation_marker_drops_backslash() {
     // `\$` followed by a real `${...}` yields a literal `$` then the live marker.
     let d = Odin::parse("x = \"total \\$${amount}\"\n").unwrap();
     assert_eq!(d.get_string("x"), Some("total $${amount}"));
+}
+
+// ─── Triple-quoted multiline strings ─────────────────────────────────────────
+
+#[test]
+fn multiline_spans_newlines() {
+    let d = Odin::parse("field = \"\"\"hello\nworld\"\"\"").unwrap();
+    assert_eq!(d.get_string("field"), Some("hello\nworld"));
+}
+
+#[test]
+fn multiline_single_line() {
+    let d = Odin::parse("field = \"\"\"one line\"\"\"").unwrap();
+    assert_eq!(d.get_string("field"), Some("one line"));
+}
+
+#[test]
+fn multiline_retains_leading_trailing_newlines() {
+    let d = Odin::parse("field = \"\"\"\ninner\n\"\"\"").unwrap();
+    assert_eq!(d.get_string("field"), Some("\ninner\n"));
+}
+
+#[test]
+fn multiline_empty() {
+    let d = Odin::parse("field = \"\"\"\"\"\"").unwrap();
+    assert_eq!(d.get_string("field"), Some(""));
+}
+
+#[test]
+fn multiline_keeps_quotes_verbatim() {
+    let d = Odin::parse("field = \"\"\"say \"hi\" 'yo'\"\"\"").unwrap();
+    assert_eq!(d.get_string("field"), Some("say \"hi\" 'yo'"));
+}
+
+#[test]
+fn multiline_keeps_backslashes_verbatim() {
+    let d = Odin::parse("field = \"\"\"C:\\path\\to\"\"\"").unwrap();
+    assert_eq!(d.get_string("field"), Some("C:\\path\\to"));
+}
+
+#[test]
+fn multiline_keeps_interpolation_markers_verbatim() {
+    let d = Odin::parse("field = \"\"\"value=${@x}\"\"\"").unwrap();
+    assert_eq!(d.get_string("field"), Some("value=${@x}"));
+}
+
+#[test]
+fn multiline_unterminated_is_p004() {
+    let r = Odin::parse("field = \"\"\"never closed\n");
+    assert_eq!(r.unwrap_err().code(), "P004");
+}
+
+#[test]
+fn multiline_does_not_capture_normal_empty_string() {
+    let d = Odin::parse("a = \"\"\nb = \"x\"").unwrap();
+    assert_eq!(d.get_string("a"), Some(""));
+    assert_eq!(d.get_string("b"), Some("x"));
+}
+
+#[test]
+fn multiline_tracks_line_numbers_for_later_errors() {
+    // A multiline value spanning two lines must not corrupt line tracking;
+    // a following duplicate assignment still reports a P007 error.
+    let r = Odin::parse("a = \"\"\"x\ny\"\"\"\na = \"dup\"");
+    assert_eq!(r.unwrap_err().code(), "P007");
+}
+
+#[test]
+fn bare_literal_block_captured_as_literal_body() {
+    // A bare `"""..."""` line under a header is captured verbatim as a synthetic
+    // `<header>._literalBody` assignment for the transform layer.
+    let d = Odin::parse("{HDR}\n:literal\n\"\"\"\nHDR|${@x}\n\"\"\"\n").unwrap();
+    assert_eq!(d.get_string("HDR._literalBody"), Some("\nHDR|${@x}\n"));
+    assert_eq!(d.get_string("HDR._literal"), Some("true"));
 }

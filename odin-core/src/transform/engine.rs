@@ -592,105 +592,36 @@ fn process_segment_body(segment: &TransformSegment, ctx: &mut ExecContext, outpu
         format!("{path_prefix}.{clean_name}")
     };
 
-    // Check for array loop: if source_path is set, iterate over array elements
-    if let Some(ref source_path) = segment.source_path {
-        let source_val = resolve_path(ctx.source, source_path, &ctx.constants, &ctx.accumulators);
-        // Wrap non-array values in a single-element array for iteration
-        // (handles XML single-element case where parser doesn't create an array).
-        // Null (missing path) produces an empty array — zero iterations,
-        // matching TS where Array.isArray(null) is false and loop is skipped.
-        let array_val = match source_val {
-            DynValue::Array(_) => source_val,
-            DynValue::Null => DynValue::Array(Vec::new()),
-            other => DynValue::Array(vec![other]),
-        };
-        if let DynValue::Array(ref items) = array_val {
-            let mut result_items = Vec::new();
-            let len = items.len() as i64;
-            let is_value_only = segment.mappings.iter().all(|m| m.target == "_");
-            // `:counter name` exposes the loop index by name; `:as alias`
-            // exposes the current item under an alias path.
-            let counter_name = segment.directives.iter()
-                .find(|d| d.directive_type == "counter")
-                .and_then(|d| d.value.clone());
-            let loop_alias = segment.directives.iter()
-                .find(|d| d.directive_type == "as")
-                .and_then(|d| d.value.clone());
-            for (idx, item) in items.iter().enumerate() {
-                // Set loop variables
-                ctx.loop_vars.insert("_item".to_string(), item.clone());
-                ctx.loop_vars.insert("_index".to_string(), DynValue::Integer(idx as i64));
-                ctx.loop_vars.insert("_length".to_string(), DynValue::Integer(len));
-                if let Some(ref c) = counter_name {
-                    ctx.loop_vars.insert(c.clone(), DynValue::Integer(idx as i64));
-                }
-                if let Some(ref a) = loop_alias {
-                    ctx.loop_vars.insert(a.clone(), item.clone());
-                }
+    // Literal block: emit interpolated text lines instead of field mappings.
+    if segment.directives.iter().any(|d| d.directive_type == "literal") {
+        process_literal_segment(segment, ctx, output, is_root, is_internal, clean_name);
+        return;
+    }
 
-                let mut item_output = DynValue::Object(Vec::new());
-                for mapping in &segment.mappings {
-                    if mapping.target == "_" {
-                        // Target "_" means "replace the entire item output"
-                        // Reborrow item_output as shared for evaluation
-                        match evaluate_expression(&mapping.expression, ctx, item, &item_output) {
-                            Ok(val) => {
-                                let is_raw = matches!(
-                                    ctx.source_format.as_str(),
-                                    "fixed-width" | "flat" | "flat-kvp" | "flat-yaml" | "csv" | "delimited"
-                                );
-                                let val = if is_raw {
-                                    apply_type_directives(val, &mapping.directives)
-                                } else {
-                                    let type_dirs: Vec<_> = mapping.directives.iter()
-                                        .filter(|d| !matches!(d.name.as_str(), "pos" | "len" | "leftPad" | "rightPad" | "truncate"))
-                                        .cloned()
-                                        .collect();
-                                    apply_type_directives(val, &type_dirs)
-                                };
-                                if is_value_only {
-                                    item_output = val;
-                                }
-                            }
-                            Err(e) => {
-                                let (code, msg) = extract_error_code(&e);
-                                ctx.errors.push(TransformError {
-                                    message: format!("mapping '_': {msg}"),
-                                    path: Some("_".to_string()),
-                                    code: code.map(|c| c.to_string()),
-                                });
-                            }
-                        }
-                    } else {
-                        process_mapping(mapping, ctx, item, &mut item_output, &current_prefix);
-                    }
-                }
-                result_items.push(item_output);
+    // Collect `:loop` directives in order, each paired with its `:as` alias.
+    let loops = collect_loop_directives(segment);
 
-                ctx.loop_vars.remove("_item");
-                ctx.loop_vars.remove("_index");
-                ctx.loop_vars.remove("_length");
-                if let Some(ref c) = counter_name {
-                    ctx.loop_vars.remove(c);
-                }
-                if let Some(ref a) = loop_alias {
-                    ctx.loop_vars.remove(a);
-                }
-            }
-            let array_val = DynValue::Array(result_items);
-            if is_internal {
-                // Computation-only sink: ran for side effects, emit nothing.
-            } else if is_root {
-                *output = array_val;
-            } else {
-                set_path(output, clean_name, array_val);
-            }
+    // Check for array loop: iterate (possibly nested) over array elements.
+    if !loops.is_empty() {
+        let source_path = segment.source_path.clone().unwrap_or_default();
+        let is_value_only = segment.mappings.iter().all(|m| m.target == "_");
+        let counter_name = segment.directives.iter()
+            .find(|d| d.directive_type == "counter")
+            .and_then(|d| d.value.clone());
+        let mut result_items = Vec::new();
+        iterate_loops(
+            &loops, 0, ctx, segment, counter_name.as_deref(), is_value_only,
+            &current_prefix, &mut result_items, None,
+        );
+        let array_val = DynValue::Array(result_items);
+        if is_internal {
+            // Computation-only sink: ran for side effects, emit nothing.
+        } else if is_root {
+            *output = array_val;
         } else {
-            ctx.warnings.push(TransformWarning {
-                message: format!("segment '{seg_name}': source_path '{source_path}' did not resolve to an array"),
-                path: Some(source_path.clone()),
-            });
+            set_path(output, clean_name, array_val);
         }
+        let _ = source_path;
     } else if !segment.items.is_empty() {
         // Use interleaved items list for correct field ordering.
         // This processes mappings and child segments in the order they
@@ -801,6 +732,353 @@ fn process_segment_body(segment: &TransformSegment, ctx: &mut ExecContext, outpu
                 process_segment(child, ctx, child_target, &current_prefix);
             }
         }
+    }
+}
+
+/// Collect a segment's `:loop` directives in order, each paired with the `:as`
+/// alias directive that immediately follows it (if any).
+fn collect_loop_directives(segment: &TransformSegment) -> Vec<(String, Option<String>)> {
+    let mut loops = Vec::new();
+    let dirs = &segment.directives;
+    for (i, d) in dirs.iter().enumerate() {
+        if d.directive_type == "loop" {
+            let path = d.value.clone().unwrap_or_default();
+            let alias = dirs.get(i + 1)
+                .filter(|n| n.directive_type == "as")
+                .and_then(|n| n.value.clone());
+            loops.push((path, alias));
+        }
+    }
+    // Fall back to a single implicit loop over `source_path` when no `:loop`
+    // directive is present (segments built without explicit loop directives).
+    if loops.is_empty() {
+        if let Some(sp) = &segment.source_path {
+            let alias = dirs.iter()
+                .find(|d| d.directive_type == "as")
+                .and_then(|d| d.value.clone());
+            loops.push((sp.clone(), alias));
+        }
+    }
+    loops
+}
+
+/// Resolve a loop's source path to its (cloned) array value for the current level.
+///
+/// The outermost loop resolves against the source. Inner loops resolve a leading
+/// `.field` against the current item, an `alias.field` against the bound alias,
+/// and any other path against the current item. A non-array result yields `None`.
+fn resolve_loop_items(
+    path: &str,
+    depth: usize,
+    ctx: &ExecContext,
+    current: &DynValue,
+) -> Option<Vec<DynValue>> {
+    let path = path.strip_prefix('@').unwrap_or(path).trim();
+    let resolved = if let Some(rel) = path.strip_prefix('.') {
+        // Leading `.` resolves against the current item, or the source when no
+        // outer item is bound (top-level loop).
+        if matches!(current, DynValue::Null) {
+            resolve_sub_path(ctx.source, rel)
+        } else {
+            resolve_sub_path(current, rel)
+        }
+    } else if depth == 0 {
+        resolve_path(ctx.source, path, &ctx.constants, &ctx.accumulators)
+    } else {
+        let first = path.split(['.', '[']).next().unwrap_or(path);
+        if let Some(aliased) = ctx.loop_vars.get(first) {
+            if path == first {
+                aliased.clone()
+            } else {
+                let rest = &path[first.len()..];
+                let rest = rest.strip_prefix('.').unwrap_or(rest);
+                resolve_sub_path(aliased, rest)
+            }
+        } else {
+            resolve_sub_path(current, path)
+        }
+    };
+    match resolved {
+        DynValue::Array(items) => Some(items),
+        _ => None,
+    }
+}
+
+/// Drive one or more `:loop` directives as a nested cross-product. Each level
+/// binds its alias and current item, then recurses into the next loop; the
+/// innermost level emits one result per item. A non-array source at any level
+/// yields no rows. The optional `render` closure, when present, replaces field
+/// mapping with per-item literal-block rendering.
+#[allow(clippy::too_many_arguments)]
+fn iterate_loops(
+    loops: &[(String, Option<String>)],
+    depth: usize,
+    ctx: &mut ExecContext,
+    segment: &TransformSegment,
+    counter_name: Option<&str>,
+    is_value_only: bool,
+    current_prefix: &str,
+    results: &mut Vec<DynValue>,
+    render: Option<&mut Vec<String>>,
+) {
+    let (path, alias) = &loops[depth];
+    let current = ctx.loop_vars.get("_item").cloned().unwrap_or(DynValue::Null);
+    let Some(items) = resolve_loop_items(path, depth, ctx, &current) else {
+        return;
+    };
+    let len = items.len() as i64;
+    let is_innermost = depth == loops.len() - 1;
+
+    // Snapshot the loop variables this level mutates so siblings restore cleanly.
+    let saved_item = ctx.loop_vars.get("_item").cloned();
+    let saved_index = ctx.loop_vars.get("_index").cloned();
+    let saved_length = ctx.loop_vars.get("_length").cloned();
+    let saved_alias = alias.as_ref().and_then(|a| ctx.loop_vars.get(a).cloned());
+
+    let mut render = render;
+    for (idx, item) in items.iter().enumerate() {
+        ctx.loop_vars.insert("_item".to_string(), item.clone());
+        ctx.loop_vars.insert("_index".to_string(), DynValue::Integer(idx as i64));
+        ctx.loop_vars.insert("_length".to_string(), DynValue::Integer(len));
+        if let Some(a) = alias {
+            ctx.loop_vars.insert(a.clone(), item.clone());
+        }
+        if let Some(c) = counter_name {
+            if is_innermost {
+                ctx.loop_vars.insert(c.to_string(), DynValue::Integer(idx as i64));
+            }
+        }
+
+        if !is_innermost {
+            iterate_loops(
+                loops, depth + 1, ctx, segment, counter_name, is_value_only,
+                current_prefix, results, render.as_deref_mut(),
+            );
+            continue;
+        }
+
+        if let Some(lines) = render.as_deref_mut() {
+            render_literal_item(segment, ctx, item, lines);
+            continue;
+        }
+
+        emit_loop_item(segment, ctx, item, is_value_only, current_prefix, results);
+    }
+
+    // Restore mutated loop variables to their pre-level state.
+    restore_var(&mut ctx.loop_vars, "_item", saved_item);
+    restore_var(&mut ctx.loop_vars, "_index", saved_index);
+    restore_var(&mut ctx.loop_vars, "_length", saved_length);
+    if let Some(a) = alias {
+        restore_var(&mut ctx.loop_vars, a, saved_alias);
+    }
+    if is_innermost {
+        if let Some(c) = counter_name {
+            ctx.loop_vars.remove(c);
+        }
+    }
+}
+
+fn restore_var(vars: &mut HashMap<String, DynValue>, key: &str, saved: Option<DynValue>) {
+    match saved {
+        Some(v) => { vars.insert(key.to_string(), v); }
+        None => { vars.remove(key); }
+    }
+}
+
+/// Evaluate one innermost-loop item's mappings into a result element.
+fn emit_loop_item(
+    segment: &TransformSegment,
+    ctx: &mut ExecContext,
+    item: &DynValue,
+    is_value_only: bool,
+    current_prefix: &str,
+    results: &mut Vec<DynValue>,
+) {
+    let mut item_output = DynValue::Object(Vec::new());
+    for mapping in &segment.mappings {
+        if mapping.target == "_" {
+            match evaluate_expression(&mapping.expression, ctx, item, &item_output) {
+                Ok(val) => {
+                    let is_raw = matches!(
+                        ctx.source_format.as_str(),
+                        "fixed-width" | "flat" | "flat-kvp" | "flat-yaml" | "csv" | "delimited"
+                    );
+                    let val = if is_raw {
+                        apply_type_directives(val, &mapping.directives)
+                    } else {
+                        let type_dirs: Vec<_> = mapping.directives.iter()
+                            .filter(|d| !matches!(d.name.as_str(), "pos" | "len" | "leftPad" | "rightPad" | "truncate"))
+                            .cloned()
+                            .collect();
+                        apply_type_directives(val, &type_dirs)
+                    };
+                    if is_value_only {
+                        item_output = val;
+                    }
+                }
+                Err(e) => {
+                    let (code, msg) = extract_error_code(&e);
+                    ctx.errors.push(TransformError {
+                        message: format!("mapping '_': {msg}"),
+                        path: Some("_".to_string()),
+                        code: code.map(|c| c.to_string()),
+                    });
+                }
+            }
+        } else {
+            process_mapping(mapping, ctx, item, &mut item_output, current_prefix);
+        }
+    }
+    results.push(item_output);
+}
+
+/// Magic key under which a literal segment stores its pre-rendered output lines.
+const LITERAL_LINES_KEY: &str = "__literalLines";
+
+/// Render a `:literal` segment to interpolated text lines. Under a `:loop` the
+/// block renders once per item; otherwise it renders once. Output is stored as a
+/// `{ __literalLines: [...] }` marker object that the formatter emits verbatim.
+fn process_literal_segment(
+    segment: &TransformSegment,
+    ctx: &mut ExecContext,
+    output: &mut DynValue,
+    is_root: bool,
+    is_internal: bool,
+    clean_name: &str,
+) {
+    let loops = collect_loop_directives(segment);
+    let mut lines: Vec<String> = Vec::new();
+
+    if !loops.is_empty() {
+        let counter_name = segment.directives.iter()
+            .find(|d| d.directive_type == "counter")
+            .and_then(|d| d.value.clone());
+        let mut results: Vec<DynValue> = Vec::new();
+        iterate_loops(
+            &loops, 0, ctx, segment, counter_name.as_deref(), false,
+            "", &mut results, Some(&mut lines),
+        );
+    } else {
+        let src = ctx.source.clone();
+        render_literal_item(segment, ctx, &src, &mut lines);
+    }
+
+    let marker = DynValue::Object(vec![(
+        LITERAL_LINES_KEY.to_string(),
+        DynValue::Array(lines.into_iter().map(DynValue::String).collect()),
+    )]);
+    if is_internal {
+        // Computation-only sink: emit nothing.
+    } else if is_root {
+        *output = marker;
+    } else {
+        set_path(output, clean_name, marker);
+    }
+}
+
+/// Render the literal body once for the current item, appending its lines.
+fn render_literal_item(
+    segment: &TransformSegment,
+    ctx: &mut ExecContext,
+    current: &DynValue,
+    lines: &mut Vec<String>,
+) {
+    let body = segment.directives.iter()
+        .find(|d| d.directive_type == "literalBody")
+        .and_then(|d| d.value.clone())
+        .unwrap_or_default();
+    let template = normalize_literal_body(&body);
+    match interpolate_literal_block(&template, ctx, current) {
+        Ok(rendered) => {
+            for line in rendered.split('\n') {
+                lines.push(line.to_string());
+            }
+        }
+        Err(e) => {
+            let (code, msg) = extract_error_code(&e);
+            ctx.errors.push(TransformError {
+                message: msg.to_string(),
+                path: Some(segment.path.clone()),
+                code: code.map(|c| c.to_string()),
+            });
+        }
+    }
+}
+
+/// Strip one leading and one trailing newline so the `"""` delimiters, written
+/// on their own lines, do not contribute blank output lines.
+fn normalize_literal_body(body: &str) -> String {
+    let mut s = body;
+    if let Some(rest) = s.strip_prefix("\r\n") {
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix('\n') {
+        s = rest;
+    }
+    if let Some(rest) = s.strip_suffix("\r\n") {
+        s = rest;
+    } else if let Some(rest) = s.strip_suffix('\n') {
+        s = rest;
+    }
+    s.to_string()
+}
+
+/// Interpolate a literal block body. Differs from the general interpolation in
+/// escape handling and nesting rules: `\${` emits `${`, `\\` emits `\`, `\$`
+/// emits `$`, and a `${...}` whose expression nests another `${` is rejected
+/// (T014).
+fn interpolate_literal_block(
+    template: &str,
+    ctx: &mut ExecContext,
+    current: &DynValue,
+) -> Result<String, String> {
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' {
+            match (bytes.get(i + 1), bytes.get(i + 2)) {
+                (Some(b'$'), Some(b'{')) => { out.push_str("${"); i += 3; continue; }
+                (Some(b'\\'), _) => { out.push('\\'); i += 2; continue; }
+                (Some(b'$'), _) => { out.push('$'); i += 2; continue; }
+                _ => { out.push('\\'); i += 1; continue; }
+            }
+        }
+        if ch == b'$' && bytes.get(i + 1) == Some(&b'{') {
+            let Some(rel) = template[i + 2..].find('}') else {
+                out.push_str(&template[i..]);
+                break;
+            };
+            let close = i + 2 + rel;
+            let expr = &template[i + 2..close];
+            if expr.contains("${") {
+                return Err(format!("[T014] Nested interpolation is not allowed: ${{{expr}}}"));
+            }
+            let value = evaluate_interpolation_expr(expr.trim(), ctx, current)?;
+            out.push_str(&value);
+            i = close + 1;
+            continue;
+        }
+        let ch_len = utf8_len(ch);
+        out.push_str(&template[i..(i + ch_len).min(template.len())]);
+        i += ch_len;
+    }
+    Ok(out)
+}
+
+/// Evaluate a single literal-block interpolation expression (path or verb).
+fn evaluate_interpolation_expr(
+    expr: &str,
+    ctx: &mut ExecContext,
+    current: &DynValue,
+) -> Result<String, String> {
+    if expr.starts_with('@') || expr.starts_with('%') {
+        let field_expr = super::parser::parse_value_expression(expr);
+        let value = evaluate_expression(&field_expr, ctx, current, current)?;
+        Ok(dyn_to_interp_string(&value))
+    } else {
+        Ok(format!("${{{expr}}}"))
     }
 }
 
@@ -1174,6 +1452,11 @@ fn evaluate_expression(
             if let Some(v) = lookup_loop_var(&ctx.loop_vars, path) {
                 return Ok(v);
             }
+            // Aliased sub-path (`@alias.field`): the first segment names a `:as`
+            // binding; resolve the remainder within the bound item.
+            if let Some(v) = lookup_alias_path(&ctx.loop_vars, path) {
+                return Ok(v);
+            }
             // Try current segment output first for local field references, then source
             Ok(resolve_path_with_output(current_source, current_output, &ctx.global_output, path, &ctx.constants, &ctx.accumulators))
         }
@@ -1499,6 +1782,21 @@ fn lookup_loop_var(loop_vars: &HashMap<String, DynValue>, path: &str) -> Option<
         return None;
     }
     loop_vars.get(name).cloned()
+}
+
+/// Resolve an `@alias.sub.path` reference where the first segment names a loop
+/// alias (a `:as` binding). Returns `None` when the first segment is not a bound
+/// alias, or when the path has no sub-path.
+fn lookup_alias_path(loop_vars: &HashMap<String, DynValue>, path: &str) -> Option<DynValue> {
+    let clean = path.strip_prefix('@').unwrap_or(path);
+    let first = clean.split(['.', '[']).next()?;
+    if first.is_empty() || first == clean {
+        return None;
+    }
+    let bound = loop_vars.get(first)?;
+    let rest = &clean[first.len()..];
+    let rest = rest.strip_prefix('.').unwrap_or(rest);
+    Some(resolve_sub_path(bound, rest))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -13394,5 +13692,268 @@ mod xml_namespace_typehints_tests {
             "CDATA section missing in:\n{xml}"
         );
         assert!(!xml.contains("&lt;"), "text was escaped instead of CDATA:\n{xml}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nested loops + literal blocks
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod nested_loop_and_literal_tests {
+    use crate::Odin;
+    use crate::transform::engine::execute;
+    use crate::types::transform::{DynValue, TransformResult};
+
+    fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }
+    fn i(v: i64) -> DynValue { DynValue::Integer(v) }
+    fn obj(pairs: Vec<(&str, DynValue)>) -> DynValue {
+        DynValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+    fn arr(items: Vec<DynValue>) -> DynValue { DynValue::Array(items) }
+
+    fn json_header() -> &'static str {
+        "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"json->json\"\ntarget.format = \"json\"\n"
+    }
+    fn fwf_header() -> &'static str {
+        "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->fixed-width\"\ntarget.format = \"fixed-width\"\n"
+    }
+
+    fn run_json(body: &str, source: &DynValue) -> TransformResult {
+        let text = format!("{}\n{}", json_header(), body);
+        let t = Odin::parse_transform(&text).unwrap();
+        execute(&t, source)
+    }
+    fn run_fwf(body: &str, source: &DynValue) -> TransformResult {
+        let text = format!("{}\n{}", fwf_header(), body);
+        let t = Odin::parse_transform(&text).unwrap();
+        execute(&t, source)
+    }
+
+    fn rows(result: &TransformResult) -> Vec<DynValue> {
+        result.output.as_ref().unwrap().get("rows").unwrap().as_array().unwrap().to_vec()
+    }
+
+    // Nested loops: parser
+
+    #[test]
+    fn parser_preserves_all_loops_in_order_with_aliases() {
+        let text = format!(
+            "{}\n{{rows[]}}\n:loop vehicles :as veh\n:loop .coverages :as cov\nvin = \"@veh.vin\"\ncode = \"@cov.code\"\n",
+            json_header()
+        );
+        let t = Odin::parse_transform(&text).unwrap();
+        let dirs = &t.segments[0].directives;
+        let loops: Vec<_> = dirs.iter().filter(|d| d.directive_type == "loop").collect();
+        assert_eq!(loops.len(), 2);
+        assert_eq!(loops[0].value.as_deref(), Some("vehicles"));
+        assert_eq!(loops[1].value.as_deref(), Some(".coverages"));
+        let aliases: Vec<_> = dirs.iter().filter(|d| d.directive_type == "as").map(|d| d.value.clone().unwrap()).collect();
+        assert_eq!(aliases, vec!["veh".to_string(), "cov".to_string()]);
+    }
+
+    #[test]
+    fn parser_preserves_three_loops_in_order() {
+        let text = format!(
+            "{}\n{{rows[]}}\n:loop a :as x\n:loop .bs :as y\n:loop .cs :as z\nv = \"@z.v\"\n",
+            json_header()
+        );
+        let t = Odin::parse_transform(&text).unwrap();
+        let loops: Vec<_> = t.segments[0].directives.iter()
+            .filter(|d| d.directive_type == "loop")
+            .map(|d| d.value.clone().unwrap())
+            .collect();
+        assert_eq!(loops, vec!["a".to_string(), ".bs".to_string(), ".cs".to_string()]);
+    }
+
+    // Nested loops: happy path
+
+    #[test]
+    fn iterates_two_level_cross_product() {
+        let src = obj(vec![("vehicles", arr(vec![
+            obj(vec![("vin", s("V1")), ("coverages", arr(vec![obj(vec![("code", s("A"))]), obj(vec![("code", s("B"))])]))]),
+            obj(vec![("vin", s("V2")), ("coverages", arr(vec![obj(vec![("code", s("C"))])]))]),
+        ]))]);
+        let r = run_json("{rows[]}\n:loop vehicles :as veh\n:loop .coverages :as cov\nvin = \"@veh.vin\"\ncode = \"@cov.code\"\n", &src);
+        assert!(r.success);
+        let rows = rows(&r);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], obj(vec![("vin", s("V1")), ("code", s("A"))]));
+        assert_eq!(rows[1], obj(vec![("vin", s("V1")), ("code", s("B"))]));
+        assert_eq!(rows[2], obj(vec![("vin", s("V2")), ("code", s("C"))]));
+    }
+
+    #[test]
+    fn iterates_three_level_cross_product_with_exact_count() {
+        let src = obj(vec![("a", arr(vec![
+            obj(vec![("v", s("A1")), ("bs", arr(vec![
+                obj(vec![("v", s("B1")), ("cs", arr(vec![obj(vec![("v", s("C1"))]), obj(vec![("v", s("C2"))])]))]),
+            ]))]),
+            obj(vec![("v", s("A2")), ("bs", arr(vec![
+                obj(vec![("v", s("B2")), ("cs", arr(vec![obj(vec![("v", s("C3"))])]))]),
+                obj(vec![("v", s("B3")), ("cs", arr(vec![obj(vec![("v", s("C4"))])]))]),
+            ]))]),
+        ]))]);
+        let r = run_json("{rows[]}\n:loop a :as x\n:loop .bs :as y\n:loop .cs :as z\nav = \"@x.v\"\nbv = \"@y.v\"\ncv = \"@z.v\"\n", &src);
+        assert!(r.success);
+        let rows = rows(&r);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0], obj(vec![("av", s("A1")), ("bv", s("B1")), ("cv", s("C1"))]));
+        assert_eq!(rows[3], obj(vec![("av", s("A2")), ("bv", s("B3")), ("cv", s("C4"))]));
+    }
+
+    // Nested loops: edge cases
+
+    #[test]
+    fn empty_inner_array_yields_no_rows() {
+        let src = obj(vec![("vehicles", arr(vec![
+            obj(vec![("vin", s("V1")), ("coverages", arr(vec![obj(vec![("code", s("A"))])]))]),
+            obj(vec![("vin", s("V2")), ("coverages", arr(vec![]))]),
+            obj(vec![("vin", s("V3")), ("coverages", arr(vec![obj(vec![("code", s("C"))])]))]),
+        ]))]);
+        let r = run_json("{rows[]}\n:loop vehicles :as veh\n:loop .coverages :as cov\nvin = \"@veh.vin\"\ncode = \"@cov.code\"\n", &src);
+        let rows = rows(&r);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], obj(vec![("vin", s("V1")), ("code", s("A"))]));
+        assert_eq!(rows[1], obj(vec![("vin", s("V3")), ("code", s("C"))]));
+    }
+
+    #[test]
+    fn counter_binds_innermost_index_resetting_per_outer() {
+        let src = obj(vec![("vehicles", arr(vec![
+            obj(vec![("vin", s("V1")), ("coverages", arr(vec![obj(vec![]), obj(vec![]), obj(vec![])]))]),
+            obj(vec![("vin", s("V2")), ("coverages", arr(vec![obj(vec![])]))]),
+        ]))]);
+        let r = run_json("{rows[]}\n:loop vehicles :as veh\n:loop .coverages :as cov\n:counter idx\nvin = \"@veh.vin\"\nn = \"@idx\"\n", &src);
+        let rows = rows(&r);
+        let pairs: Vec<(String, i64)> = rows.iter().map(|row| {
+            let vin = row.get("vin").unwrap().as_str().unwrap().to_string();
+            let n = row.get("n").unwrap().as_i64().unwrap();
+            (vin, n)
+        }).collect();
+        assert_eq!(pairs, vec![
+            ("V1".to_string(), 0), ("V1".to_string(), 1), ("V1".to_string(), 2), ("V2".to_string(), 0),
+        ]);
+    }
+
+    #[test]
+    fn single_alias_less_loop_still_works() {
+        let src = obj(vec![("items", arr(vec![obj(vec![("sku", s("A"))]), obj(vec![("sku", s("B"))])]))]);
+        let r = run_json("{rows[]}\n:loop items\nsku = \"@.sku\"\n", &src);
+        let rows = rows(&r);
+        assert_eq!(rows, vec![obj(vec![("sku", s("A"))]), obj(vec![("sku", s("B"))])]);
+    }
+
+    // Nested loops: non-array sources
+
+    #[test]
+    fn non_array_inner_yields_no_rows_no_error() {
+        let src = obj(vec![("vehicles", arr(vec![
+            obj(vec![("vin", s("V1")), ("coverages", s("not-an-array"))]),
+        ]))]);
+        let r = run_json("{rows[]}\n:loop vehicles :as veh\n:loop .coverages :as cov\nvin = \"@veh.vin\"\ncode = \"@cov.code\"\n", &src);
+        assert!(r.success);
+        assert!(r.errors.is_empty());
+        assert_eq!(rows(&r).len(), 0);
+    }
+
+    #[test]
+    fn non_array_outer_yields_no_rows() {
+        let src = obj(vec![("vehicles", s("nope"))]);
+        let r = run_json("{rows[]}\n:loop vehicles :as veh\n:loop .coverages :as cov\nvin = \"@veh.vin\"\ncode = \"@cov.code\"\n", &src);
+        assert!(r.success);
+        assert_eq!(rows(&r).len(), 0);
+    }
+
+    // Literal blocks: parsing
+
+    #[test]
+    fn literal_body_and_directive_captured() {
+        let text = format!("{}\n{{HDR}}\n:literal\n\"\"\"\nHDR|${{@policy.number}}\n\"\"\"\n", fwf_header());
+        let t = Odin::parse_transform(&text).unwrap();
+        let seg = &t.segments[0];
+        assert!(seg.directives.iter().any(|d| d.directive_type == "literal"));
+        let body = seg.directives.iter().find(|d| d.directive_type == "literalBody").unwrap();
+        assert_eq!(body.value.as_deref(), Some("\nHDR|${@policy.number}\n"));
+    }
+
+    // Literal blocks: happy path
+
+    #[test]
+    fn literal_interpolates_path_and_verb() {
+        let src = obj(vec![("policy", obj(vec![("number", s("P-100")), ("code", s("abc"))]))]);
+        let r = run_fwf("{HDR}\n:literal\n\"\"\"\nHDR|${@policy.number}|${%upper @policy.code}\n\"\"\"\n", &src);
+        assert!(r.success);
+        assert_eq!(r.formatted.as_deref(), Some("HDR|P-100|ABC"));
+    }
+
+    #[test]
+    fn literal_emits_one_line_per_loop_item() {
+        let src = obj(vec![("items", arr(vec![
+            obj(vec![("sku", s("A1")), ("qty", s("2"))]),
+            obj(vec![("sku", s("B2")), ("qty", s("5"))]),
+        ]))]);
+        let r = run_fwf("{DET[]}\n:loop @items\n:literal\n\"\"\"\nDET|${@.sku}|${@.qty}\n\"\"\"\n", &src);
+        assert!(r.success);
+        assert_eq!(r.formatted.as_deref(), Some("DET|A1|2\nDET|B2|5"));
+    }
+
+    #[test]
+    fn literal_resolves_accumulator() {
+        let body = "{$accumulator}\ntotal = ##0\ntotal._persist = true\n\n{items[]}\n_loop = \"@items\"\n_ = %accumulate total @.amount\n\n{TRL}\n:literal\n\"\"\"\nTRL|${@$accumulator.total}\n\"\"\"\n";
+        let src = obj(vec![("items", arr(vec![obj(vec![("amount", i(10))]), obj(vec![("amount", i(32))])]))]);
+        let r = run_fwf(body, &src);
+        assert!(r.success);
+        assert!(r.formatted.as_deref().unwrap().trim().ends_with("TRL|42"));
+    }
+
+    // Literal blocks: edge cases
+
+    #[test]
+    fn literal_honors_escape_rules() {
+        let src = obj(vec![("a", s("V"))]);
+        let r = run_fwf("{X}\n:literal\n\"\"\"\nlit:\\${@a} dollar:\\$ slash:\\\\ real:${@a}\n\"\"\"\n", &src);
+        assert!(r.success);
+        assert_eq!(r.formatted.as_deref(), Some("lit:${@a} dollar:$ slash:\\ real:V"));
+    }
+
+    #[test]
+    fn literal_interpolation_free_verbatim() {
+        let r = run_fwf("{X}\n:literal\n\"\"\"\nJUST TEXT NO INTERP\n\"\"\"\n", &obj(vec![]));
+        assert!(r.success);
+        assert_eq!(r.formatted.as_deref(), Some("JUST TEXT NO INTERP"));
+    }
+
+    #[test]
+    fn literal_multi_line_block() {
+        let src = obj(vec![("a", s("1")), ("b", s("3"))]);
+        let r = run_fwf("{X}\n:literal\n\"\"\"\nLINE1 ${@a}\nLINE2\nLINE3 ${@b}\n\"\"\"\n", &src);
+        assert!(r.success);
+        assert_eq!(r.formatted.as_deref(), Some("LINE1 1\nLINE2\nLINE3 3"));
+    }
+
+    #[test]
+    fn literal_preserves_interior_blank_lines() {
+        let r = run_fwf("{X}\n:literal\n\"\"\"\nA\n\nB\n\"\"\"\n", &obj(vec![]));
+        assert!(r.success);
+        assert_eq!(r.formatted.as_deref(), Some("A\n\nB"));
+    }
+
+    // Literal blocks: errors
+
+    #[test]
+    fn literal_rejects_nested_interpolation_t014() {
+        let src = obj(vec![("a", obj(vec![("b", s("x"))])), ("b", s("k"))]);
+        let r = run_fwf("{X}\n:literal\n\"\"\"\n${@a.${@b}}\n\"\"\"\n", &src);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T014")));
+    }
+
+    #[test]
+    fn literal_unknown_verb_is_error() {
+        let src = obj(vec![("a", s("z"))]);
+        let r = run_fwf("{X}\n:literal\n\"\"\"\n${%nope @a}\n\"\"\"\n", &src);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.message.to_lowercase().contains("verb")));
     }
 }

@@ -510,7 +510,11 @@ fn build_segment(
     use crate::types::transform::SegmentItem;
 
     let mut source_path: Option<String> = None;
-    let mut loop_alias: Option<String> = None;
+    // Ordered loop directives (path, optional alias). Repeated `:loop` lines
+    // are stored under `_loop`, `_loop2`, … and drive a nested cross-product.
+    let mut loops: Vec<(String, Option<String>)> = Vec::new();
+    let mut literal_body: Option<String> = None;
+    let mut has_literal = false;
     let mut counter: Option<String> = None;
     let mut discriminator: Option<Discriminator> = None;
     let mut pass: Option<usize> = None;
@@ -549,20 +553,33 @@ fn build_segment(
         }
 
         if field.starts_with('_') {
+            // Repeated loops are stored as `_loop`, `_loop2`, …; normalize.
+            let is_loop = field == "_loop"
+                || (field.starts_with("_loop")
+                    && field["_loop".len()..].bytes().all(|b| b.is_ascii_digit())
+                    && field.len() > "_loop".len());
             // Directive field
             match field.as_str() {
-                "_loop" | "_from" => {
+                _ if is_loop || field == "_from" => {
                     // A `:loop path :as alias` form carries an alias suffix.
                     let raw = odin_value_to_string(&value);
-                    if let Some(as_pos) = raw.find(" :as ") {
-                        source_path = Some(raw[..as_pos].trim().to_string());
-                        let alias = raw[as_pos + 5..].trim();
-                        if !alias.is_empty() {
-                            loop_alias = Some(alias.to_string());
-                        }
+                    let (path, alias) = if let Some(as_pos) = raw.find(" :as ") {
+                        let p = raw[..as_pos].trim().to_string();
+                        let a = raw[as_pos + 5..].trim();
+                        (p, if a.is_empty() { None } else { Some(a.to_string()) })
                     } else {
-                        source_path = Some(raw);
+                        (raw, None)
+                    };
+                    if source_path.is_none() {
+                        source_path = Some(path.clone());
                     }
+                    loops.push((path, alias));
+                }
+                "_literal" => {
+                    has_literal = true;
+                }
+                "_literalBody" => {
+                    literal_body = Some(odin_value_to_string(&value));
                 }
                 "_counter" => {
                     counter = Some(odin_value_to_string(&value).trim().to_string());
@@ -665,11 +682,18 @@ fn build_segment(
 
     // Build segment directives from parsed underscore-prefixed fields
     let mut directives = Vec::new();
-    if let Some(ref sp) = source_path {
-        directives.push(SegmentDirective::new("loop", Some(sp.clone())));
+    if has_literal {
+        directives.push(SegmentDirective::new("literal", None));
     }
-    if let Some(ref alias) = loop_alias {
-        directives.push(SegmentDirective::new("as", Some(alias.clone())));
+    if let Some(ref body) = literal_body {
+        directives.push(SegmentDirective::new("literalBody", Some(body.clone())));
+    }
+    // Emit one `loop` directive (plus optional `as`) per parsed loop, in order.
+    for (path, alias) in &loops {
+        directives.push(SegmentDirective::new("loop", Some(path.clone())));
+        if let Some(a) = alias {
+            directives.push(SegmentDirective::new("as", Some(a.clone())));
+        }
     }
     if let Some(ref c) = counter {
         directives.push(SegmentDirective::new("counter", Some(c.clone())));

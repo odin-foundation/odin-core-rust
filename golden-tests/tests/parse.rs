@@ -710,3 +710,13 @@ fn golden_parse_array_index_normalization() {
 fn golden_parse_currency_scientific() {
     run_test_suite("types/currency-scientific.json");
 }
+
+#[test]
+fn golden_parse_multiline_strings() {
+    run_test_suite("basic/multiline-strings.json");
+}
+
+#[test]
+fn golden_parse_tabular_typed_cells() {
+    run_test_suite("composition/tabular-typed-cells.json");
+}
