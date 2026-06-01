@@ -1,6 +1,6 @@
 //! Invariant expression evaluation.
 //!
-//! Recursive-descent evaluator over the invariant grammar:
+//! Recursive-descent parser over the invariant grammar:
 //!   expression     = logic_or
 //!   logic_or       = logic_and , { "||" , logic_and }
 //!   logic_and      = equality , { "&&" , equality }
@@ -10,6 +10,12 @@
 //!   multiplicative = unary , { ( "*" | "/" | "%" ) , unary }
 //!   unary          = [ "!" ] , primary
 //!   primary        = path | number | string | "(" , expression , ")"
+//!
+//! An expression is parsed to an AST once and cached by its source string; each
+//! document validation evaluates the cached AST against that document's values.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::types::values::OdinValue;
 
@@ -34,6 +40,30 @@ enum Token {
     LParen,
     RParen,
 }
+
+/// A parsed, document-independent invariant expression node.
+#[derive(Clone, Debug)]
+enum Node {
+    Number(f64),
+    Str(String),
+    Bool(bool),
+    Field(String),
+    Not(Box<Node>),
+    Logic { op: LogicOp, left: Box<Node>, right: Box<Node> },
+    Equality { negate: bool, left: Box<Node>, right: Box<Node> },
+    Compare { op: CmpOp, left: Box<Node>, right: Box<Node> },
+    Additive { subtract: bool, left: Box<Node>, right: Box<Node> },
+    Multiplicative { op: MulOp, left: Box<Node>, right: Box<Node> },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LogicOp { And, Or }
+
+#[derive(Clone, Copy, Debug)]
+enum CmpOp { Gt, Lt, Gte, Lte }
+
+#[derive(Clone, Copy, Debug)]
+enum MulOp { Mul, Div, Rem }
 
 /// Outcome of evaluating an invariant expression.
 pub struct InvariantResult {
@@ -118,46 +148,77 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, ()> {
     Ok(tokens)
 }
 
+/// A parse result: the cached AST, or `Err` for a malformed expression.
+type AstEntry = Result<Arc<Node>, ()>;
+
+/// Compiled, document-independent invariant ASTs keyed by source string.
+fn ast_cache() -> &'static Mutex<HashMap<String, AstEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, AstEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return the cached AST for an expression, parsing and caching it on first use.
+fn get_ast(expr: &str) -> AstEntry {
+    if let Ok(cache) = ast_cache().lock() {
+        if let Some(entry) = cache.get(expr) {
+            return entry.clone();
+        }
+    }
+
+    let parsed = parse_to_ast(expr).map(Arc::new);
+
+    if let Ok(mut cache) = ast_cache().lock() {
+        return cache.entry(expr.to_string()).or_insert(parsed).clone();
+    }
+    parsed
+}
+
+/// Parse an invariant expression to an AST. Returns `Err` on malformed input.
+fn parse_to_ast(expr: &str) -> Result<Node, ()> {
+    let tokens = tokenize(expr)?;
+    let mut parser = AstParser { tokens, pos: 0 };
+    let ast = parser.parse_expression()?;
+    if parser.pos != parser.tokens.len() {
+        return Err(()); // trailing tokens
+    }
+    Ok(ast)
+}
+
 /// Parse and evaluate an invariant expression. `resolve` returns the document
 /// value at a field name, or `None` if absent.
+///
+/// The parsed AST is cached by expression source, so re-validating documents
+/// against the same schema reuses the compiled form.
 pub fn evaluate_invariant<F>(expr: &str, resolve: F) -> Result<InvariantResult, ()>
 where
     F: Fn(&str) -> Option<OdinValue>,
 {
-    let tokens = tokenize(expr)?;
-    let mut parser = Parser {
-        tokens,
-        pos: 0,
+    let ast = get_ast(expr)?;
+
+    let mut state = EvalState {
         resolve: &resolve,
         absent_operand: false,
         null_operand: false,
     };
+    let final_val = eval_node(&ast, &mut state);
 
-    let final_val = parser.parse_expression()?;
-    if parser.pos != parser.tokens.len() {
-        return Err(()); // trailing tokens
-    }
-
-    let value = if parser.null_operand {
+    let value = if state.null_operand {
         Some(false)
-    } else if parser.absent_operand {
+    } else if state.absent_operand {
         None
     } else {
         Some(to_bool(&final_val))
     };
 
-    Ok(InvariantResult { value, null_operand: parser.null_operand })
+    Ok(InvariantResult { value, null_operand: state.null_operand })
 }
 
-struct Parser<'a, F: Fn(&str) -> Option<OdinValue>> {
+struct AstParser {
     tokens: Vec<Token>,
     pos: usize,
-    resolve: &'a F,
-    absent_operand: bool,
-    null_operand: bool,
 }
 
-impl<'a, F: Fn(&str) -> Option<OdinValue>> Parser<'a, F> {
+impl AstParser {
     fn peek_op(&self) -> Option<&str> {
         match self.tokens.get(self.pos) {
             Some(Token::Op(s)) => Some(s.as_str()),
@@ -171,31 +232,31 @@ impl<'a, F: Fn(&str) -> Option<OdinValue>> Parser<'a, F> {
         t
     }
 
-    fn parse_expression(&mut self) -> Result<Operand, ()> {
+    fn parse_expression(&mut self) -> Result<Node, ()> {
         self.parse_logic_or()
     }
 
-    fn parse_logic_or(&mut self) -> Result<Operand, ()> {
+    fn parse_logic_or(&mut self) -> Result<Node, ()> {
         let mut left = self.parse_logic_and()?;
         while self.peek_op() == Some("||") {
             self.next();
             let right = self.parse_logic_and()?;
-            left = Operand::Bool(to_bool(&left) || to_bool(&right));
+            left = Node::Logic { op: LogicOp::Or, left: Box::new(left), right: Box::new(right) };
         }
         Ok(left)
     }
 
-    fn parse_logic_and(&mut self) -> Result<Operand, ()> {
+    fn parse_logic_and(&mut self) -> Result<Node, ()> {
         let mut left = self.parse_equality()?;
         while self.peek_op() == Some("&&") {
             self.next();
             let right = self.parse_equality()?;
-            left = Operand::Bool(to_bool(&left) && to_bool(&right));
+            left = Node::Logic { op: LogicOp::And, left: Box::new(left), right: Box::new(right) };
         }
         Ok(left)
     }
 
-    fn parse_equality(&mut self) -> Result<Operand, ()> {
+    fn parse_equality(&mut self) -> Result<Node, ()> {
         let mut left = self.parse_comparison()?;
         while matches!(self.peek_op(), Some("==") | Some("!=") | Some("=")) {
             let op = match self.next() {
@@ -203,26 +264,35 @@ impl<'a, F: Fn(&str) -> Option<OdinValue>> Parser<'a, F> {
                 _ => unreachable!(),
             };
             let right = self.parse_comparison()?;
-            let eq = loose_equals(&left, &right);
-            left = Operand::Bool(if op == "!=" { !eq } else { eq });
+            left = Node::Equality {
+                negate: op == "!=",
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
 
-    fn parse_comparison(&mut self) -> Result<Operand, ()> {
+    fn parse_comparison(&mut self) -> Result<Node, ()> {
         let mut left = self.parse_additive()?;
         while matches!(self.peek_op(), Some(">") | Some("<") | Some(">=") | Some("<=")) {
             let op = match self.next() {
                 Some(Token::Op(s)) => s,
                 _ => unreachable!(),
             };
+            let cmp = match op.as_str() {
+                ">" => CmpOp::Gt,
+                "<" => CmpOp::Lt,
+                ">=" => CmpOp::Gte,
+                _ => CmpOp::Lte,
+            };
             let right = self.parse_additive()?;
-            left = Operand::Bool(compare(&left, &op, &right));
+            left = Node::Compare { op: cmp, left: Box::new(left), right: Box::new(right) };
         }
         Ok(left)
     }
 
-    fn parse_additive(&mut self) -> Result<Operand, ()> {
+    fn parse_additive(&mut self) -> Result<Node, ()> {
         let mut left = self.parse_multiplicative()?;
         while matches!(self.peek_op(), Some("+") | Some("-")) {
             let op = match self.next() {
@@ -230,47 +300,43 @@ impl<'a, F: Fn(&str) -> Option<OdinValue>> Parser<'a, F> {
                 _ => unreachable!(),
             };
             let right = self.parse_multiplicative()?;
-            left = match (to_num(&left), to_num(&right)) {
-                (Some(l), Some(r)) => Operand::Number(if op == "+" { l + r } else { l - r }),
-                _ => Operand::Number(f64::NAN),
+            left = Node::Additive {
+                subtract: op == "-",
+                left: Box::new(left),
+                right: Box::new(right),
             };
         }
         Ok(left)
     }
 
-    fn parse_multiplicative(&mut self) -> Result<Operand, ()> {
+    fn parse_multiplicative(&mut self) -> Result<Node, ()> {
         let mut left = self.parse_unary()?;
         while matches!(self.peek_op(), Some("*") | Some("/") | Some("%")) {
             let op = match self.next() {
                 Some(Token::Op(s)) => s,
                 _ => unreachable!(),
             };
-            let right = self.parse_unary()?;
-            left = match (to_num(&left), to_num(&right)) {
-                (Some(l), Some(r)) => {
-                    let v = match op.as_str() {
-                        "*" => l * r,
-                        "/" => if r == 0.0 { f64::NAN } else { l / r },
-                        _ => if r == 0.0 { f64::NAN } else { l % r },
-                    };
-                    Operand::Number(v)
-                }
-                _ => Operand::Number(f64::NAN),
+            let mul = match op.as_str() {
+                "*" => MulOp::Mul,
+                "/" => MulOp::Div,
+                _ => MulOp::Rem,
             };
+            let right = self.parse_unary()?;
+            left = Node::Multiplicative { op: mul, left: Box::new(left), right: Box::new(right) };
         }
         Ok(left)
     }
 
-    fn parse_unary(&mut self) -> Result<Operand, ()> {
+    fn parse_unary(&mut self) -> Result<Node, ()> {
         if self.peek_op() == Some("!") {
             self.next();
             let operand = self.parse_unary()?;
-            return Ok(Operand::Bool(!to_bool(&operand)));
+            return Ok(Node::Not(Box::new(operand)));
         }
         self.parse_primary()
     }
 
-    fn parse_primary(&mut self) -> Result<Operand, ()> {
+    fn parse_primary(&mut self) -> Result<Node, ()> {
         let tok = self.next().ok_or(())?;
         match tok {
             Token::LParen => {
@@ -280,28 +346,90 @@ impl<'a, F: Fn(&str) -> Option<OdinValue>> Parser<'a, F> {
                     _ => Err(()),
                 }
             }
-            Token::Number(text) => text.parse::<f64>().map(Operand::Number).map_err(|_| ()),
-            Token::Str(text) => Ok(Operand::Str(text)),
+            Token::Number(text) => text.parse::<f64>().map(Node::Number).map_err(|_| ()),
+            Token::Str(text) => Ok(Node::Str(text)),
             Token::Ident(text) => {
                 if text == "true" {
-                    return Ok(Operand::Bool(true));
+                    return Ok(Node::Bool(true));
                 }
                 if text == "false" {
-                    return Ok(Operand::Bool(false));
+                    return Ok(Node::Bool(false));
                 }
-                match (self.resolve)(&text) {
-                    None => {
-                        self.absent_operand = true;
-                        Ok(Operand::Number(f64::NAN))
-                    }
-                    Some(OdinValue::Null { .. }) => {
-                        self.null_operand = true;
-                        Ok(Operand::Null)
-                    }
-                    Some(value) => Ok(operand_from_value(&value)),
-                }
+                Ok(Node::Field(text))
             }
             _ => Err(()),
+        }
+    }
+}
+
+/// Per-evaluation state tracking absent/null operands.
+struct EvalState<'a, F: Fn(&str) -> Option<OdinValue>> {
+    resolve: &'a F,
+    absent_operand: bool,
+    null_operand: bool,
+}
+
+fn eval_node<F>(node: &Node, state: &mut EvalState<'_, F>) -> Operand
+where
+    F: Fn(&str) -> Option<OdinValue>,
+{
+    match node {
+        Node::Number(n) => Operand::Number(*n),
+        Node::Str(s) => Operand::Str(s.clone()),
+        Node::Bool(b) => Operand::Bool(*b),
+        Node::Field(name) => match (state.resolve)(name) {
+            None => {
+                state.absent_operand = true;
+                Operand::Number(f64::NAN)
+            }
+            Some(OdinValue::Null { .. }) => {
+                state.null_operand = true;
+                Operand::Null
+            }
+            Some(value) => operand_from_value(&value),
+        },
+        Node::Not(operand) => Operand::Bool(!to_bool(&eval_node(operand, state))),
+        Node::Logic { op, left, right } => {
+            let l = to_bool(&eval_node(left, state));
+            let r = to_bool(&eval_node(right, state));
+            Operand::Bool(match op {
+                LogicOp::Or => l || r,
+                LogicOp::And => l && r,
+            })
+        }
+        Node::Equality { negate, left, right } => {
+            let l = eval_node(left, state);
+            let r = eval_node(right, state);
+            let eq = loose_equals(&l, &r);
+            Operand::Bool(if *negate { !eq } else { eq })
+        }
+        Node::Compare { op, left, right } => {
+            let l = eval_node(left, state);
+            let r = eval_node(right, state);
+            Operand::Bool(compare(&l, *op, &r))
+        }
+        Node::Additive { subtract, left, right } => {
+            let l = eval_node(left, state);
+            let r = eval_node(right, state);
+            match (to_num(&l), to_num(&r)) {
+                (Some(a), Some(b)) => Operand::Number(if *subtract { a - b } else { a + b }),
+                _ => Operand::Number(f64::NAN),
+            }
+        }
+        Node::Multiplicative { op, left, right } => {
+            let l = eval_node(left, state);
+            let r = eval_node(right, state);
+            match (to_num(&l), to_num(&r)) {
+                (Some(a), Some(b)) => {
+                    let v = match op {
+                        MulOp::Mul => a * b,
+                        MulOp::Div => if b == 0.0 { f64::NAN } else { a / b },
+                        MulOp::Rem => if b == 0.0 { f64::NAN } else { a % b },
+                    };
+                    Operand::Number(v)
+                }
+                _ => Operand::Number(f64::NAN),
+            }
         }
     }
 }
@@ -372,23 +500,21 @@ fn loose_equals(a: &Operand, b: &Operand) -> bool {
     }
 }
 
-fn compare(a: &Operand, op: &str, b: &Operand) -> bool {
+fn compare(a: &Operand, op: CmpOp, b: &Operand) -> bool {
     if let (Some(x), Some(y)) = (to_num(a), to_num(b)) {
         return match op {
-            ">" => x > y,
-            "<" => x < y,
-            ">=" => x >= y,
-            "<=" => x <= y,
-            _ => false,
+            CmpOp::Gt => x > y,
+            CmpOp::Lt => x < y,
+            CmpOp::Gte => x >= y,
+            CmpOp::Lte => x <= y,
         };
     }
     if let (Operand::Str(x), Operand::Str(y)) = (a, b) {
         return match op {
-            ">" => x > y,
-            "<" => x < y,
-            ">=" => x >= y,
-            "<=" => x <= y,
-            _ => false,
+            CmpOp::Gt => x > y,
+            CmpOp::Lt => x < y,
+            CmpOp::Gte => x >= y,
+            CmpOp::Lte => x <= y,
         };
     }
     false

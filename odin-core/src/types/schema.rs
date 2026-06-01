@@ -100,7 +100,7 @@ pub struct SchemaConditional {
 }
 
 /// A conditional comparison operator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConditionalOperator {
     /// Equal (`=`).
     Eq,

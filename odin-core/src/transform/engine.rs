@@ -23,6 +23,141 @@ use crate::types::values::{OdinValue, OdinArrayItem};
 use super::verbs::{VerbRegistry, VerbContext};
 use super::formatters;
 
+use std::sync::{Arc, Mutex, OnceLock};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compiled validation cache (`:validate` / `:enum` / `:range`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Precompiled validation derived from a `:validate` / `:enum` / `:range`
+/// directive value. Built once per distinct directive string and reused across
+/// every value the mapping processes.
+#[derive(Clone)]
+enum CompiledCheck {
+    /// `:validate` regex (compiled under the `regex` feature) or an invalid pattern.
+    #[cfg(feature = "regex")]
+    Pattern(Result<Arc<regex::Regex>, ()>),
+    /// `:validate` pattern when matching is unavailable without the `regex` feature.
+    #[cfg(not(feature = "regex"))]
+    Pattern,
+    /// `:enum` allowed-value set.
+    Enum(Arc<Vec<String>>),
+    /// `:range` bounds parsed from `min..max`.
+    Range { min: Option<f64>, max: Option<f64> },
+}
+
+fn check_cache() -> &'static Mutex<HashMap<(u8, String), CompiledCheck>> {
+    static CACHE: OnceLock<Mutex<HashMap<(u8, String), CompiledCheck>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Compile (or reuse) a validation check for a directive value. `kind` tags the
+/// directive (`0` = validate, `1` = enum, `2` = range) so distinct directives
+/// with the same string don't collide.
+fn compile_check(kind: u8, value: &str) -> CompiledCheck {
+    let key = (kind, value.to_string());
+    if let Ok(cache) = check_cache().lock() {
+        if let Some(c) = cache.get(&key) {
+            return c.clone();
+        }
+    }
+
+    let compiled = match kind {
+        0 => {
+            #[cfg(feature = "regex")]
+            {
+                CompiledCheck::Pattern(regex::Regex::new(value).map(Arc::new).map_err(|_| ()))
+            }
+            #[cfg(not(feature = "regex"))]
+            {
+                CompiledCheck::Pattern
+            }
+        }
+        1 => {
+            let allowed: Vec<String> = value
+                .split(',')
+                .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                .collect();
+            CompiledCheck::Enum(Arc::new(allowed))
+        }
+        _ => {
+            let mut parts = value.splitn(2, "..");
+            let min = parts.next().and_then(|p| p.trim().parse::<f64>().ok());
+            let max = parts.next().and_then(|p| p.trim().parse::<f64>().ok());
+            CompiledCheck::Range { min, max }
+        }
+    };
+
+    if let Ok(mut cache) = check_cache().lock() {
+        return cache.entry(key).or_insert(compiled).clone();
+    }
+    compiled
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-mapping directive flags
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Boolean presence flags derived once from a mapping's directives, which are
+/// data-independent and rescanned for every value the mapping processes.
+#[derive(Clone, Copy, Default)]
+struct MappingFlags {
+    has_if: bool,
+    has_unless: bool,
+    has_object: bool,
+    has_default: bool,
+    has_raw: bool,
+    has_array: bool,
+    has_validation: bool,
+}
+
+fn flags_cache() -> &'static Mutex<HashMap<u64, MappingFlags>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, MappingFlags>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A content fingerprint over a mapping's directive names (presence flags depend
+/// only on which directives are attached, not their values or order).
+fn mapping_flags_key(mapping: &FieldMapping) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut acc: u64 = 0;
+    for d in &mapping.directives {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        d.name.hash(&mut h);
+        acc ^= h.finish();
+    }
+    acc
+}
+
+/// Compute (or reuse) the directive presence flags for a mapping.
+fn mapping_flags(mapping: &FieldMapping) -> MappingFlags {
+    let key = mapping_flags_key(mapping);
+    if let Ok(cache) = flags_cache().lock() {
+        if let Some(f) = cache.get(&key) {
+            return *f;
+        }
+    }
+
+    let mut f = MappingFlags::default();
+    for d in &mapping.directives {
+        match d.name.as_str() {
+            "if" => f.has_if = true,
+            "unless" => f.has_unless = true,
+            "object" => f.has_object = true,
+            "default" => f.has_default = true,
+            "raw" => f.has_raw = true,
+            "array" => f.has_array = true,
+            "validate" | "enum" | "range" => f.has_validation = true,
+            _ => {}
+        }
+    }
+
+    if let Ok(mut cache) = flags_cache().lock() {
+        cache.entry(key).or_insert(f);
+    }
+    f
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Execution context
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1259,29 +1394,37 @@ fn process_mapping(
     output: &mut DynValue,
     path_prefix: &str,
 ) {
+    let flags = mapping_flags(mapping);
+
     // Field-level :if / :unless — drop the field when the condition fails.
-    if let Some(dir) = mapping.directives.iter().find(|d| d.name == "if") {
-        if let Some(crate::types::values::DirectiveValue::String(cond)) = &dir.value {
-            if !evaluate_field_condition(cond, ctx, current_source) {
-                return;
+    if flags.has_if {
+        if let Some(dir) = mapping.directives.iter().find(|d| d.name == "if") {
+            if let Some(crate::types::values::DirectiveValue::String(cond)) = &dir.value {
+                if !evaluate_field_condition(cond, ctx, current_source) {
+                    return;
+                }
             }
         }
     }
-    if let Some(dir) = mapping.directives.iter().find(|d| d.name == "unless") {
-        if let Some(crate::types::values::DirectiveValue::String(cond)) = &dir.value {
-            if evaluate_field_condition(cond, ctx, current_source) {
-                return;
+    if flags.has_unless {
+        if let Some(dir) = mapping.directives.iter().find(|d| d.name == "unless") {
+            if let Some(crate::types::values::DirectiveValue::String(cond)) = &dir.value {
+                if evaluate_field_condition(cond, ctx, current_source) {
+                    return;
+                }
             }
         }
     }
 
     // A :default modifier rescues a missing lookup; suppress errors it raises.
-    let has_default = mapping.directives.iter().any(|d| d.name == "default");
+    let has_default = flags.has_default;
     let errors_before = if has_default { ctx.errors.len() } else { 0 };
 
     // :object builds a structural object from an inline `{k = @path, ...}` spec.
-    let value = if let Some(dir) = mapping.directives.iter().find(|d| d.name == "object") {
-        if let Some(crate::types::values::DirectiveValue::String(spec)) = &dir.value {
+    let value = if flags.has_object {
+        if let Some(crate::types::values::DirectiveValue::String(spec)) =
+            mapping.directives.iter().find(|d| d.name == "object").and_then(|d| d.value.as_ref())
+        {
             Ok(build_inline_object(spec, ctx, current_source, &*output))
         } else {
             Ok(DynValue::Object(Vec::new()))
@@ -1319,7 +1462,7 @@ fn process_mapping(
             };
 
             // Validation modifiers: :validate, :enum, :range (honors onValidation policy).
-            if !validate_field_value(&val, mapping, ctx) {
+            if flags.has_validation && !validate_field_value(&val, mapping, ctx) {
                 return;
             }
 
@@ -1353,14 +1496,14 @@ fn process_mapping(
             }
 
             // :raw — parse a JSON string into a structural value.
-            let val = if mapping.directives.iter().any(|d| d.name == "raw") {
+            let val = if flags.has_raw {
                 parse_raw_json_value(val)
             } else {
                 val
             };
 
             // :array — wrap the value in a single-element array.
-            let val = if mapping.directives.iter().any(|d| d.name == "array") {
+            let val = if flags.has_array {
                 DynValue::Array(vec![val])
             } else {
                 val
@@ -1610,52 +1753,51 @@ fn validate_field_value(value: &DynValue, mapping: &FieldMapping, ctx: &mut Exec
     if let Some(dir) = mapping.directives.iter().find(|d| d.name == "validate") {
         if let Some(crate::types::values::DirectiveValue::String(pattern)) = &dir.value {
             let s = dyn_to_plain_string(value);
-            #[cfg(feature = "regex")]
-            {
-                match regex::Regex::new(pattern) {
-                    Ok(re) => {
-                        if !re.is_match(&s) {
-                            failures.push(format!("value '{s}' does not match pattern '{pattern}'"));
-                        }
+            match compile_check(0, pattern) {
+                #[cfg(feature = "regex")]
+                CompiledCheck::Pattern(Ok(re)) => {
+                    if !re.is_match(&s) {
+                        failures.push(format!("value '{s}' does not match pattern '{pattern}'"));
                     }
-                    Err(_) => failures.push(format!("invalid validation pattern '{pattern}'")),
                 }
-            }
-            #[cfg(not(feature = "regex"))]
-            {
-                let _ = (&s, pattern);
+                #[cfg(feature = "regex")]
+                CompiledCheck::Pattern(Err(())) => {
+                    failures.push(format!("invalid validation pattern '{pattern}'"));
+                }
+                #[cfg(not(feature = "regex"))]
+                CompiledCheck::Pattern => {
+                    let _ = (&s, pattern);
+                }
+                _ => {}
             }
         }
     }
 
     if let Some(dir) = mapping.directives.iter().find(|d| d.name == "enum") {
         if let Some(crate::types::values::DirectiveValue::String(list)) = &dir.value {
-            let allowed: Vec<String> = list
-                .split(',')
-                .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-                .collect();
-            let s = dyn_to_plain_string(value);
-            if !allowed.iter().any(|a| a == &s) {
-                failures.push(format!("value '{}' is not one of [{}]", s, allowed.join(", ")));
+            if let CompiledCheck::Enum(allowed) = compile_check(1, list) {
+                let s = dyn_to_plain_string(value);
+                if !allowed.iter().any(|a| a == &s) {
+                    failures.push(format!("value '{}' is not one of [{}]", s, allowed.join(", ")));
+                }
             }
         }
     }
 
     if let Some(dir) = mapping.directives.iter().find(|d| d.name == "range") {
         if let Some(crate::types::values::DirectiveValue::String(range_str)) = &dir.value {
-            let mut parts = range_str.splitn(2, "..");
-            let min = parts.next().and_then(|p| p.trim().parse::<f64>().ok());
-            let max = parts.next().and_then(|p| p.trim().parse::<f64>().ok());
-            match value.as_f64() {
-                Some(num) => {
-                    if min.is_some_and(|m| num < m) || max.is_some_and(|m| num > m) {
-                        failures.push(format!("value {num} is outside range {range_str}"));
+            if let CompiledCheck::Range { min, max } = compile_check(2, range_str) {
+                match value.as_f64() {
+                    Some(num) => {
+                        if min.is_some_and(|m| num < m) || max.is_some_and(|m| num > m) {
+                            failures.push(format!("value {num} is outside range {range_str}"));
+                        }
                     }
+                    None => failures.push(format!(
+                        "value '{}' is not numeric for range {range_str}",
+                        dyn_to_plain_string(value)
+                    )),
                 }
-                None => failures.push(format!(
-                    "value '{}' is not numeric for range {range_str}",
-                    dyn_to_plain_string(value)
-                )),
             }
         }
     }

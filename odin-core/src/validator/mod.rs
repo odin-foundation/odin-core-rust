@@ -13,10 +13,13 @@ pub mod schema_serializer;
 pub mod validate_redos;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::types::document::OdinDocument;
 use crate::types::schema::{
-    OdinSchemaDefinition, SchemaConstraint, SchemaField,
+    OdinSchemaDefinition, SchemaArray, SchemaConstraint, SchemaDefault, SchemaField,
     SchemaFieldType, SchemaObjectConstraint, SchemaType, ConditionalOperator, ConditionalValue,
     ValidationResult,
 };
@@ -24,6 +27,243 @@ use crate::types::options::ValidateOptions;
 use crate::types::errors::{ValidationError, ValidationErrorCode};
 use crate::types::values::OdinValue;
 use crate::resolver::TypeRegistry;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema-Only Memo
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Schema-only results, independent of any document: the composition-expanded
+/// schema and the schema-level errors (V013 type references, V017 well-formedness).
+struct SchemaMemo {
+    expanded: OdinSchemaDefinition,
+    /// V013 schema-level type-reference errors (computed before V017).
+    type_ref_errors: Vec<ValidationError>,
+    /// V017 schema-definition well-formedness errors.
+    definition_errors: Vec<ValidationError>,
+}
+
+/// Process-global cache of schema-only work, keyed by a content fingerprint of
+/// the schema combined with the registry identity.
+fn schema_memo_cache() -> &'static Mutex<HashMap<u64, Arc<SchemaMemo>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<SchemaMemo>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Compute (or reuse) the schema-only results for `schema`/`registry`: the
+/// expanded schema plus schema-level errors. Reused across every document
+/// validated against the same schema and registry.
+fn get_schema_memo(
+    schema: &OdinSchemaDefinition,
+    registry: Option<&TypeRegistry>,
+) -> Arc<SchemaMemo> {
+    let key = schema_fingerprint(schema, registry);
+
+    if let Ok(cache) = schema_memo_cache().lock() {
+        if let Some(memo) = cache.get(&key) {
+            return Arc::clone(memo);
+        }
+    }
+
+    // Compute outside the lock.
+    let expanded = expand_type_composition(schema).into_owned();
+    let mut type_ref_errors = Vec::new();
+    validate_schema_type_references(&expanded, registry, &mut type_ref_errors);
+    let mut definition_errors = Vec::new();
+    schema_definition::validate_schema_definition(&expanded, registry, &mut definition_errors);
+    let memo = Arc::new(SchemaMemo { expanded, type_ref_errors, definition_errors });
+
+    if let Ok(mut cache) = schema_memo_cache().lock() {
+        return Arc::clone(cache.entry(key).or_insert(memo));
+    }
+    memo
+}
+
+/// A deterministic content fingerprint of a schema and the registry it resolves
+/// against. Map entries are hashed order-independently (XOR of per-entry hashes)
+/// so the unordered `HashMap` storage does not affect the result.
+fn schema_fingerprint(schema: &OdinSchemaDefinition, registry: Option<&TypeRegistry>) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+
+    schema.metadata.id.hash(&mut h);
+    schema.metadata.title.hash(&mut h);
+    schema.metadata.description.hash(&mut h);
+    schema.metadata.version.hash(&mut h);
+
+    for imp in &schema.imports {
+        imp.path.hash(&mut h);
+        imp.alias.hash(&mut h);
+    }
+
+    hash_type_map(schema.types.iter(), &mut h);
+    hash_field_map(schema.fields.iter(), &mut h);
+
+    let mut arrays_acc: u64 = 0;
+    for (name, arr) in &schema.arrays {
+        let mut eh = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut eh);
+        hash_array(arr, &mut eh);
+        arrays_acc ^= eh.finish();
+    }
+    arrays_acc.hash(&mut h);
+
+    let mut constraints_acc: u64 = 0;
+    for (path, list) in &schema.constraints {
+        let mut eh = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut eh);
+        for c in list {
+            hash_object_constraint(c, &mut eh);
+        }
+        constraints_acc ^= eh.finish();
+    }
+    constraints_acc.hash(&mut h);
+
+    if let Some(reg) = registry {
+        1u8.hash(&mut h);
+        hash_type_map(reg.local_types.iter(), &mut h);
+        let mut ns_acc: u64 = 0;
+        for (ns, types) in &reg.namespaces {
+            let mut eh = std::collections::hash_map::DefaultHasher::new();
+            ns.hash(&mut eh);
+            hash_type_map(types.iter(), &mut eh);
+            ns_acc ^= eh.finish();
+        }
+        ns_acc.hash(&mut h);
+    } else {
+        0u8.hash(&mut h);
+    }
+
+    h.finish()
+}
+
+fn hash_type_map<'a, I>(types: I, h: &mut impl Hasher)
+where
+    I: Iterator<Item = (&'a String, &'a SchemaType)>,
+{
+    let mut acc: u64 = 0;
+    for (name, t) in types {
+        let mut eh = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut eh);
+        t.name.hash(&mut eh);
+        t.description.hash(&mut eh);
+        t.parents.hash(&mut eh);
+        t.override_bases.hash(&mut eh);
+        for f in &t.fields {
+            hash_field(f, &mut eh);
+        }
+        acc ^= eh.finish();
+    }
+    acc.hash(h);
+}
+
+fn hash_field_map<'a, I>(fields: I, h: &mut impl Hasher)
+where
+    I: Iterator<Item = (&'a String, &'a SchemaField)>,
+{
+    let mut acc: u64 = 0;
+    for (path, f) in fields {
+        let mut eh = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut eh);
+        hash_field(f, &mut eh);
+        acc ^= eh.finish();
+    }
+    acc.hash(h);
+}
+
+fn hash_field(f: &SchemaField, h: &mut impl Hasher) {
+    f.name.hash(h);
+    hash_field_type(&f.field_type, h);
+    f.required.hash(h);
+    f.confidential.hash(h);
+    f.deprecated.hash(h);
+    f.immutable.hash(h);
+    f.computed.hash(h);
+    f.description.hash(h);
+    for c in &f.constraints {
+        hash_constraint(c, h);
+    }
+    match &f.default_value {
+        None => 0u8.hash(h),
+        Some(d) => {
+            d.type_name().hash(h);
+            match d {
+                SchemaDefault::String(s) => s.hash(h),
+                SchemaDefault::Integer(n) => n.hash(h),
+                SchemaDefault::Bool(b) => b.hash(h),
+                SchemaDefault::Number(n)
+                | SchemaDefault::Currency(n)
+                | SchemaDefault::Percent(n) => n.to_bits().hash(h),
+            }
+        }
+    }
+    for cond in &f.conditionals {
+        cond.field.hash(h);
+        cond.operator.hash(h);
+        cond.unless.hash(h);
+        match &cond.value {
+            ConditionalValue::String(s) => s.hash(h),
+            ConditionalValue::Number(n) => n.to_bits().hash(h),
+            ConditionalValue::Bool(b) => b.hash(h),
+        }
+    }
+}
+
+fn hash_field_type(t: &SchemaFieldType, h: &mut impl Hasher) {
+    std::mem::discriminant(t).hash(h);
+    match t {
+        SchemaFieldType::Number { decimal_places }
+        | SchemaFieldType::Decimal { decimal_places }
+        | SchemaFieldType::Currency { decimal_places } => decimal_places.hash(h),
+        SchemaFieldType::Enum(values) => values.hash(h),
+        SchemaFieldType::Union(members) => {
+            for m in members {
+                hash_field_type(m, h);
+            }
+        }
+        SchemaFieldType::Reference(s) | SchemaFieldType::TypeRef(s) => s.hash(h),
+        _ => {}
+    }
+}
+
+fn hash_constraint(c: &SchemaConstraint, h: &mut impl Hasher) {
+    std::mem::discriminant(c).hash(h);
+    match c {
+        SchemaConstraint::Bounds { min, max, min_exclusive, max_exclusive } => {
+            min.hash(h);
+            max.hash(h);
+            min_exclusive.hash(h);
+            max_exclusive.hash(h);
+        }
+        SchemaConstraint::Pattern(p) | SchemaConstraint::Format(p) => p.hash(h),
+        SchemaConstraint::Enum(values) => values.hash(h),
+        SchemaConstraint::Unique => {}
+        SchemaConstraint::Size { min, max } => {
+            min.hash(h);
+            max.hash(h);
+        }
+    }
+}
+
+fn hash_array(arr: &SchemaArray, h: &mut impl Hasher) {
+    arr.name.hash(h);
+    hash_field_type(&arr.item_type, h);
+    arr.min_items.hash(h);
+    arr.max_items.hash(h);
+    arr.unique.hash(h);
+    arr.columns.hash(h);
+    hash_field_map(arr.item_fields.iter(), h);
+}
+
+fn hash_object_constraint(c: &SchemaObjectConstraint, h: &mut impl Hasher) {
+    std::mem::discriminant(c).hash(h);
+    match c {
+        SchemaObjectConstraint::Invariant(e) => e.hash(h),
+        SchemaObjectConstraint::Cardinality { fields, min, max } => {
+            fields.hash(h);
+            min.hash(h);
+            max.hash(h);
+        }
+    }
+}
 
 /// Validate a document against a schema.
 pub fn validate(
@@ -46,24 +286,30 @@ pub fn validate_with_registry(
     let opts = options.cloned().unwrap_or_default();
     let mut errors = Vec::new();
 
-    // 0. Expand type composition (merge base type fields into derived types)
-    let schema = expand_type_composition(schema);
+    // 0. Schema-only work (type composition expansion, V013 schema type refs,
+    //    V017 well-formedness) is computed once per schema and reused.
+    let memo = get_schema_memo(schema, registry);
+    let schema = &memo.expanded;
 
     // Schema-level type references (V013): imported types resolve via registry.
-    validate_schema_type_references(&schema, registry, &mut errors);
+    for e in &memo.type_ref_errors {
+        errors.push(e.clone());
+    }
     if opts.fail_fast && !errors.is_empty() {
         return ValidationResult::invalid(errors);
     }
 
     // Schema-definition well-formedness (V017): override/intersection/tabular/default.
-    schema_definition::validate_schema_definition(&schema, registry, &mut errors);
+    for e in &memo.definition_errors {
+        errors.push(e.clone());
+    }
     if opts.fail_fast && !errors.is_empty() {
         return ValidationResult::invalid(errors);
     }
 
     // 1. Validate fields defined in schema (including fields synthesized from
     //    section `_composition` intersections and field-level `@TypeRef`s).
-    let expanded_fields = expand_field_compositions(doc, &schema, registry);
+    let expanded_fields = expand_field_compositions(doc, schema, registry);
     for (path, field) in &expanded_fields {
         // Array item-field templates (`path[].field`) are not literal document
         // paths; they are validated per-row, not against the template path.
@@ -115,7 +361,7 @@ pub fn validate_with_registry(
 
     // 6. Strict mode: check for unknown fields
     if opts.strict {
-        validate_strict(doc, &schema, &mut errors);
+        validate_strict(doc, schema, &mut errors);
     }
 
     if errors.is_empty() {
@@ -466,19 +712,73 @@ fn parse_temporal_bound(s: &str) -> Option<i64> {
     Some(days_from_civil(y, m, d) * 86_400_000)
 }
 
+/// Cached compilation of a distinct pattern string: the ReDoS safety verdict
+/// and, when the `regex` feature is on, the compiled regex.
+#[derive(Clone)]
+enum CompiledPattern {
+    /// ReDoS analysis rejected the pattern.
+    Unsafe(String),
+    /// Pattern is safe but failed to compile.
+    Invalid,
+    /// Pattern is safe and compiled (only tracked under the `regex` feature).
+    #[cfg(feature = "regex")]
+    Compiled(Arc<regex::Regex>),
+    /// Pattern is safe; matching is unavailable without the `regex` feature.
+    #[cfg(not(feature = "regex"))]
+    Safe,
+}
+
+fn pattern_cache() -> &'static Mutex<HashMap<String, CompiledPattern>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CompiledPattern>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Compile a pattern once per distinct string and reuse: runs the ReDoS safety
+/// check and (under the `regex` feature) compiles the regex.
+fn compile_pattern(pattern: &str) -> CompiledPattern {
+    if let Ok(cache) = pattern_cache().lock() {
+        if let Some(c) = cache.get(pattern) {
+            return c.clone();
+        }
+    }
+
+    let redos_check = validate_redos::analyze_pattern(pattern);
+    let compiled = if !redos_check.safe {
+        CompiledPattern::Unsafe(redos_check.reason.unwrap_or_default())
+    } else {
+        #[cfg(feature = "regex")]
+        {
+            match regex::Regex::new(pattern) {
+                Ok(re) => CompiledPattern::Compiled(Arc::new(re)),
+                Err(_) => CompiledPattern::Invalid,
+            }
+        }
+        #[cfg(not(feature = "regex"))]
+        {
+            CompiledPattern::Safe
+        }
+    };
+
+    if let Ok(mut cache) = pattern_cache().lock() {
+        return cache.entry(pattern.to_string()).or_insert(compiled).clone();
+    }
+    compiled
+}
+
 fn validate_pattern(
     value: &OdinValue,
     path: &str,
     pattern: &str,
     errors: &mut Vec<ValidationError>,
 ) {
+    let compiled = compile_pattern(pattern);
+
     // ReDoS safety check
-    let redos_check = validate_redos::analyze_pattern(pattern);
-    if !redos_check.safe {
+    if let CompiledPattern::Unsafe(reason) = &compiled {
         errors.push(ValidationError::new(
             ValidationErrorCode::PatternMismatch,
             path,
-            format!("Unsafe regex pattern: {}", redos_check.reason.unwrap_or_default()),
+            format!("Unsafe regex pattern: {reason}"),
         ));
         return;
     }
@@ -487,8 +787,8 @@ fn validate_pattern(
         // Use regex crate if available, otherwise basic matching
         #[cfg(feature = "regex")]
         {
-            match regex::Regex::new(pattern) {
-                Ok(re) => {
+            match &compiled {
+                CompiledPattern::Compiled(re) => {
                     if !re.is_match(s) {
                         errors.push(ValidationError::new(
                             ValidationErrorCode::PatternMismatch,
@@ -497,13 +797,14 @@ fn validate_pattern(
                         ));
                     }
                 }
-                Err(_) => {
+                CompiledPattern::Invalid => {
                     errors.push(ValidationError::new(
                         ValidationErrorCode::PatternMismatch,
                         path,
                         format!("Invalid regex pattern: '{}'", pattern),
                     ));
                 }
+                CompiledPattern::Unsafe(_) => {}
             }
         }
         #[cfg(not(feature = "regex"))]
