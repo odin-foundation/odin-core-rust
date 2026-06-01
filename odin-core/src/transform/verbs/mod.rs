@@ -38,6 +38,9 @@ pub struct VerbContext<'a> {
     /// Set by `%lookup` on a table/column/key miss so the engine can report
     /// it through the `onMissing` policy.
     pub lookup_miss: std::cell::Cell<Option<LookupMiss>>,
+    /// Set by `%accumulate` when the running sum overflows so the engine can
+    /// report a T008 and retain the last valid accumulator value.
+    pub overflow: std::cell::Cell<Option<String>>,
 }
 
 /// A `%lookup` miss: the referenced table and the joined match key.
@@ -45,6 +48,9 @@ pub struct VerbContext<'a> {
 pub struct LookupMiss {
     pub table: String,
     pub key: String,
+    /// Whether the referenced table exists. `false` indicates a missing table
+    /// (T003); `true` indicates a key not found in an existing table (T004).
+    pub table_exists: bool,
 }
 
 /// Global singleton for built-in verbs (initialized once, shared across all executions).
@@ -910,18 +916,20 @@ fn verb_lookup(args: &[DynValue], ctx: &VerbContext) -> Result<DynValue, String>
     if let Some(val) = do_table_lookup(&table_ref, keys, &ctx.tables) { Ok(val.clone()) } else {
         // Check for table-level default
         let table_name = table_ref.split('.').next().unwrap_or(&table_ref);
+        let table_exists = ctx.tables.contains_key(table_name);
         if let Some(table) = ctx.tables.get(table_name) {
             if let Some(ref default) = table.default {
                 return Ok(default.clone());
             }
         }
-        // Report the miss for the onMissing policy.
+        // Report the miss for the onMissing policy. A missing table is T003;
+        // a key not found in an existing table is T004.
         let key = keys
             .iter()
             .map(coerce_str_pub)
             .collect::<Vec<_>>()
             .join(", ");
-        ctx.lookup_miss.set(Some(LookupMiss { table: table_name.to_string(), key }));
+        ctx.lookup_miss.set(Some(LookupMiss { table: table_name.to_string(), key, table_exists }));
         Ok(DynValue::Null)
     }
 }
@@ -1809,6 +1817,7 @@ mod extended_tests {
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
             lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
         }
     }
 
@@ -2460,6 +2469,7 @@ mod extended_tests_2 {
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
             lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
         }
     }
 

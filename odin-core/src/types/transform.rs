@@ -6,6 +6,17 @@
 use std::collections::HashMap;
 use crate::types::values::OdinValue;
 
+/// Resolver that maps an `@import` path to the imported transform's text.
+/// Returns `None` when the path cannot be satisfied.
+pub type ImportResolver<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+/// Options controlling a transform execution.
+#[derive(Default)]
+pub struct ExecuteOptions<'a> {
+    /// Resolver for `@import` references; absent imports stay unresolved.
+    pub import_resolver: Option<&'a ImportResolver<'a>>,
+}
+
 /// A parsed ODIN transform specification.
 #[derive(Debug, Clone)]
 pub struct OdinTransform {
@@ -550,6 +561,78 @@ pub fn dangling_branch_error(directive: &str, segment: Option<&str>) -> Transfor
         message: format!("'{directive}' segment has no preceding 'if'"),
         path: segment.map(std::string::ToString::to_string),
         code: Some(transform_error_codes::T012_DANGLING_BRANCH.to_string()),
+    }
+}
+
+/// Build a T001 unknown-verb error.
+pub fn unknown_verb_error(verb: &str, field: Option<&str>) -> TransformError {
+    TransformError {
+        message: format!("Unknown verb: {verb}"),
+        path: field.map(std::string::ToString::to_string),
+        code: Some(transform_error_codes::T001_UNKNOWN_VERB.to_string()),
+    }
+}
+
+/// Build a T003 lookup-table-not-found error.
+pub fn lookup_table_not_found_error(table: &str, field: Option<&str>) -> TransformError {
+    TransformError {
+        message: format!("Lookup table not found: {table}"),
+        path: field.map(std::string::ToString::to_string),
+        code: Some(transform_error_codes::T003_LOOKUP_TABLE_NOT_FOUND.to_string()),
+    }
+}
+
+/// Build a T004 lookup-key-not-found error.
+pub fn lookup_key_not_found_error(table: &str, key: &str, field: Option<&str>) -> TransformError {
+    TransformError {
+        message: format!("Lookup key '{key}' not found in table '{table}'"),
+        path: field.map(std::string::ToString::to_string),
+        code: Some(transform_error_codes::T004_LOOKUP_KEY_NOT_FOUND.to_string()),
+    }
+}
+
+/// Build a T005 source-path-not-found error.
+pub fn source_path_not_found_error(path: &str, field: Option<&str>) -> TransformError {
+    TransformError {
+        message: format!("Source path not found: {path}"),
+        path: field.map(std::string::ToString::to_string),
+        code: Some(transform_error_codes::T005_SOURCE_PATH_NOT_FOUND.to_string()),
+    }
+}
+
+/// Build a T006 invalid-output-format error.
+pub fn invalid_output_format_error(format: &str) -> TransformError {
+    TransformError {
+        message: format!("Invalid or unsupported output format: {format}"),
+        path: None,
+        code: Some(transform_error_codes::T006_INVALID_OUTPUT_FORMAT.to_string()),
+    }
+}
+
+/// Build a T008 accumulator-overflow error.
+pub fn accumulator_overflow_error(accumulator: &str, field: Option<&str>) -> TransformError {
+    TransformError {
+        message: format!("Accumulator '{accumulator}' overflow: value no longer exactly representable"),
+        path: field.map(std::string::ToString::to_string),
+        code: Some(transform_error_codes::T008_ACCUMULATOR_OVERFLOW.to_string()),
+    }
+}
+
+/// Build a T009 loop-source-not-array error.
+pub fn loop_source_not_array_error(path: &str, segment: Option<&str>) -> TransformError {
+    TransformError {
+        message: format!("Loop source path '{path}' does not resolve to an array"),
+        path: segment.map(std::string::ToString::to_string),
+        code: Some(transform_error_codes::T009_LOOP_SOURCE_NOT_ARRAY.to_string()),
+    }
+}
+
+/// A required field present but explicitly null (distinct from an absent path).
+pub fn source_missing_error(field: &str) -> TransformError {
+    TransformError {
+        message: format!("Required field '{field}' is missing or null"),
+        path: Some(field.to_string()),
+        code: Some("SOURCE_MISSING".to_string()),
     }
 }
 

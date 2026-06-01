@@ -694,12 +694,44 @@ pub(super) fn accumulate(args: &[DynValue], ctx: &VerbContext) -> Result<DynValu
     let value = &args[1];
     let current = ctx.accumulators.get(name).cloned().unwrap_or(DynValue::Null);
 
-    // Attempt numeric addition
-    match (&current, value) {
-        (DynValue::Integer(a), DynValue::Integer(b)) => Ok(DynValue::Integer(a + b)),
-        (DynValue::Float(a), DynValue::Float(b)) => Ok(DynValue::Float(a + b)),
-        (DynValue::Integer(a), DynValue::Float(b)) => Ok(DynValue::Float(*a as f64 + b)),
-        (DynValue::Float(a), DynValue::Integer(b)) => Ok(DynValue::Float(a + *b as f64)),
+    // The running sum can no longer be represented exactly once its magnitude
+    // exceeds the safe-integer bound (2^53 - 1).
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    // An integer accumulator holds an exact integer.
+    let integer_accumulator = matches!(current, DynValue::Integer(_));
+
+    // Exact integer addition when both sides are exact integers.
+    if let (DynValue::Integer(a), DynValue::Integer(b)) = (&current, value) {
+        return match a.checked_add(*b) {
+            // T008 even within i64 range once the exact sum exceeds the safe-
+            // integer magnitude (cross-language precision contract).
+            Some(sum) if (sum as f64).abs() > MAX_SAFE_INTEGER => {
+                ctx.overflow.set(Some(name.to_string()));
+                Ok(current)
+            }
+            Some(sum) => Ok(DynValue::Integer(sum)),
+            None => {
+                ctx.overflow.set(Some(name.to_string()));
+                Ok(current)
+            }
+        };
+    }
+
+    // Floating-point addition when both sides are numeric (covers Float,
+    // FloatRaw, Currency, Percent, and mixed Integer/Float).
+    match (current.as_f64(), value.as_f64()) {
+        (Some(a), Some(b)) => {
+            let sum = a + b;
+            // T008: the result is non-finite, or an integer accumulator has
+            // grown beyond the safe-integer magnitude (precision lost).
+            if !sum.is_finite() || (integer_accumulator && sum.abs() > MAX_SAFE_INTEGER) {
+                ctx.overflow.set(Some(name.to_string()));
+                Ok(current) // retain the last valid value
+            } else {
+                Ok(DynValue::Float(sum))
+            }
+        }
+        // Non-numeric: replace with the new value.
         _ => Ok(value.clone()),
     }
 }
@@ -1515,6 +1547,7 @@ mod tests {
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
             lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
         }
     }
 
@@ -1529,7 +1562,7 @@ mod tests {
     impl OwnedCtx {
         fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
         fn ctx(&self) -> VerbContext<'_> {
-            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None) }
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None), overflow: std::cell::Cell::new(None) }
         }
     }
 
@@ -2619,6 +2652,7 @@ mod extended_tests {
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
             lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
         }
     }
 
@@ -2631,7 +2665,7 @@ mod extended_tests {
     impl OwnedCtx {
         fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
         fn ctx(&self) -> VerbContext<'_> {
-            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None) }
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None), overflow: std::cell::Cell::new(None) }
         }
     }
 
@@ -4462,6 +4496,7 @@ mod extended_tests_2 {
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
             lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
         }
     }
 
@@ -4474,7 +4509,7 @@ mod extended_tests_2 {
     impl OwnedCtx {
         fn new() -> Self { Self { null: DynValue::Null, lv: HashMap::new(), acc: HashMap::new(), tbl: HashMap::new() } }
         fn ctx(&self) -> VerbContext<'_> {
-            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None) }
+            VerbContext { source: &self.null, loop_vars: &self.lv, accumulators: &self.acc, tables: &self.tbl, lookup_miss: std::cell::Cell::new(None), overflow: std::cell::Cell::new(None) }
         }
     }
     fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }

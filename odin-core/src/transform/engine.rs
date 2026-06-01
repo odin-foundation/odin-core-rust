@@ -14,7 +14,10 @@ use std::collections::HashMap;
 use crate::types::transform::{
     OdinTransform, TransformResult, TransformError, TransformWarning, TransformSegment,
     FieldMapping, FieldExpression, VerbCall, VerbArg, DynValue, ConfidentialMode,
-    extract_error_code,
+    ExecuteOptions, extract_error_code, transform_error_codes,
+    lookup_table_not_found_error, lookup_key_not_found_error,
+    source_path_not_found_error, invalid_output_format_error, loop_source_not_array_error,
+    source_missing_error,
 };
 use crate::types::values::{OdinValue, OdinArrayItem};
 use super::verbs::{VerbRegistry, VerbContext};
@@ -55,6 +58,37 @@ struct ExecContext<'a> {
     validation_policy: ValidationPolicy,
     /// Policy for lookup/source misses (`fail`/`warn`/`skip`/`default`).
     missing_policy: MissingPolicy,
+    /// Policy for evaluation/verb errors (`fail`/`warn`).
+    error_policy: ErrorPolicy,
+}
+
+/// Policy applied to a coded evaluation error (`onError`, default fail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorPolicy {
+    /// Record the error (failing the transform).
+    Fail,
+    /// Demote the error to a warning.
+    Warn,
+}
+
+impl ErrorPolicy {
+    /// Read the policy from a target's `onError` option (default `fail`).
+    fn from_options(options: &HashMap<String, String>) -> Self {
+        match options.get("onError").map(String::as_str) {
+            Some("warn") => Self::Warn,
+            _ => Self::Fail,
+        }
+    }
+}
+
+/// Known output formats. An unrecognized format triggers a T006 error rather
+/// than a silent JSON fallback.
+fn is_known_output_format(format: &str) -> bool {
+    matches!(
+        format.to_ascii_lowercase().as_str(),
+        "odin" | "json" | "xml" | "csv" | "fixed-width" | "fwf"
+            | "flat" | "properties" | "delimited"
+    )
 }
 
 /// Policy applied when a `%lookup` reports a miss.
@@ -107,6 +141,15 @@ impl ValidationPolicy {
 
 /// Execute a parsed transform against source data and return a `TransformResult`.
 pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult {
+    execute_with_options(transform, source, &ExecuteOptions::default())
+}
+
+/// Execute a parsed transform with explicit options (e.g., an `@import` resolver).
+pub fn execute_with_options(
+    transform: &OdinTransform,
+    source: &DynValue,
+    options: &ExecuteOptions,
+) -> TransformResult {
     // Check for multi-record mode (source has discriminator config)
     if let Some(ref source_config) = transform.source {
         if let Some(disc_str) = source_config.options.get("discriminator") {
@@ -127,7 +170,7 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
         if let Some(fmt) = src_fmt {
             if matches!(fmt, "csv" | "delimited" | "fixed-width" | "xml" | "json" | "yaml" | "flat-kvp" | "flat-yaml") {
                 if let Ok(parsed) = crate::transform::source_parsers::parse_source(raw, fmt) {
-                    return execute(transform, &parsed);
+                    return execute_with_options(transform, &parsed, options);
                 }
             }
         }
@@ -142,7 +185,10 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
         (k.clone(), odin_value_to_dyn(&def.initial))
     }).collect::<HashMap<_, _>>();
 
-    let tables = transform.tables.clone();
+    // Merge imported declarations ($table, constants, accumulators, named
+    // segments). Local declarations win.
+    let (constants, accumulators, tables, imported_segments) =
+        merge_imports(transform, options, constants, accumulators);
 
     // Determine source format from source config or direction string
     let source_format = transform.source.as_ref().map(|s| s.format.clone())
@@ -168,13 +214,25 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
         source_format,
         validation_policy: ValidationPolicy::from_options(&transform.target.options),
         missing_policy: MissingPolicy::from_options(&transform.target.options),
+        error_policy: ErrorPolicy::from_options(&transform.target.options),
     };
 
     // 2. Build output object
     let mut output = DynValue::Object(Vec::new());
 
+    // Combine local segments with imported mapping segments. Local segments win:
+    // an imported segment whose name collides with a local one is dropped.
+    let local_names: std::collections::HashSet<&str> =
+        transform.segments.iter().map(|s| s.name.as_str()).collect();
+    let mut all_segments: Vec<TransformSegment> = transform.segments.clone();
+    for seg in imported_segments {
+        if !local_names.contains(seg.name.as_str()) {
+            all_segments.push(seg);
+        }
+    }
+
     // 3. Order segments by pass: pass 1 first, then 2, ..., then 0/None last
-    let ordered = order_segments_by_pass(&transform.segments);
+    let ordered = order_segments_by_pass(&all_segments);
 
     // Group ordered segments into runs of equal pass. Conditional chains are
     // resolved within each pass run, so a chain never spans a pass boundary.
@@ -206,20 +264,37 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
 
     // 4. Apply confidential enforcement to the entire output tree
     if let Some(mode) = ctx.enforce_confidential {
-        apply_confidential_enforcement(&transform.segments, &mode, &mut output);
+        apply_confidential_enforcement(&all_segments, &mode, &mut output);
     }
 
-    // 5. Format the output
-    let formatted = if transform.target.format.eq_ignore_ascii_case("odin") {
-        let include_header = transform.target.options.get("header").is_some_and(|v| v == "true");
-        formatters::format_odin_with_modifiers(&output, &ctx.field_modifiers, include_header)
-    } else if transform.target.format.eq_ignore_ascii_case("fixed-width") {
-        // Fixed-width export uses segment mapping directives for positioning
-        formatters::format_fixed_width_from_segments(&output, &transform.segments, &transform.target.options)
-    } else if transform.target.format.eq_ignore_ascii_case("xml") {
-        formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers, &transform.target.namespaces)
+    // 5. Format the output. The effective format is the explicit `target.format`,
+    // or the direction's target side, defaulting to JSON. An unknown explicit
+    // format is a T006 error and yields no formatted output (no silent fallback).
+    let effective_format = if transform.target.format.is_empty() {
+        transform.metadata.direction.as_deref()
+            .and_then(|d| d.split("->").nth(1))
+            .filter(|f| !f.is_empty())
+            .unwrap_or("json")
+            .to_string()
     } else {
-        format_output(&output, &transform.target.format, &transform.target.options)
+        transform.target.format.clone()
+    };
+
+    let formatted = if is_known_output_format(&effective_format) {
+        if effective_format.eq_ignore_ascii_case("odin") {
+            let include_header = transform.target.options.get("header").is_some_and(|v| v == "true");
+            formatters::format_odin_with_modifiers(&output, &ctx.field_modifiers, include_header)
+        } else if effective_format.eq_ignore_ascii_case("fixed-width") {
+            // Fixed-width export uses segment mapping directives for positioning
+            formatters::format_fixed_width_from_segments(&output, &all_segments, &transform.target.options)
+        } else if effective_format.eq_ignore_ascii_case("xml") {
+            formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers, &transform.target.namespaces)
+        } else {
+            format_output(&output, &effective_format, &transform.target.options)
+        }
+    } else {
+        ctx.errors.push(invalid_output_format_error(&effective_format));
+        String::new()
     };
 
     let success = ctx.errors.is_empty();
@@ -232,6 +307,57 @@ pub fn execute(transform: &OdinTransform, source: &DynValue) -> TransformResult 
         warnings: ctx.warnings,
         modifiers: ctx.field_modifiers,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// @import resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+type ImportedMerge = (
+    HashMap<String, DynValue>,
+    HashMap<String, DynValue>,
+    HashMap<String, crate::types::transform::LookupTable>,
+    Vec<TransformSegment>,
+);
+
+/// Resolve `@import` references and merge their declarations into the local set.
+/// Local declarations win: an imported table/constant/accumulator/segment whose
+/// name already exists locally is skipped. Imports the resolver cannot satisfy
+/// are ignored. Without a resolver, no imports are merged.
+fn merge_imports(
+    transform: &OdinTransform,
+    options: &ExecuteOptions,
+    mut constants: HashMap<String, DynValue>,
+    mut accumulators: HashMap<String, DynValue>,
+) -> ImportedMerge {
+    let mut tables = transform.tables.clone();
+    let mut imported_segments: Vec<TransformSegment> = Vec::new();
+
+    let Some(resolver) = options.import_resolver else {
+        return (constants, accumulators, tables, imported_segments);
+    };
+    if transform.imports.is_empty() {
+        return (constants, accumulators, tables, imported_segments);
+    }
+
+    for import in &transform.imports {
+        let Some(text) = resolver(&import.path) else { continue };
+        let Ok(imported) = crate::transform::parse_transform(&text) else { continue };
+
+        // Local declarations win over imported ones.
+        for (name, table) in imported.tables {
+            tables.entry(name).or_insert(table);
+        }
+        for (name, value) in &imported.constants {
+            constants.entry(name.clone()).or_insert_with(|| odin_value_to_dyn(value));
+        }
+        for (name, def) in &imported.accumulators {
+            accumulators.entry(name.clone()).or_insert_with(|| odin_value_to_dyn(&def.initial));
+        }
+        imported_segments.extend(imported.segments);
+    }
+
+    (constants, accumulators, tables, imported_segments)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +513,7 @@ fn execute_multi_record(
         source_format: source_format.to_string(),
         validation_policy: ValidationPolicy::from_options(&transform.target.options),
         missing_policy: MissingPolicy::from_options(&transform.target.options),
+        error_policy: ErrorPolicy::from_options(&transform.target.options),
     };
 
     let mut output = DynValue::Object(Vec::new());
@@ -762,17 +889,28 @@ fn collect_loop_directives(segment: &TransformSegment) -> Vec<(String, Option<St
     loops
 }
 
-/// Resolve a loop's source path to its (cloned) array value for the current level.
+/// The outcome of resolving a `:loop` source for one level.
+enum LoopItems {
+    /// Source resolved to an array; iterate its elements.
+    Array(Vec<DynValue>),
+    /// Source is absent or null; yield zero rows with no error.
+    Absent,
+    /// Source is a present non-array scalar; a T009 error.
+    NotArray,
+}
+
+/// Resolve a loop's source path to its array value for the current level.
 ///
 /// The outermost loop resolves against the source. Inner loops resolve a leading
 /// `.field` against the current item, an `alias.field` against the bound alias,
-/// and any other path against the current item. A non-array result yields `None`.
+/// and any other path against the current item. An absent/null source yields
+/// `Absent` (zero rows); a present non-array scalar yields `NotArray` (T009).
 fn resolve_loop_items(
     path: &str,
     depth: usize,
     ctx: &ExecContext,
     current: &DynValue,
-) -> Option<Vec<DynValue>> {
+) -> LoopItems {
     let path = path.strip_prefix('@').unwrap_or(path).trim();
     let resolved = if let Some(rel) = path.strip_prefix('.') {
         // Leading `.` resolves against the current item, or the source when no
@@ -799,8 +937,9 @@ fn resolve_loop_items(
         }
     };
     match resolved {
-        DynValue::Array(items) => Some(items),
-        _ => None,
+        DynValue::Array(items) => LoopItems::Array(items),
+        DynValue::Null => LoopItems::Absent,
+        _ => LoopItems::NotArray,
     }
 }
 
@@ -823,8 +962,17 @@ fn iterate_loops(
 ) {
     let (path, alias) = &loops[depth];
     let current = ctx.loop_vars.get("_item").cloned().unwrap_or(DynValue::Null);
-    let Some(items) = resolve_loop_items(path, depth, ctx, &current) else {
-        return;
+    let items = match resolve_loop_items(path, depth, ctx, &current) {
+        LoopItems::Array(items) => items,
+        // Absent/null source: zero rows, no error (nested loops rely on this).
+        LoopItems::Absent => return,
+        // Present non-array scalar: T009, honoring onError.
+        LoopItems::NotArray => {
+            let loop_path = path.strip_prefix('@').unwrap_or(path).trim().to_string();
+            let err = loop_source_not_array_error(&loop_path, Some(&segment.path));
+            push_coded_error(ctx, err.message, err.path, err.code);
+            return;
+        }
     };
     let len = items.len() as i64;
     let is_innermost = depth == loops.len() - 1;
@@ -919,11 +1067,12 @@ fn emit_loop_item(
                 }
                 Err(e) => {
                     let (code, msg) = extract_error_code(&e);
-                    ctx.errors.push(TransformError {
-                        message: format!("mapping '_': {msg}"),
-                        path: Some("_".to_string()),
-                        code: code.map(|c| c.to_string()),
-                    });
+                    push_coded_error(
+                        ctx,
+                        format!("mapping '_': {msg}"),
+                        Some("_".to_string()),
+                        code.map(std::string::ToString::to_string),
+                    );
                 }
             }
         } else {
@@ -1157,6 +1306,35 @@ fn process_mapping(
                 return;
             }
 
+            // Missing source path: a `:required` field always fails (T005 when
+            // the path is absent, SOURCE_MISSING when present-but-null); an
+            // ordinary field honors the onMissing policy. A present-null value
+            // that is not required is kept.
+            let is_required = mapping.modifiers.as_ref().is_some_and(|m| m.required);
+            if matches!(val, DynValue::Null) {
+                if let Some(src_path) = copy_source_absent_path(mapping, ctx, current_source) {
+                    if is_required {
+                        ctx.errors.push(source_path_not_found_error(&src_path, Some(&mapping.target)));
+                        return;
+                    }
+                    match ctx.missing_policy {
+                        MissingPolicy::Fail => {
+                            ctx.errors.push(source_path_not_found_error(&src_path, Some(&mapping.target)));
+                            return;
+                        }
+                        MissingPolicy::Warn => {
+                            let e = source_path_not_found_error(&src_path, Some(&mapping.target));
+                            ctx.warnings.push(TransformWarning { message: e.message, path: e.path });
+                        }
+                        MissingPolicy::Silent => {}
+                    }
+                } else if is_required {
+                    // Required field present but explicitly null.
+                    ctx.errors.push(source_missing_error(&mapping.target));
+                    return;
+                }
+            }
+
             // :raw — parse a JSON string into a structural value.
             let val = if mapping.directives.iter().any(|d| d.name == "raw") {
                 parse_raw_json_value(val)
@@ -1203,12 +1381,22 @@ fn process_mapping(
         }
         Err(e) => {
             let (code, msg) = extract_error_code(&e);
-            ctx.errors.push(TransformError {
-                message: format!("mapping '{}': {}", mapping.target, msg),
-                path: Some(mapping.target.clone()),
-                code: code.map(|c| c.to_string()),
-            });
+            push_coded_error(
+                ctx,
+                format!("mapping '{}': {}", mapping.target, msg),
+                Some(mapping.target.clone()),
+                code.map(std::string::ToString::to_string),
+            );
         }
+    }
+}
+
+/// Record a coded evaluation error, honoring the `onError` policy: `fail`
+/// records an error, `warn` demotes it to a warning.
+fn push_coded_error(ctx: &mut ExecContext, message: String, path: Option<String>, code: Option<String>) {
+    match ctx.error_policy {
+        ErrorPolicy::Warn => ctx.warnings.push(TransformWarning { message, path }),
+        ErrorPolicy::Fail => ctx.errors.push(TransformError { message, path, code }),
     }
 }
 
@@ -1241,6 +1429,75 @@ fn resolve_field_path(path: &str, ctx: &ExecContext, current_source: &DynValue) 
         return from_current;
     }
     resolve_path(ctx.source, path, &ctx.constants, &ctx.accumulators)
+}
+
+/// If `mapping` copies a source path that is absent (the leaf key/index does
+/// not exist, distinct from a present null value), return the cleaned source
+/// path. Only plain copy expressions qualify; verbs, literals, objects, and
+/// `:default`/`:object` mappings never count as a missing source.
+fn copy_source_absent_path(
+    mapping: &FieldMapping,
+    ctx: &ExecContext,
+    current_source: &DynValue,
+) -> Option<String> {
+    let FieldExpression::Copy(raw) = &mapping.expression else { return None };
+    if mapping.directives.iter().any(|d| d.name == "default" || d.name == "object") {
+        return None;
+    }
+    let path = raw.strip_prefix('@').unwrap_or(raw).trim();
+    // Special / non-source paths never qualify.
+    if path.is_empty() || path.starts_with('$')
+        || path.starts_with("_item") || path.starts_with("_index") || path.starts_with("_length") {
+        return None;
+    }
+    // Loop-bound names (counters, aliases) are not source paths.
+    let first = path.trim_start_matches('.').split(['.', '[']).next().unwrap_or("");
+    if ctx.loop_vars.contains_key(first) {
+        return None;
+    }
+
+    let (base, sub): (&DynValue, &str) = if let Some(rel) = path.strip_prefix('.') {
+        if matches!(current_source, DynValue::Null) { (ctx.source, rel) } else { (current_source, rel) }
+    } else {
+        (ctx.source, path)
+    };
+    if path_exists(base, sub) {
+        None
+    } else {
+        Some(path.trim_start_matches('.').to_string())
+    }
+}
+
+/// Whether a dotted/indexed sub-path resolves to an existing key/index, even
+/// when the value found there is null.
+fn path_exists(value: &DynValue, path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    let mut current = value;
+    for seg in PathSegmentIter::new(path) {
+        match seg {
+            PathSegment::Field(name) => match current.get(name) {
+                Some(v) => current = v,
+                None => return false,
+            },
+            PathSegment::Index(name, idx) => {
+                let field_val = if name.is_empty() {
+                    current
+                } else {
+                    match current.get(name) {
+                        Some(v) => v,
+                        None => return false,
+                    }
+                };
+                match field_val.get_index(idx) {
+                    Some(v) => current = v,
+                    None => return false,
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Build a structural object from an inline `:object {k = @path, ...}` spec.
@@ -1652,7 +1909,7 @@ fn execute_verb_call(
                 Ok(evaluated_args.into_iter().next().unwrap_or(DynValue::Null))
             };
         }
-        None => return Err(format!("unknown verb: '{}'", call.verb)),
+        None => return Err(format!("[{}] Unknown verb: {}", transform_error_codes::T001_UNKNOWN_VERB, call.verb)),
     };
 
     // Build verb context (borrowed — see VerbContext docs)
@@ -1662,13 +1919,25 @@ fn execute_verb_call(
         accumulators: &ctx.accumulators,
         tables: &ctx.tables,
         lookup_miss: std::cell::Cell::new(None),
+        overflow: std::cell::Cell::new(None),
     };
 
     let result = verb_fn(&evaluated_args, &verb_ctx)?;
 
+    // Drain verb-context signals before reborrowing `ctx` mutably.
+    let miss = verb_ctx.lookup_miss.take();
+    let overflow = verb_ctx.overflow.take();
+    drop(verb_ctx);
+
     // Report a lookup miss through the onMissing policy.
-    if let Some(miss) = verb_ctx.lookup_miss.take() {
-        report_lookup_miss(ctx, &miss.table, &miss.key);
+    if let Some(miss) = miss {
+        report_lookup_miss(ctx, &miss.table, &miss.key, miss.table_exists);
+    }
+
+    // Report an accumulator overflow (T008). The verb retains the last valid
+    // value, so the accumulator update below stores the unchanged value.
+    if let Some(acc_name) = overflow {
+        ctx.errors.push(crate::types::transform::accumulator_overflow_error(&acc_name, None));
     }
 
     // Special handling: accumulate and set update the accumulator state
@@ -1682,15 +1951,16 @@ fn execute_verb_call(
 }
 
 /// Record a `%lookup` miss honoring the `onMissing` policy (default silent).
-fn report_lookup_miss(ctx: &mut ExecContext, table: &str, key: &str) {
-    let message = format!("Lookup key '{key}' not found in table '{table}'");
+/// A missing table is T003; a key not found in an existing table is T004.
+fn report_lookup_miss(ctx: &mut ExecContext, table: &str, key: &str, table_exists: bool) {
+    let err = if table_exists {
+        lookup_key_not_found_error(table, key, None)
+    } else {
+        lookup_table_not_found_error(table, None)
+    };
     match ctx.missing_policy {
-        MissingPolicy::Fail => ctx.errors.push(TransformError {
-            message,
-            path: None,
-            code: Some(crate::types::transform::transform_error_codes::T004_LOOKUP_KEY_NOT_FOUND.to_string()),
-        }),
-        MissingPolicy::Warn => ctx.warnings.push(TransformWarning { message, path: None }),
+        MissingPolicy::Fail => ctx.errors.push(err),
+        MissingPolicy::Warn => ctx.warnings.push(TransformWarning { message: err.message, path: err.path }),
         MissingPolicy::Silent => {}
     }
 }
@@ -11532,7 +11802,9 @@ mod extended_tests {
         };
         let t = mk_custom(vec![seg]);
         let result = execute(&t, &src_obj(vec![("notArray", s("scalar"))]));
-        assert!(result.success);
+        // A present non-array loop source is a T009 error.
+        assert!(!result.success);
+        assert_eq!(result.errors[0].code.as_deref(), Some("T009"));
     }
 
     #[test]
@@ -13518,11 +13790,12 @@ mod extended_tests_2 {
     }
 
     #[test]
-    fn lookup_missing_table_fail_raises_t004() {
+    fn lookup_missing_table_fail_raises_t003() {
         let text = format!("{}{}", lookup_header(Some("fail")), "{result}\nname = %lookup \"NOPE.name\" @.code\n");
         let r = parse_and_exec(&text, &json_obj(vec![("code", s("A"))]));
+        // An undeclared table is T003 (distinct from a T004 missing key).
         assert!(!r.success);
-        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T004")));
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T003")));
     }
 
     #[test]
@@ -13847,21 +14120,34 @@ mod nested_loop_and_literal_tests {
     // Nested loops: non-array sources
 
     #[test]
-    fn non_array_inner_yields_no_rows_no_error() {
+    fn non_array_inner_raises_t009() {
         let src = obj(vec![("vehicles", arr(vec![
             obj(vec![("vin", s("V1")), ("coverages", s("not-an-array"))]),
         ]))]);
         let r = run_json("{rows[]}\n:loop vehicles :as veh\n:loop .coverages :as cov\nvin = \"@veh.vin\"\ncode = \"@cov.code\"\n", &src);
-        assert!(r.success);
-        assert!(r.errors.is_empty());
-        assert_eq!(rows(&r).len(), 0);
+        // A present non-array inner loop source is a T009 error.
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T009")));
     }
 
     #[test]
-    fn non_array_outer_yields_no_rows() {
+    fn non_array_outer_raises_t009() {
         let src = obj(vec![("vehicles", s("nope"))]);
         let r = run_json("{rows[]}\n:loop vehicles :as veh\n:loop .coverages :as cov\nvin = \"@veh.vin\"\ncode = \"@cov.code\"\n", &src);
+        // A present non-array outer loop source is a T009 error.
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T009")));
+    }
+
+    #[test]
+    fn absent_inner_loop_yields_no_rows_no_error() {
+        // An ABSENT inner loop source still yields zero rows silently.
+        let src = obj(vec![("vehicles", arr(vec![
+            obj(vec![("vin", s("V1"))]),
+        ]))]);
+        let r = run_json("{rows[]}\n:loop vehicles :as veh\n:loop .coverages :as cov\nvin = \"@veh.vin\"\ncode = \"@cov.code\"\n", &src);
         assert!(r.success);
+        assert!(r.errors.is_empty());
         assert_eq!(rows(&r).len(), 0);
     }
 
@@ -13955,5 +14241,288 @@ mod nested_loop_and_literal_tests {
         let r = run_fwf("{X}\n:literal\n\"\"\"\n${%nope @a}\n\"\"\"\n", &src);
         assert!(!r.success);
         assert!(r.errors.iter().any(|e| e.message.to_lowercase().contains("verb")));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enforcement-gap tests: stable error codes (T001, T003, T005, T006, T008,
+// T009), the onMissing policy for source fields, and @import resolution.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod enforcement_gaps_tests {
+    use crate::Odin;
+    use crate::transform::{
+        parse_transform, execute_transform, execute_transform_with_options, document_to_dynvalue,
+    };
+    use crate::types::transform::{ExecuteOptions, TransformResult};
+
+    /// Build a transform header for `odin->{format}` with optional target keys.
+    fn header(format: &str, target: &[(&str, &str)]) -> String {
+        let mut t = format!("{{$}}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->{format}\"\n\n{{$source}}\nformat = \"odin\"\n\n{{$target}}\nformat = \"{format}\"\n");
+        for (k, v) in target {
+            t.push_str(&format!("{k} = \"{v}\"\n"));
+        }
+        t.push('\n');
+        t
+    }
+
+    /// Parse a source ODIN doc, run the transform, and return the result.
+    fn run(body: &str, input: &str, format: &str, target: &[(&str, &str)]) -> TransformResult {
+        let text = format!("{}{}", header(format, target), body);
+        let t = parse_transform(&text).unwrap();
+        let src = document_to_dynvalue(&Odin::parse(input).unwrap());
+        execute_transform(&t, &src)
+    }
+
+    fn code0(r: &TransformResult) -> Option<&str> {
+        r.errors.first().and_then(|e| e.code.as_deref())
+    }
+    // Warnings carry no explicit code field; match the demoted error message.
+    fn has_warn(r: &TransformResult, code: &str) -> bool {
+        let needle = match code {
+            "T001" => "Unknown verb",
+            "T003" => "Lookup table not found",
+            "T005" => "Source path not found",
+            "T009" => "does not resolve to an array",
+            _ => return false,
+        };
+        r.warnings.iter().any(|w| w.message.contains(needle))
+    }
+
+    // ── T001 — unknown verb ──────────────────────────────────────────────────
+
+    #[test]
+    fn t001_unknown_builtin_verb() {
+        let r = run("{out}\nx = %notAVerb @.a", "a = ##1", "odin", &[]);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("T001"));
+        assert_eq!(r.errors[0].path.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn t001_unregistered_custom_verb_is_ok() {
+        let r = run("{out}\nx = %&my.thing @.a", "a = \"v\"", "odin", &[]);
+        assert!(r.success);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn t001_demoted_to_warning_under_on_error_warn() {
+        let r = run("{out}\nx = %notAVerb @.a", "a = ##1", "odin", &[("onError", "warn")]);
+        assert!(r.success);
+        assert!(has_warn(&r, "T001"));
+    }
+
+    // ── T003 — lookup table not found ────────────────────────────────────────
+
+    #[test]
+    fn t003_undeclared_table_fail() {
+        let r = run("{out}\nx = %lookup \"GHOST.code\" @.k", "k = \"active\"", "odin", &[("onMissing", "fail")]);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("T003"));
+    }
+
+    #[test]
+    fn t003_undeclared_table_silent_by_default() {
+        let r = run("{out}\nx = %lookup \"GHOST.code\" @.k", "k = \"active\"", "odin", &[]);
+        assert!(r.success);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn t003_demoted_to_warning_under_on_missing_warn() {
+        let r = run("{out}\nx = %lookup \"GHOST.code\" @.k", "k = \"active\"", "odin", &[("onMissing", "warn")]);
+        assert!(r.success);
+        assert!(has_warn(&r, "T003"));
+    }
+
+    #[test]
+    fn t004_missing_key_in_declared_table() {
+        let body = "{$table.T[name, code]}\n\"foo\", ##1\n\n{out}\nx = %lookup \"T.code\" @.k";
+        let r = run(body, "k = \"bar\"", "odin", &[("onMissing", "fail")]);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("T004"));
+    }
+
+    // ── T005 — source path not found / onMissing ─────────────────────────────
+
+    #[test]
+    fn t005_required_absent_path() {
+        let r = run("{out}\nx = @.does.not.exist :required", "a = ##1", "odin", &[]);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("T005"));
+    }
+
+    #[test]
+    fn t005_absent_path_on_missing_fail() {
+        let r = run("{out}\nx = @.does.not.exist", "a = ##1", "odin", &[("onMissing", "fail")]);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("T005"));
+    }
+
+    #[test]
+    fn t005_absent_path_on_missing_warn() {
+        let r = run("{out}\nx = @.does.not.exist", "a = ##1", "odin", &[("onMissing", "warn")]);
+        assert!(r.success);
+        assert!(has_warn(&r, "T005"));
+    }
+
+    #[test]
+    fn t005_absent_path_silent_under_skip() {
+        let r = run("{out}\nx = @.does.not.exist", "a = ##1", "odin", &[]);
+        assert!(r.success);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn t005_absent_path_skip_keeps_null() {
+        let r = run("{out}\nx = @.does.not.exist", "a = ##1", "odin", &[("onMissing", "skip")]);
+        assert!(r.success);
+        let out = r.output.unwrap();
+        let seg = out.get("out").unwrap();
+        assert_eq!(seg.get("x"), Some(&crate::types::transform::DynValue::Null));
+    }
+
+    #[test]
+    fn t005_present_null_required_is_source_missing() {
+        let r = run("{out}\nx = @.a :required", "a = ~", "odin", &[]);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("SOURCE_MISSING"));
+    }
+
+    #[test]
+    fn t005_verb_null_result_does_not_raise() {
+        let r = run("{out}\nx = %upper @.missing", "a = ##1", "odin", &[("onMissing", "fail")]);
+        assert!(!r.errors.iter().any(|e| e.code.as_deref() == Some("T005")));
+    }
+
+    // ── T006 — invalid output format ─────────────────────────────────────────
+
+    #[test]
+    fn t006_unknown_target_format() {
+        let r = run("{out}\nx = @.a", "a = ##1", "notaformat", &[]);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T006")));
+    }
+
+    #[test]
+    fn t006_known_formats_do_not_raise() {
+        // None of the built-in formats are treated as unknown.
+        for fmt in ["odin", "json", "xml", "csv", "fixed-width", "flat"] {
+            let r = run("{out}\nx = @.a", "a = ##1", fmt, &[]);
+            assert!(!r.errors.iter().any(|e| e.code.as_deref() == Some("T006")), "format {fmt}");
+        }
+    }
+
+    #[test]
+    fn t006_known_formats_produce_output() {
+        for fmt in ["odin", "json", "xml"] {
+            let r = run("{out}\nx = @.a", "a = ##1", fmt, &[]);
+            assert!(!r.formatted.unwrap().is_empty(), "format {fmt}");
+        }
+    }
+
+    // ── T009 — loop source not array ─────────────────────────────────────────
+
+    #[test]
+    fn t009_present_non_array_scalar() {
+        let r = run("{out[]}\n:loop notArr\nx = @.a", "notArr = \"scalar\"", "odin", &[]);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("T009"));
+    }
+
+    #[test]
+    fn t009_absent_loop_source_zero_rows_no_error() {
+        let r = run("{out[]}\n:loop missing\nx = @.a", "a = ##1", "odin", &[]);
+        assert!(r.success);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn t009_demoted_to_warning_under_on_error_warn() {
+        let r = run("{out[]}\n:loop notArr\nx = @.a", "notArr = \"scalar\"", "odin", &[("onError", "warn")]);
+        assert!(r.success);
+        assert!(has_warn(&r, "T009"));
+    }
+
+    // ── T008 — accumulator overflow ──────────────────────────────────────────
+
+    #[test]
+    fn t008_integer_accumulator_overflow() {
+        // Fits i64 but exceeds the safe-integer magnitude (2^53 - 1).
+        let body = "{$accumulator}\ntotal = ##0\n\n{out}\nx = %accumulate \"total\" @.a";
+        let r = run(body, "a = ##9000000000000000000", "odin", &[]);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("T008"));
+    }
+
+    #[test]
+    fn t008_ordinary_accumulation_ok() {
+        let body = "{$accumulator}\ntotal = ##0\n\n{out}\nx = %accumulate \"total\" @.a";
+        let r = run(body, "a = ##5", "odin", &[]);
+        assert!(r.success);
+        assert!(r.errors.is_empty());
+    }
+
+    // ── @import resolution ───────────────────────────────────────────────────
+
+    const TABLES_DOC: &str = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->odin\"\n\n{$source}\nformat = \"odin\"\n\n{$target}\nformat = \"odin\"\n\n{$table.STATES[code, name]}\n\"CA\", \"California\"\n\"TX\", \"Texas\"\n";
+    const SHARED_DOC: &str = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->odin\"\n\n{$source}\nformat = \"odin\"\n\n{$target}\nformat = \"odin\"\n\n{shared}\ngreeting = \"hello\"\n";
+    const MAIN: &str = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->odin\"\n\n@import ./tables/states.odin\n@import ./mappings/shared.odin\n\n{$source}\nformat = \"odin\"\n\n{$target}\nformat = \"odin\"\nonMissing = \"fail\"\n\n{out}\nstate = %lookup \"STATES.name\" @.code\n";
+
+    fn resolver(p: &str) -> Option<String> {
+        if p.contains("states") { Some(TABLES_DOC.to_string()) }
+        else if p.contains("shared") { Some(SHARED_DOC.to_string()) }
+        else { None }
+    }
+
+    #[test]
+    fn import_table_usable_by_lookup() {
+        let t = parse_transform(MAIN).unwrap();
+        let src = document_to_dynvalue(&Odin::parse("code = \"CA\"").unwrap());
+        let opts = ExecuteOptions { import_resolver: Some(&resolver) };
+        let r = execute_transform_with_options(&t, &src, &opts);
+        assert!(r.success, "errors: {:?}", r.errors);
+        assert!(r.formatted.unwrap().contains("California"));
+    }
+
+    #[test]
+    fn import_mapping_segment_merges() {
+        let t = parse_transform(MAIN).unwrap();
+        let src = document_to_dynvalue(&Odin::parse("code = \"TX\"").unwrap());
+        let opts = ExecuteOptions { import_resolver: Some(&resolver) };
+        let r = execute_transform_with_options(&t, &src, &opts);
+        let out = r.formatted.unwrap();
+        assert!(out.contains("greeting"), "output: {out}");
+        assert!(out.contains("hello"), "output: {out}");
+    }
+
+    #[test]
+    fn import_unresolved_without_resolver_is_t003() {
+        let t = parse_transform(MAIN).unwrap();
+        let src = document_to_dynvalue(&Odin::parse("code = \"CA\"").unwrap());
+        let r = execute_transform(&t, &src);
+        assert!(!r.success);
+        assert_eq!(code0(&r), Some("T003"));
+    }
+
+    #[test]
+    fn import_local_table_wins() {
+        let local = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->odin\"\n\n@import ./tables/states.odin\n\n{$source}\nformat = \"odin\"\n\n{$target}\nformat = \"odin\"\n\n{$table.STATES[code, name]}\n\"CA\", \"Local-California\"\n\n{out}\nstate = %lookup \"STATES.name\" @.code\n";
+        let t = parse_transform(local).unwrap();
+        let src = document_to_dynvalue(&Odin::parse("code = \"CA\"").unwrap());
+        let opts = ExecuteOptions { import_resolver: Some(&resolver) };
+        let r = execute_transform_with_options(&t, &src, &opts);
+        assert!(r.formatted.unwrap().contains("Local-California"));
+    }
+
+    #[test]
+    fn import_unsatisfiable_is_ignored() {
+        let t_text = "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"odin->odin\"\n\n@import ./missing/nowhere.odin\n\n{$source}\nformat = \"odin\"\n\n{$target}\nformat = \"odin\"\n\n{out}\nx = @.a\n";
+        let t = parse_transform(t_text).unwrap();
+        let src = document_to_dynvalue(&Odin::parse("a = ##1").unwrap());
+        let opts = ExecuteOptions { import_resolver: Some(&resolver) };
+        let r = execute_transform_with_options(&t, &src, &opts);
+        assert!(r.success);
     }
 }

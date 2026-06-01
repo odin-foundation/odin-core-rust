@@ -12,7 +12,7 @@ pub mod source_parsers;
 pub mod parser;
 pub mod engine;
 
-use crate::types::transform::{OdinTransform, TransformResult, DynValue};
+use crate::types::transform::{OdinTransform, TransformResult, DynValue, ExecuteOptions};
 use crate::types::document::OdinDocument;
 use crate::types::values::{OdinValue, OdinArrayItem};
 use crate::types::errors::ParseError;
@@ -40,6 +40,18 @@ pub fn execute_transform(
     source: &DynValue,
 ) -> TransformResult {
     engine::execute(transform, source)
+}
+
+/// Execute a transform against source data with explicit execution options.
+///
+/// Use this to supply an `@import` resolver. Without a resolver, `@import`
+/// references stay unresolved.
+pub fn execute_transform_with_options(
+    transform: &OdinTransform,
+    source: &DynValue,
+    options: &ExecuteOptions,
+) -> TransformResult {
+    engine::execute_with_options(transform, source, options)
 }
 
 /// Execute a multi-record transform against raw input records.

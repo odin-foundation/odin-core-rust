@@ -1335,6 +1335,7 @@ mod tests {
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
             lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
         }
     }
 
@@ -1823,6 +1824,7 @@ mod extended_tests {
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
             lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
         }
     }
 
@@ -3435,6 +3437,7 @@ mod extended_tests_2 {
             accumulators: ACC.get_or_init(HashMap::new),
             tables: TBL.get_or_init(HashMap::new),
             lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
         }
     }
 
