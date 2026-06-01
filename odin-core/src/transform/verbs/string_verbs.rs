@@ -194,8 +194,17 @@ pub(super) fn verb_replace_regex(
     }
     match (&args[0], &args[1], &args[2]) {
         (DynValue::String(s), DynValue::String(pattern), DynValue::String(replacement)) => {
-            // Simple pattern matching: treat pattern as a literal string replacement.
-            Ok(DynValue::String(s.replace(pattern.as_str(), replacement)))
+            #[cfg(feature = "regex")]
+            {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => Ok(DynValue::String(re.replace_all(s, replacement.as_str()).into_owned())),
+                    Err(_) => Ok(DynValue::Null),
+                }
+            }
+            #[cfg(not(feature = "regex"))]
+            {
+                Ok(DynValue::String(s.replace(pattern.as_str(), replacement)))
+            }
         }
         _ => Err("replaceRegex: expected string arguments".to_string()),
     }
@@ -237,7 +246,7 @@ pub(super) fn verb_pad_right(args: &[DynValue], _ctx: &VerbContext) -> Result<Dy
     }
 }
 
-/// pad: center-pad string (both sides) to width with pad character.
+/// pad: right-pad string to width with pad character (alias for padRight).
 /// Arity 3: (string, width, padChar).
 pub(super) fn verb_pad(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 3 {
@@ -247,15 +256,11 @@ pub(super) fn verb_pad(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
     let width = to_usize(&args[1], "pad")?;
     let ch = pad_char(&args[2], "pad")?;
 
-    if s.len() >= width {
+    if s.chars().count() >= width {
         Ok(DynValue::String(s))
     } else {
-        let total_pad = width - s.len();
-        let left_pad = total_pad / 2;
-        let right_pad = total_pad - left_pad;
-        let left: String = std::iter::repeat(ch).take(left_pad).collect();
-        let right: String = std::iter::repeat(ch).take(right_pad).collect();
-        Ok(DynValue::String(format!("{left}{s}{right}")))
+        let pad: String = std::iter::repeat(ch).take(width - s.chars().count()).collect();
+        Ok(DynValue::String(format!("{s}{pad}")))
     }
 }
 
@@ -527,7 +532,17 @@ pub(super) fn verb_match(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVal
     }
     match (&args[0], &args[1]) {
         (DynValue::String(s), DynValue::String(pattern)) => {
-            Ok(DynValue::Bool(s.contains(pattern.as_str())))
+            #[cfg(feature = "regex")]
+            {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => Ok(DynValue::Bool(re.is_match(s))),
+                    Err(_) => Ok(DynValue::Null),
+                }
+            }
+            #[cfg(not(feature = "regex"))]
+            {
+                Ok(DynValue::Bool(s.contains(pattern.as_str())))
+            }
         }
         (DynValue::Null, _) => Ok(DynValue::Bool(false)),
         _ => Err("match: expected string arguments".to_string()),
@@ -653,7 +668,7 @@ pub(super) fn verb_wrap(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
     match (&args[0], &args[1]) {
         (DynValue::String(s), width_val) => {
             let width = to_usize(width_val, "wrap")?;
-            if width == 0 {
+            if width == 0 || s.chars().count() <= width {
                 return Ok(DynValue::String(s.clone()));
             }
 
@@ -676,7 +691,7 @@ pub(super) fn verb_wrap(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
                 lines.push(current_line);
             }
 
-            Ok(DynValue::Array(lines.into_iter().map(DynValue::String).collect()))
+            Ok(DynValue::String(lines.join("\n")))
         }
         _ => Err("wrap: expected (string, integer) arguments".to_string()),
     }
@@ -757,11 +772,26 @@ fn strip_accent_char(ch: char) -> char {
 pub(super) fn verb_clean(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     match args.first() {
         Some(DynValue::String(s)) => {
-            let result: String = s
+            // Drop control characters (keeping \t \n \r), normalize Unicode
+            // whitespace to spaces, collapse runs of whitespace, then trim.
+            let filtered: String = s
                 .chars()
                 .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\r' || *ch == '\t')
                 .collect();
-            Ok(DynValue::String(result))
+            let mut result = String::with_capacity(filtered.len());
+            let mut prev_space = false;
+            for ch in filtered.chars() {
+                if ch.is_whitespace() {
+                    if !prev_space {
+                        result.push(' ');
+                        prev_space = true;
+                    }
+                } else {
+                    result.push(ch);
+                    prev_space = false;
+                }
+            }
+            Ok(DynValue::String(result.trim().to_string()))
         }
         Some(DynValue::Null) => Ok(DynValue::Null),
         _ => Err("clean: expected string argument".to_string()),
@@ -1414,7 +1444,7 @@ mod tests {
         ];
         assert_eq!(
             verb_pad(&args, &ctx()).unwrap(),
-            DynValue::String("**hi**".into())
+            DynValue::String("hi****".into())
         );
     }
 
@@ -1617,7 +1647,7 @@ mod tests {
         let args = vec![DynValue::String("hello\x00\x01world\n".into())];
         assert_eq!(
             verb_clean(&args, &ctx()).unwrap(),
-            DynValue::String("helloworld\n".into())
+            DynValue::String("helloworld".into())
         );
     }
 
@@ -1628,13 +1658,7 @@ mod tests {
             DynValue::Integer(15),
         ];
         let result = verb_wrap(&args, &ctx()).unwrap();
-        assert_eq!(
-            result,
-            DynValue::Array(vec![
-                DynValue::String("the quick brown".into()),
-                DynValue::String("fox jumps over".into()),
-            ])
-        );
+        assert_eq!(result, DynValue::String("the quick brown\nfox jumps over".into()));
     }
 
     #[test]
@@ -2021,6 +2045,10 @@ mod extended_tests {
 
     #[test]
     fn replace_regex_special_chars() {
+        // With regex enabled, `.` matches any character; without it, `.` is literal.
+        #[cfg(feature = "regex")]
+        assert_eq!(verb_replace_regex(&[s("a.b.c"), s("."), s("-")], &ctx()).unwrap(), s("-----"));
+        #[cfg(not(feature = "regex"))]
         assert_eq!(verb_replace_regex(&[s("a.b.c"), s("."), s("-")], &ctx()).unwrap(), s("a-b-c"));
     }
 
@@ -2094,8 +2122,7 @@ mod extended_tests {
 
     #[test]
     fn pad_center_odd_padding() {
-        // 3 chars to pad: left=1, right=2
-        assert_eq!(verb_pad(&[s("ab"), i(5), s("-")], &ctx()).unwrap(), s("-ab--"));
+        assert_eq!(verb_pad(&[s("ab"), i(5), s("-")], &ctx()).unwrap(), s("ab---"));
     }
 
     #[test]
@@ -2715,23 +2742,22 @@ mod extended_tests {
 
     #[test]
     fn wrap_single_long_word() {
-        assert_eq!(
-            verb_wrap(&[s("superlongword"), i(5)], &ctx()).unwrap(),
-            DynValue::Array(vec![s("superlongword")])
-        );
+        assert_eq!(verb_wrap(&[s("superlongword"), i(5)], &ctx()).unwrap(), s("superlongword"));
     }
 
     #[test]
     fn wrap_empty_string() {
-        assert_eq!(verb_wrap(&[s(""), i(10)], &ctx()).unwrap(), DynValue::Array(vec![]));
+        assert_eq!(verb_wrap(&[s(""), i(10)], &ctx()).unwrap(), s(""));
     }
 
     #[test]
     fn wrap_exact_width() {
-        assert_eq!(
-            verb_wrap(&[s("hello world"), i(11)], &ctx()).unwrap(),
-            DynValue::Array(vec![s("hello world")])
-        );
+        assert_eq!(verb_wrap(&[s("hello world"), i(11)], &ctx()).unwrap(), s("hello world"));
+    }
+
+    #[test]
+    fn wrap_multi_line() {
+        assert_eq!(verb_wrap(&[s("the quick brown fox"), i(10)], &ctx()).unwrap(), s("the quick\nbrown fox"));
     }
 
     #[test]
@@ -2818,7 +2844,7 @@ mod extended_tests {
 
     #[test]
     fn clean_preserves_newlines_tabs() {
-        assert_eq!(verb_clean(&[s("a\nb\tc\r")], &ctx()).unwrap(), s("a\nb\tc\r"));
+        assert_eq!(verb_clean(&[s("a\nb\tc\r")], &ctx()).unwrap(), s("a b c"));
     }
 
     #[test]
@@ -3557,7 +3583,7 @@ mod extended_tests_2 {
     #[test]
     fn ext_pad_both_sides() {
         let r = verb_pad(&[s("hi"), i(6), s("-")], &ctx()).unwrap();
-        assert_eq!(r, s("--hi--"));
+        assert_eq!(r, s("hi----"));
     }
 
     #[test]
@@ -3922,7 +3948,7 @@ mod extended_tests_2 {
     #[test]
     fn ext_wrap_short_text_no_wrap() {
         let r = verb_wrap(&[s("short"), i(100)], &ctx()).unwrap();
-        assert_eq!(r, DynValue::Array(vec![s("short")]));
+        assert_eq!(r, s("short"));
     }
 
     #[test]

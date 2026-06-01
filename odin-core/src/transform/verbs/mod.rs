@@ -554,7 +554,7 @@ fn verb_capitalize(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, St
         Some(DynValue::String(s)) => {
             let mut chars = s.chars();
             let result = match chars.next() {
-                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                Some(c) => c.to_uppercase().to_string() + &chars.as_str().to_lowercase(),
                 None => String::new(),
             };
             Ok(DynValue::String(result))
@@ -585,9 +585,10 @@ fn verb_substring(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Str
         .ok_or("substring: start must be numeric")?;
     let start = (start_val.max(0) as usize).min(s.len());
     let end = if args.len() >= 3 {
-        let end_val = args[2].as_i64().or_else(|| args[2].as_f64().map(|f| f as i64))
-            .ok_or("substring: end must be numeric")?;
-        (end_val.max(0) as usize).min(s.len())
+        // Third argument is a length: end = start + len.
+        let len_val = args[2].as_i64().or_else(|| args[2].as_f64().map(|f| f as i64))
+            .ok_or("substring: length must be numeric")?;
+        start.saturating_add(len_val.max(0) as usize).min(s.len())
     } else {
         s.len()
     };
@@ -657,7 +658,7 @@ fn verb_add(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if let (DynValue::Integer(x), DynValue::Integer(y)) = (&a, &b) { Ok(DynValue::Integer(x + y)) } else {
         let x = a.as_f64().unwrap_or(0.0);
         let y = b.as_f64().unwrap_or(0.0);
-        Ok(DynValue::Float(x + y))
+        Ok(numeric_verbs::numeric_result(x + y))
     }
 }
 
@@ -670,7 +671,7 @@ fn verb_subtract(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Stri
     if let (DynValue::Integer(x), DynValue::Integer(y)) = (&a, &b) { Ok(DynValue::Integer(x - y)) } else {
         let x = a.as_f64().unwrap_or(0.0);
         let y = b.as_f64().unwrap_or(0.0);
-        Ok(DynValue::Float(x - y))
+        Ok(numeric_verbs::numeric_result(x - y))
     }
 }
 
@@ -683,7 +684,7 @@ fn verb_multiply(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Stri
     if let (DynValue::Integer(x), DynValue::Integer(y)) = (&a, &b) { Ok(DynValue::Integer(x * y)) } else {
         let x = a.as_f64().unwrap_or(0.0);
         let y = b.as_f64().unwrap_or(0.0);
-        Ok(DynValue::Float(x * y))
+        Ok(numeric_verbs::numeric_result(x * y))
     }
 }
 
@@ -1118,14 +1119,10 @@ fn verb_is_object(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Str
 }
 
 fn verb_is_date(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::String(s)) => {
-            // Check for YYYY-MM-DD pattern
-            let is_date = s.len() >= 10 && is_valid_date_prefix(s);
-            Ok(DynValue::Bool(is_date))
-        }
-        _ => Ok(DynValue::Bool(false)),
-    }
+    Ok(DynValue::Bool(matches!(
+        args.first(),
+        Some(DynValue::Date(_) | DynValue::Timestamp(_))
+    )))
 }
 
 /// Check if a string starts with a valid YYYY-MM-DD date pattern.
@@ -2012,8 +2009,9 @@ mod extended_tests {
     #[test] fn is_object_no_args() { assert_eq!(verb_is_object(&[], &ctx()).unwrap(), b(false)); }
 
     // --- isDate ---
-    #[test] fn is_date_valid() { assert_eq!(verb_is_date(&[s("2024-01-15")], &ctx()).unwrap(), b(true)); }
-    #[test] fn is_date_timestamp() { assert_eq!(verb_is_date(&[s("2024-01-15T10:30:00")], &ctx()).unwrap(), b(true)); }
+    #[test] fn is_date_valid() { assert_eq!(verb_is_date(&[DynValue::Date("2024-01-15".into())], &ctx()).unwrap(), b(true)); }
+    #[test] fn is_date_timestamp() { assert_eq!(verb_is_date(&[DynValue::Timestamp("2024-01-15T10:30:00".into())], &ctx()).unwrap(), b(true)); }
+    #[test] fn is_date_string_not_date() { assert_eq!(verb_is_date(&[s("2024-01-15")], &ctx()).unwrap(), b(false)); }
     #[test] fn is_date_invalid() { assert_eq!(verb_is_date(&[s("not-a-date")], &ctx()).unwrap(), b(false)); }
     #[test] fn is_date_int() { assert_eq!(verb_is_date(&[i(20240115)], &ctx()).unwrap(), b(false)); }
     #[test] fn is_date_null() { assert_eq!(verb_is_date(&[null()], &ctx()).unwrap(), b(false)); }
@@ -2177,7 +2175,7 @@ mod extended_tests {
     #[test] fn replace_too_few() { assert!(verb_replace(&[s("hello"), s("h")], &ctx()).is_err()); }
 
     // --- substring ---
-    #[test] fn substring_basic() { assert_eq!(verb_substring(&[s("hello"), i(1), i(4)], &ctx()).unwrap(), s("ell")); }
+    #[test] fn substring_basic() { assert_eq!(verb_substring(&[s("hello"), i(1), i(3)], &ctx()).unwrap(), s("ell")); }
     #[test] fn substring_no_end() { assert_eq!(verb_substring(&[s("hello"), i(2)], &ctx()).unwrap(), s("llo")); }
     #[test] fn substring_start_beyond() { assert_eq!(verb_substring(&[s("hello"), i(10)], &ctx()).unwrap(), s("")); }
     #[test] fn substring_start_negative() { assert_eq!(verb_substring(&[s("hello"), i(-1)], &ctx()).unwrap(), s("hello")); }
@@ -2202,7 +2200,7 @@ mod extended_tests {
 
     // --- add ---
     #[test] fn add_ints() { assert_eq!(verb_add(&[i(3), i(4)], &ctx()).unwrap(), i(7)); }
-    #[test] fn add_floats() { assert_eq!(verb_add(&[f(1.5), f(2.5)], &ctx()).unwrap(), f(4.0)); }
+    #[test] fn add_floats() { assert_eq!(verb_add(&[f(1.5), f(2.5)], &ctx()).unwrap(), i(4)); }
     #[test] fn add_mixed() {
         let result = verb_add(&[i(3), f(1.5)], &ctx()).unwrap();
         assert_eq!(result, f(4.5));
@@ -2213,13 +2211,13 @@ mod extended_tests {
 
     // --- subtract ---
     #[test] fn subtract_ints() { assert_eq!(verb_subtract(&[i(10), i(3)], &ctx()).unwrap(), i(7)); }
-    #[test] fn subtract_floats() { assert_eq!(verb_subtract(&[f(5.5), f(2.5)], &ctx()).unwrap(), f(3.0)); }
+    #[test] fn subtract_floats() { assert_eq!(verb_subtract(&[f(5.5), f(2.5)], &ctx()).unwrap(), i(3)); }
     #[test] fn subtract_negative() { assert_eq!(verb_subtract(&[i(3), i(10)], &ctx()).unwrap(), i(-7)); }
     #[test] fn subtract_too_few() { assert!(verb_subtract(&[i(1)], &ctx()).is_err()); }
 
     // --- multiply ---
     #[test] fn multiply_ints() { assert_eq!(verb_multiply(&[i(3), i(4)], &ctx()).unwrap(), i(12)); }
-    #[test] fn multiply_floats() { assert_eq!(verb_multiply(&[f(2.5), f(4.0)], &ctx()).unwrap(), f(10.0)); }
+    #[test] fn multiply_floats() { assert_eq!(verb_multiply(&[f(2.5), f(4.0)], &ctx()).unwrap(), i(10)); }
     #[test] fn multiply_by_zero() { assert_eq!(verb_multiply(&[i(100), i(0)], &ctx()).unwrap(), i(0)); }
     #[test] fn multiply_negative() { assert_eq!(verb_multiply(&[i(-3), i(4)], &ctx()).unwrap(), i(-12)); }
     #[test] fn multiply_too_few() { assert!(verb_multiply(&[i(1)], &ctx()).is_err()); }
@@ -2270,7 +2268,7 @@ mod extended_tests {
     #[test] fn negate_negative() { assert_eq!(numeric_verbs::negate(&[i(-5)], &ctx()).unwrap(), i(5)); }
     #[test] fn negate_zero() { assert_eq!(numeric_verbs::negate(&[i(0)], &ctx()).unwrap(), i(0)); }
     #[test] fn negate_float() { assert_eq!(numeric_verbs::negate(&[f(3.14)], &ctx()).unwrap(), f(-3.14)); }
-    #[test] fn negate_string_num() { assert_eq!(numeric_verbs::negate(&[s("42")], &ctx()).unwrap(), f(-42.0)); }
+    #[test] fn negate_string_num() { assert_eq!(numeric_verbs::negate(&[s("42")], &ctx()).unwrap(), i(-42)); }
     #[test] fn negate_non_numeric() { assert!(numeric_verbs::negate(&[s("abc")], &ctx()).is_err()); }
 
     // --- safeDivide ---
@@ -2279,11 +2277,11 @@ mod extended_tests {
     #[test] fn safe_divide_too_few() { assert!(numeric_verbs::safe_divide(&[i(10), i(2)], &ctx()).is_err()); }
 
     // --- clamp ---
-    #[test] fn clamp_in_range() { assert_eq!(numeric_verbs::clamp(&[f(5.0), f(1.0), f(10.0)], &ctx()).unwrap(), f(5.0)); }
-    #[test] fn clamp_below_min() { assert_eq!(numeric_verbs::clamp(&[f(-5.0), f(0.0), f(10.0)], &ctx()).unwrap(), f(0.0)); }
-    #[test] fn clamp_above_max() { assert_eq!(numeric_verbs::clamp(&[f(15.0), f(0.0), f(10.0)], &ctx()).unwrap(), f(10.0)); }
-    #[test] fn clamp_at_min() { assert_eq!(numeric_verbs::clamp(&[f(0.0), f(0.0), f(10.0)], &ctx()).unwrap(), f(0.0)); }
-    #[test] fn clamp_at_max() { assert_eq!(numeric_verbs::clamp(&[f(10.0), f(0.0), f(10.0)], &ctx()).unwrap(), f(10.0)); }
+    #[test] fn clamp_in_range() { assert_eq!(numeric_verbs::clamp(&[f(5.0), f(1.0), f(10.0)], &ctx()).unwrap(), i(5)); }
+    #[test] fn clamp_below_min() { assert_eq!(numeric_verbs::clamp(&[f(-5.0), f(0.0), f(10.0)], &ctx()).unwrap(), i(0)); }
+    #[test] fn clamp_above_max() { assert_eq!(numeric_verbs::clamp(&[f(15.0), f(0.0), f(10.0)], &ctx()).unwrap(), i(10)); }
+    #[test] fn clamp_at_min() { assert_eq!(numeric_verbs::clamp(&[f(0.0), f(0.0), f(10.0)], &ctx()).unwrap(), i(0)); }
+    #[test] fn clamp_at_max() { assert_eq!(numeric_verbs::clamp(&[f(10.0), f(0.0), f(10.0)], &ctx()).unwrap(), i(10)); }
     #[test] fn clamp_too_few() { assert!(numeric_verbs::clamp(&[f(5.0), f(0.0)], &ctx()).is_err()); }
 
     // --- sqrt ---
@@ -2312,11 +2310,11 @@ mod extended_tests {
     // --- log ---
     #[test] fn log_natural() {
         let result = numeric_verbs::log_verb(&[f(std::f64::consts::E)], &ctx()).unwrap();
-        if let DynValue::Float(v) = result { assert!((v - 1.0).abs() < 1e-10); } else { panic!("expected float"); }
+        assert!((result.as_f64().unwrap() - 1.0).abs() < 1e-10);
     }
     #[test] fn log_base_10() {
         let result = numeric_verbs::log_verb(&[f(100.0), f(10.0)], &ctx()).unwrap();
-        if let DynValue::Float(v) = result { assert!((v - 2.0).abs() < 1e-10); } else { panic!("expected float"); }
+        assert!((result.as_f64().unwrap() - 2.0).abs() < 1e-10);
     }
     #[test] fn log_zero() { assert!(numeric_verbs::log_verb(&[f(0.0)], &ctx()).is_err()); }
     #[test] fn log_negative() { assert!(numeric_verbs::log_verb(&[f(-1.0)], &ctx()).is_err()); }
@@ -2325,17 +2323,17 @@ mod extended_tests {
     // --- ln ---
     #[test] fn ln_e() {
         let result = numeric_verbs::ln(&[f(std::f64::consts::E)], &ctx()).unwrap();
-        if let DynValue::Float(v) = result { assert!((v - 1.0).abs() < 1e-10); } else { panic!("expected float"); }
+        assert!((result.as_f64().unwrap() - 1.0).abs() < 1e-10);
     }
-    #[test] fn ln_one() { assert_eq!(numeric_verbs::ln(&[f(1.0)], &ctx()).unwrap(), f(0.0)); }
+    #[test] fn ln_one() { assert_eq!(numeric_verbs::ln(&[f(1.0)], &ctx()).unwrap(), i(0)); }
     #[test] fn ln_negative() { assert!(numeric_verbs::ln(&[f(-1.0)], &ctx()).is_err()); }
 
     // --- log10 ---
     #[test] fn log10_100() {
         let result = numeric_verbs::log10(&[f(100.0)], &ctx()).unwrap();
-        if let DynValue::Float(v) = result { assert!((v - 2.0).abs() < 1e-10); } else { panic!("expected float"); }
+        assert!((result.as_f64().unwrap() - 2.0).abs() < 1e-10);
     }
-    #[test] fn log10_one() { assert_eq!(numeric_verbs::log10(&[f(1.0)], &ctx()).unwrap(), f(0.0)); }
+    #[test] fn log10_one() { assert_eq!(numeric_verbs::log10(&[f(1.0)], &ctx()).unwrap(), i(0)); }
     #[test] fn log10_negative() { assert!(numeric_verbs::log10(&[f(-1.0)], &ctx()).is_err()); }
 
     // --- sign ---
@@ -2702,7 +2700,7 @@ mod extended_tests_2 {
     #[test] fn replace_non_string_error() { assert!(verb_replace(&[i(1), s("a"), s("b")], &ctx()).is_err()); }
 
     // substring: zero-length
-    #[test] fn substring_same_start_end() { assert_eq!(verb_substring(&[s("hello"), i(2), i(2)], &ctx()).unwrap(), s("")); }
+    #[test] fn substring_same_start_end() { assert_eq!(verb_substring(&[s("hello"), i(2), i(0)], &ctx()).unwrap(), s("")); }
     #[test] fn substring_end_beyond() { assert_eq!(verb_substring(&[s("hello"), i(3), i(100)], &ctx()).unwrap(), s("lo")); }
 
     // length: non-supported types
@@ -2728,7 +2726,7 @@ mod extended_tests_2 {
     // subtract
     #[test] fn subtract_basic() { assert_eq!(verb_subtract(&[i(10), i(3)], &ctx()).unwrap(), i(7)); }
     #[test] fn subtract_negative_result() { assert_eq!(verb_subtract(&[i(3), i(10)], &ctx()).unwrap(), i(-7)); }
-    #[test] fn subtract_floats() { assert_eq!(verb_subtract(&[f(5.5), f(2.5)], &ctx()).unwrap(), f(3.0)); }
+    #[test] fn subtract_floats() { assert_eq!(verb_subtract(&[f(5.5), f(2.5)], &ctx()).unwrap(), i(3)); }
     #[test] fn subtract_too_few() { assert!(verb_subtract(&[i(1)], &ctx()).is_err()); }
     #[test] fn subtract_non_numeric() { assert!(verb_subtract(&[s("abc"), i(1)], &ctx()).is_err()); }
 
@@ -2736,7 +2734,7 @@ mod extended_tests_2 {
     #[test] fn multiply_ints() { assert_eq!(verb_multiply(&[i(3), i(4)], &ctx()).unwrap(), i(12)); }
     #[test] fn multiply_by_zero() { assert_eq!(verb_multiply(&[i(100), i(0)], &ctx()).unwrap(), i(0)); }
     #[test] fn multiply_negative() { assert_eq!(verb_multiply(&[i(-3), i(4)], &ctx()).unwrap(), i(-12)); }
-    #[test] fn multiply_floats() { assert_eq!(verb_multiply(&[f(2.5), f(4.0)], &ctx()).unwrap(), f(10.0)); }
+    #[test] fn multiply_floats() { assert_eq!(verb_multiply(&[f(2.5), f(4.0)], &ctx()).unwrap(), i(10)); }
     #[test] fn multiply_too_few() { assert!(verb_multiply(&[i(1)], &ctx()).is_err()); }
     #[test] fn multiply_non_numeric() { assert!(verb_multiply(&[s("abc"), i(1)], &ctx()).is_err()); }
 
@@ -2772,7 +2770,7 @@ mod extended_tests_2 {
     #[test] fn negate2_negative_int() { assert_eq!(numeric_verbs::negate(&[i(-5)], &ctx()).unwrap(), i(5)); }
     #[test] fn negate2_float() { assert_eq!(numeric_verbs::negate(&[f(3.14)], &ctx()).unwrap(), f(-3.14)); }
     #[test] fn negate2_zero_int() { assert_eq!(numeric_verbs::negate(&[i(0)], &ctx()).unwrap(), i(0)); }
-    #[test] fn negate2_string_num() { assert_eq!(numeric_verbs::negate(&[s("7")], &ctx()).unwrap(), f(-7.0)); }
+    #[test] fn negate2_string_num() { assert_eq!(numeric_verbs::negate(&[s("7")], &ctx()).unwrap(), i(-7)); }
     #[test] fn negate2_non_numeric() { assert!(numeric_verbs::negate(&[s("abc")], &ctx()).is_err()); }
     #[test] fn negate2_null_error() { assert!(numeric_verbs::negate(&[null()], &ctx()).is_err()); }
 

@@ -27,8 +27,51 @@ use crate::types::errors::ParseError;
 ///
 /// Returns `ParseError` if the transform text is not valid ODIN.
 pub fn parse_transform(input: &str) -> Result<OdinTransform, ParseError> {
-    let doc = crate::parser::parse(input, None)?;
+    let preprocessed = rewrite_section_verb_assignments(input);
+    let doc = crate::parser::parse(&preprocessed, None)?;
     Ok(parser::parse_transform_doc(doc))
+}
+
+/// Rewrite section-verb assignments (`{.name} = %verb …`) into ordinary field
+/// mappings (`name = %verb …`). An object-returning verb assigned to a section
+/// header populates that section's fields; expressed as a normal mapping, the
+/// resulting object serializes back to the same `{.name}` sub-block.
+fn rewrite_section_verb_assignments(input: &str) -> std::borrow::Cow<'_, str> {
+    if !input.contains("} =") {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut changed = false;
+    for line in input.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('{') {
+            if let Some(close) = rest.find('}') {
+                let header = &rest[..close];
+                let after = rest[close + 1..].trim_start();
+                // Only a header immediately followed by `=` (not `[`/`$`/`@`
+                // headers, not tabular `[]`).
+                if let Some(expr) = after.strip_prefix('=') {
+                    if !header.contains('[') && !header.starts_with('$') && !header.starts_with('@') {
+                        let name = header.trim_start_matches('.').rsplit('.').next().unwrap_or(header);
+                        if !name.is_empty() {
+                            let indent = &line[..line.len() - trimmed.len()];
+                            out.push_str(indent);
+                            out.push_str(name);
+                            out.push_str(" = ");
+                            out.push_str(expr.trim_start());
+                            if !out.ends_with('\n') && line.ends_with('\n') {
+                                out.push('\n');
+                            }
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    if changed { std::borrow::Cow::Owned(out) } else { std::borrow::Cow::Borrowed(input) }
 }
 
 /// Execute a transform against source data.
@@ -97,6 +140,12 @@ fn odin_value_to_dynvalue(value: &OdinValue) -> DynValue {
     match value {
         OdinValue::Null { .. } | OdinValue::Binary { .. } => DynValue::Null,
         OdinValue::Boolean { value: b, .. } => DynValue::Bool(*b),
+        // An integer literal too large for i64 is stored with value 0 but keeps
+        // its raw text; preserve the magnitude as a float so downstream numeric
+        // logic (e.g. accumulator overflow) sees the real value.
+        OdinValue::Integer { value: 0, raw: Some(r), .. } if r != "0" => {
+            r.parse::<f64>().map_or(DynValue::Integer(0), DynValue::Float)
+        }
         OdinValue::Integer { value: n, .. } => DynValue::Integer(*n),
         OdinValue::Number { value: f, .. }
         | OdinValue::Percent { value: f, .. } => DynValue::Float(*f),
@@ -184,8 +233,14 @@ fn insert_at_path(root: &mut Vec<(String, DynValue)>, path: &str, value: DynValu
 
                     if after.is_empty() {
                         arr[idx] = value;
+                    } else if after.starts_with('[') {
+                        // Nested array index: the element is itself an array.
+                        if !matches!(arr[idx], DynValue::Array(_)) {
+                            arr[idx] = DynValue::Array(Vec::new());
+                        }
+                        insert_into_array(&mut arr[idx], after, value);
                     } else {
-                        // Recurse into array element
+                        // Recurse into array element as an object.
                         if !matches!(arr[idx], DynValue::Object(_)) {
                             arr[idx] = DynValue::Object(Vec::new());
                         }
@@ -200,6 +255,36 @@ fn insert_at_path(root: &mut Vec<(String, DynValue)>, path: &str, value: DynValu
         // Object: recurse
         if let DynValue::Object(ref mut obj) = container {
             insert_at_path(obj, &rest, value);
+        }
+    }
+}
+
+/// Insert `value` into an array-typed container along a path that begins with
+/// `[idx]` (possibly followed by further `[idx]` indices or `.field`).
+fn insert_into_array(container: &mut DynValue, path: &str, value: DynValue) {
+    let DynValue::Array(arr) = container else { return };
+    let Some(bracket_end) = path.find(']') else { return };
+    let Ok(idx) = path[1..bracket_end].parse::<usize>() else { return };
+    let after = &path[bracket_end + 1..];
+    let after = after.strip_prefix('.').unwrap_or(after);
+
+    while arr.len() <= idx {
+        arr.push(DynValue::Null);
+    }
+
+    if after.is_empty() {
+        arr[idx] = value;
+    } else if after.starts_with('[') {
+        if !matches!(arr[idx], DynValue::Array(_)) {
+            arr[idx] = DynValue::Array(Vec::new());
+        }
+        insert_into_array(&mut arr[idx], after, value);
+    } else {
+        if !matches!(arr[idx], DynValue::Object(_)) {
+            arr[idx] = DynValue::Object(Vec::new());
+        }
+        if let DynValue::Object(ref mut obj) = arr[idx] {
+            insert_at_path(obj, after, value);
         }
     }
 }

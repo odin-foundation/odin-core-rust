@@ -1347,6 +1347,10 @@ pub fn format_odin_with_modifiers(
             if include_header {
                 output.push_str("{}\n");
             }
+            if is_shallow_object(entries) {
+                write_odin_flat_sections_with_mods(&mut output, entries, modifiers);
+                return output;
+            }
             for (key, val) in entries {
                 match val {
                     DynValue::Object(_) => {
@@ -1410,6 +1414,15 @@ pub fn format_odin(value: &DynValue, include_header: bool) -> String {
                 if include_header {
                     output.push_str("{}\n");
                 }
+                // Shallow documents (every path is `field` or `section.field`,
+                // no arrays) group by the first segment into {section} headers —
+                // a single-field section still gets its header. Deeper or array-
+                // bearing structures fall through to the hierarchical writer,
+                // where single-leaf chains stay as dotted paths.
+                if is_shallow_object(entries) {
+                    write_odin_flat_sections(&mut output, entries);
+                    return output;
+                }
                 // Output flat top-level fields and leaf chains under root scope
                 for (key, val) in entries {
                     match val {
@@ -1456,6 +1469,70 @@ pub fn format_odin(value: &DynValue, include_header: bool) -> String {
     }
 
     output
+}
+
+/// A document is shallow when every leaf path is `field` or `section.field`
+/// (at most one dot) with no arrays. Such documents group by their first
+/// segment into `{section}` headers, mirroring the flat serializer.
+fn is_shallow_object(entries: &[(String, DynValue)]) -> bool {
+    for (_, val) in entries {
+        match val {
+            DynValue::Array(_) => return false,
+            DynValue::Object(fields) => {
+                // section.field — each field must be a scalar (no deeper nesting).
+                for (_, child) in fields {
+                    if matches!(child, DynValue::Object(_) | DynValue::Array(_)) {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Write a shallow document by grouping each top-level object into a `{key}`
+/// section. Scalars at root are emitted first under the root scope.
+fn write_odin_flat_sections(output: &mut String, entries: &[(String, DynValue)]) {
+    for (key, val) in entries {
+        if !matches!(val, DynValue::Object(_)) {
+            write_odin_assignment(output, key, val);
+        }
+    }
+    for (key, val) in entries {
+        if let DynValue::Object(fields) = val {
+            output.push('{');
+            output.push_str(key);
+            output.push_str("}\n");
+            for (fk, fv) in fields {
+                write_odin_assignment(output, fk, fv);
+            }
+        }
+    }
+}
+
+fn write_odin_flat_sections_with_mods(
+    output: &mut String,
+    entries: &[(String, DynValue)],
+    modifiers: &std::collections::HashMap<String, crate::types::values::OdinModifiers>,
+) {
+    for (key, val) in entries {
+        if !matches!(val, DynValue::Object(_)) {
+            write_odin_assignment_with_mods(output, key, val, key, modifiers);
+        }
+    }
+    for (key, val) in entries {
+        if let DynValue::Object(fields) = val {
+            output.push('{');
+            output.push_str(key);
+            output.push_str("}\n");
+            for (fk, fv) in fields {
+                let full = format!("{key}.{fk}");
+                write_odin_assignment_with_mods(output, fk, fv, &full, modifiers);
+            }
+        }
+    }
 }
 
 /// Check if a `DynValue::Object` is a pure leaf chain — a chain of single-child objects
@@ -1908,13 +1985,44 @@ fn write_odin_nested(output: &mut String, prefix: &str, value: &DynValue) {
     }
 }
 
+/// Whether a section emits direct content under its own scope and therefore
+/// needs its `{name}` header. False only when every field renders as an
+/// absolute-path subsection (a single-element scalar array `{name.field[]}`).
+fn section_needs_header(fields: &[(String, DynValue)]) -> bool {
+    if fields.is_empty() {
+        return true;
+    }
+    for (_, val) in fields {
+        match val {
+            DynValue::Array(items) => {
+                let scalar_only = !items.iter()
+                    .any(|v| matches!(v, DynValue::Object(_) | DynValue::Array(_)));
+                let non_null = items.iter().filter(|v| !matches!(v, DynValue::Null)).count();
+                // A single non-null scalar element renders absolute (no header);
+                // anything else (empty, all-null, multi, or nested) is relative.
+                if !(scalar_only && non_null == 1) {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// Write a top-level ODIN section with proper sub-section handling.
 ///
 /// `scope_path` tracks the current ODIN scope for determining absolute vs relative paths.
 fn write_odin_section(output: &mut String, name: &str, fields: &[(String, DynValue)], scope_path: &str) {
-    output.push('{');
-    output.push_str(name);
-    output.push_str("}\n");
+    // The `{name}` header is only needed when the section emits direct content
+    // under its own scope (scalars, leaf chains, or relative subsections). A
+    // section whose sole content is an absolute-path subsection (e.g. a single-
+    // element array rendered as `{name.field[]}`) needs no header.
+    if section_needs_header(fields) {
+        output.push('{');
+        output.push_str(name);
+        output.push_str("}\n");
+    }
 
     let mut path_buf = String::with_capacity(scope_path.len() + 32);
     path_buf.push_str(scope_path);
@@ -2205,6 +2313,10 @@ fn write_odin_array_section(output: &mut String, key: &str, items: &[DynValue]) 
         } else {
             write_odin_record_blocks(output, key, items);
         }
+    } else if let Some(width) = array_of_scalar_arrays_width(items) {
+        write_positional_table(output, &format!("{key}[]"), items, width);
+    } else if let Some(cols) = array_of_object_arrays_columns(items) {
+        write_object_array_table(output, &format!("{key}[]"), items, &cols);
     } else {
         // Simple value array (or empty)
         let _ = writeln!(output, "{{{key}[] : ~}}");
@@ -2212,6 +2324,111 @@ fn write_odin_array_section(output: &mut String, key: &str, items: &[DynValue]) 
             write_odin_value(output, item);
             output.push('\n');
         }
+    }
+}
+
+/// Width of a table whose rows are arrays of scalars, or None if `items` is not
+/// a non-empty list of scalar-only arrays. The width is the longest row, so
+/// ragged rows (e.g. a final short chunk) emit trailing empty cells.
+fn array_of_scalar_arrays_width(items: &[DynValue]) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut width = 0;
+    for item in items {
+        let DynValue::Array(row) = item else { return None };
+        if row.iter().any(|v| matches!(v, DynValue::Object(_) | DynValue::Array(_))) {
+            return None;
+        }
+        width = width.max(row.len());
+    }
+    (width > 0).then_some(width)
+}
+
+/// Emit an array of scalar arrays as a positional table: `[0], [1], …` columns
+/// with one row per item. Missing trailing cells in ragged rows are blank.
+fn write_positional_table(output: &mut String, header_key: &str, items: &[DynValue], width: usize) {
+    let cols: Vec<String> = (0..width).map(|i| format!("[{i}]")).collect();
+    let _ = writeln!(output, "{{{header_key} : {}}}", cols.join(", "));
+    for item in items {
+        let DynValue::Array(row) = item else { continue };
+        let mut cells = Vec::with_capacity(width);
+        for i in 0..width {
+            match row.get(i) {
+                None => cells.push(String::new()),
+                Some(DynValue::Null) => cells.push("~".to_string()),
+                Some(v) => cells.push(odin_value_string(v)),
+            }
+        }
+        output.push_str(&cells.join(", "));
+        output.push('\n');
+    }
+}
+
+/// Columns for a table whose rows are arrays of objects-of-scalars, expressed as
+/// `[i].field`. Returns None unless every item is such an array. Columns are
+/// gathered in order across indices and the objects' field order.
+fn array_of_object_arrays_columns(items: &[DynValue]) -> Option<Vec<String>> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut columns: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut any_object = false;
+    for item in items {
+        let DynValue::Array(row) = item else { return None };
+        for (i, cell) in row.iter().enumerate() {
+            match cell {
+                DynValue::Object(fields) => {
+                    any_object = true;
+                    for (fk, fv) in fields {
+                        if matches!(fv, DynValue::Object(_) | DynValue::Array(_)) {
+                            return None;
+                        }
+                        let col = format!("[{i}].{fk}");
+                        if seen.insert(col.clone()) {
+                            columns.push(col);
+                        }
+                    }
+                }
+                DynValue::Array(_) => return None,
+                _ => {
+                    let col = format!("[{i}]");
+                    if seen.insert(col.clone()) {
+                        columns.push(col);
+                    }
+                }
+            }
+        }
+    }
+    (any_object && !columns.is_empty()).then_some(columns)
+}
+
+/// Emit an array of object-bearing arrays as a table with `[i].field` columns.
+fn write_object_array_table(output: &mut String, header_key: &str, items: &[DynValue], columns: &[String]) {
+    let formatted = format_columns_with_relative(columns);
+    let _ = writeln!(output, "{{{header_key} : {formatted}}}");
+    for item in items {
+        let DynValue::Array(row) = item else { continue };
+        let mut cells = Vec::with_capacity(columns.len());
+        for col in columns {
+            // Column form `[i]` or `[i].field`.
+            let close = col.find(']').unwrap();
+            let idx: usize = col[1..close].parse().unwrap_or(usize::MAX);
+            let field = col[close + 1..].strip_prefix('.');
+            let cell = row.get(idx).and_then(|c| match (c, field) {
+                (DynValue::Object(fields), Some(f)) => fields.iter().find(|(k, _)| k == f).map(|(_, v)| v),
+                (v, None) => Some(v),
+                _ => None,
+            });
+            match cell {
+                None => cells.push(String::new()),
+                Some(DynValue::Null) => cells.push("~".to_string()),
+                Some(v) => cells.push(odin_value_string(v)),
+            }
+        }
+        output.push_str(&cells.join(", "));
+        output.push('\n');
     }
 }
 
@@ -2246,8 +2463,24 @@ fn write_odin_array_subsection_with_parent(
             };
             write_odin_record_blocks(output, &absolute_key, items);
         }
+    } else if let Some(width) = array_of_scalar_arrays_width(items) {
+        write_positional_table(output, &format!(".{key}[]"), items, width);
+    } else if let Some(cols) = array_of_object_arrays_columns(items) {
+        write_object_array_table(output, &format!(".{key}[]"), items, &cols);
     } else {
-        let _ = writeln!(output, "{{.{key}[] : ~}}");
+        // A single non-null-leaf array uses an absolute header
+        // (`{parent.key[]}`); empty, all-null, or multi-leaf arrays use the
+        // relative `{.key[]}` form (null elements are not leaves).
+        let non_null = items.iter().filter(|v| !matches!(v, DynValue::Null)).count();
+        if non_null == 1 {
+            if let Some(p) = parent_path.filter(|p| !p.is_empty()) {
+                let _ = writeln!(output, "{{{p}.{key}[] : ~}}");
+            } else {
+                let _ = writeln!(output, "{{{key}[] : ~}}");
+            }
+        } else {
+            let _ = writeln!(output, "{{.{key}[] : ~}}");
+        }
         for item in items {
             write_odin_value(output, item);
             output.push('\n');

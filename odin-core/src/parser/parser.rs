@@ -140,6 +140,7 @@ struct Parser<'a> {
     path_buf: String,
     norm_buf: String,
     tabular: Option<TabularContext>,
+    blank_line_break: bool,
 }
 
 /// Active tabular section state — set on `{name[] : ...}` headers.
@@ -176,6 +177,7 @@ impl<'a> Parser<'a> {
             path_buf: String::with_capacity(64),
             norm_buf: String::with_capacity(64),
             tabular: None,
+            blank_line_break: false,
         }
     }
 
@@ -201,10 +203,12 @@ impl<'a> Parser<'a> {
             let b = self.bytes[self.pos];
             let line = self.line as usize;
             let col = self.col() as usize;
-            // A new header (or EOF) closes any active tabular section.
-            if self.tabular.is_some() && b == b'{' {
+            // A new header, a blank-line break, or EOF closes any active tabular
+            // section; a following root assignment then scopes to root.
+            if self.tabular.is_some() && (b == b'{' || self.blank_line_break) {
                 self.tabular = None;
             }
+            self.blank_line_break = false;
             if self.tabular.is_some() {
                 match self.parse_tabular_row() {
                     StepResult::Ok => continue,
@@ -305,11 +309,18 @@ impl<'a> Parser<'a> {
                     self.line += 1;
                     self.line_start = self.pos;
                     newlines_in_a_row += 1;
-                    if newlines_in_a_row >= 2 && self.in_metadata && self.current_header.is_none() {
-                        self.in_metadata = false;
+                    if newlines_in_a_row >= 2 {
+                        self.blank_line_break = true;
+                        if self.in_metadata && self.current_header.is_none() {
+                            self.in_metadata = false;
+                        }
                     }
                 }
-                b';' => self.skip_comment(),
+                b';' => {
+                    // A comment line is not a blank-line break between rows.
+                    newlines_in_a_row = 0;
+                    self.skip_comment();
+                }
                 _ => return true,
             }
         }

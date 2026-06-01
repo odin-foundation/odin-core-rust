@@ -88,7 +88,7 @@ fn to_f64(v: &DynValue) -> Option<f64> {
 }
 
 /// Return a numeric DynValue: Integer if whole, Float otherwise.
-fn numeric_result(v: f64) -> DynValue {
+pub(super) fn numeric_result(v: f64) -> DynValue {
     if v.fract() == 0.0 && v.abs() < i64::MAX as f64 {
         DynValue::Integer(v as i64)
     } else {
@@ -265,10 +265,10 @@ pub(super) fn ceil(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, St
 pub(super) fn negate(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     match args.first() {
         Some(DynValue::Integer(n)) => Ok(DynValue::Integer(-n)),
-        Some(DynValue::Float(n)) => Ok(DynValue::Float(-n)),
+        Some(DynValue::Float(n)) => Ok(numeric_result(-n)),
         Some(DynValue::String(s)) => {
             if let Ok(n) = s.parse::<f64>() {
-                Ok(DynValue::Float(-n))
+                Ok(numeric_result(-n))
             } else {
                 Err("negate: cannot parse string as number".to_string())
             }
@@ -1003,9 +1003,9 @@ pub(super) fn log_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
         if base <= 0.0 || base == 1.0 {
             return Err("log: base must be positive and not 1".to_string());
         }
-        Ok(DynValue::Float(val.ln() / base.ln()))
+        Ok(numeric_result(val.ln() / base.ln()))
     } else {
-        Ok(DynValue::Float(val.ln()))
+        Ok(numeric_result(val.ln()))
     }
 }
 
@@ -1016,7 +1016,7 @@ pub(super) fn ln(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Stri
     if val <= 0.0 {
         return Err("ln: argument must be positive".to_string());
     }
-    Ok(DynValue::Float(val.ln()))
+    Ok(numeric_result(val.ln()))
 }
 
 /// log10: log base 10.
@@ -1026,7 +1026,7 @@ pub(super) fn log10(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, S
     if val <= 0.0 {
         return Err("log10: argument must be positive".to_string());
     }
-    Ok(DynValue::Float(val.log10()))
+    Ok(numeric_result(val.log10()))
 }
 
 /// exp: e^x.
@@ -1213,30 +1213,24 @@ pub(super) fn clamp(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, S
     let val = to_f64(&args[0]).ok_or("clamp: value must be numeric")?;
     let min_val = to_f64(&args[1]).ok_or("clamp: min must be numeric")?;
     let max_val = to_f64(&args[2]).ok_or("clamp: max must be numeric")?;
-    if val < min_val {
-        Ok(DynValue::Float(min_val))
-    } else if val > max_val {
-        Ok(DynValue::Float(max_val))
-    } else {
-        Ok(DynValue::Float(val))
-    }
+    Ok(numeric_result(min_val.max(max_val.min(val))))
 }
 
-/// interpolate: linear interpolation.
-/// Args: x, x0, x1, y0, y1 -> y = y0 + (x - x0) * (y1 - y0) / (x1 - x0).
+/// interpolate: linear interpolation between two points.
+/// Args: x, x1, y1, x2, y2 -> y = y1 + (x - x1) * (y2 - y1) / (x2 - x1).
 pub(super) fn interpolate(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 5 {
-        return Err("interpolate: requires 5 arguments (x, x0, x1, y0, y1)".to_string());
+        return Err("interpolate: requires 5 arguments (x, x1, y1, x2, y2)".to_string());
     }
     let x = to_f64(&args[0]).ok_or("interpolate: x must be numeric")?;
-    let x0 = to_f64(&args[1]).ok_or("interpolate: x0 must be numeric")?;
-    let x1 = to_f64(&args[2]).ok_or("interpolate: x1 must be numeric")?;
-    let y0 = to_f64(&args[3]).ok_or("interpolate: y0 must be numeric")?;
-    let y1 = to_f64(&args[4]).ok_or("interpolate: y1 must be numeric")?;
-    if (x1 - x0).abs() < f64::EPSILON {
-        return Err("interpolate: x0 and x1 must be different".to_string());
+    let x1 = to_f64(&args[1]).ok_or("interpolate: x1 must be numeric")?;
+    let y1 = to_f64(&args[2]).ok_or("interpolate: y1 must be numeric")?;
+    let x2 = to_f64(&args[3]).ok_or("interpolate: x2 must be numeric")?;
+    let y2 = to_f64(&args[4]).ok_or("interpolate: y2 must be numeric")?;
+    if (x2 - x1).abs() < f64::EPSILON {
+        return Ok(numeric_result(y1));
     }
-    Ok(DynValue::Float(y0 + (x - x0) * (y1 - y0) / (x1 - x0)))
+    Ok(numeric_result(y1 + (x - x1) * (y2 - y1) / (x2 - x1)))
 }
 
 /// weightedAvg: weighted average. Args: values array, weights array.
@@ -1321,12 +1315,7 @@ pub(super) fn mod_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
         return Ok(DynValue::Null);
     }
     let result = val % divisor;
-    // Return integer if both inputs were integers
-    if matches!(&args[0], DynValue::Integer(_)) && matches!(&args[1], DynValue::Integer(_)) {
-        Ok(DynValue::Integer(result as i64))
-    } else {
-        Ok(DynValue::Float(result))
-    }
+    Ok(numeric_result(result))
 }
 
 /// stdSample: arity 1 — sample standard deviation (n-1 divisor).
@@ -1368,10 +1357,10 @@ pub(super) fn percentile(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVal
     let lower = index.floor() as usize;
     let upper = index.ceil() as usize;
     if lower == upper || upper >= nums.len() {
-        Ok(DynValue::Float(nums[lower.min(nums.len() - 1)]))
+        Ok(numeric_result(nums[lower.min(nums.len() - 1)]))
     } else {
         let weight = index - lower as f64;
-        Ok(DynValue::Float(nums[lower] + weight * (nums[upper] - nums[lower])))
+        Ok(numeric_result(nums[lower] + weight * (nums[upper] - nums[lower])))
     }
 }
 
@@ -1390,10 +1379,10 @@ pub(super) fn quantile(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
     let lower = index.floor() as usize;
     let upper = index.ceil() as usize;
     if lower == upper || upper >= nums.len() {
-        Ok(DynValue::Float(nums[lower.min(nums.len() - 1)]))
+        Ok(numeric_result(nums[lower.min(nums.len() - 1)]))
     } else {
         let weight = index - lower as f64;
-        Ok(DynValue::Float(nums[lower] + weight * (nums[upper] - nums[lower])))
+        Ok(numeric_result(nums[lower] + weight * (nums[upper] - nums[lower])))
     }
 }
 
@@ -1537,7 +1526,7 @@ pub(super) fn depreciation_verb(args: &[DynValue], _ctx: &VerbContext) -> Result
     if life <= 0.0 {
         return Err("depreciation: life must be positive".to_string());
     }
-    Ok(DynValue::Float((cost - salvage) / life))
+    Ok(numeric_result((cost - salvage) / life))
 }
 
 /// zscore: arity 2 — calculate z-score of a value relative to a dataset.
@@ -2380,21 +2369,21 @@ mod tests {
     fn test_clamp_within_range() {
         let args = vec![DynValue::Integer(5), DynValue::Integer(0), DynValue::Integer(10)];
         let result = clamp(&args, &ctx()).unwrap();
-        assert_eq!(result, DynValue::Float(5.0));
+        assert_eq!(result, DynValue::Integer(5));
     }
 
     #[test]
     fn test_clamp_below_min() {
         let args = vec![DynValue::Integer(-5), DynValue::Integer(0), DynValue::Integer(10)];
         let result = clamp(&args, &ctx()).unwrap();
-        assert_eq!(result, DynValue::Float(0.0));
+        assert_eq!(result, DynValue::Integer(0));
     }
 
     #[test]
     fn test_clamp_above_max() {
         let args = vec![DynValue::Integer(15), DynValue::Integer(0), DynValue::Integer(10)];
         let result = clamp(&args, &ctx()).unwrap();
-        assert_eq!(result, DynValue::Float(10.0));
+        assert_eq!(result, DynValue::Integer(10));
     }
 
     // ─── interpolate tests ───────────────────────────────────────────────
@@ -3736,26 +3725,28 @@ mod extended_tests {
 
     #[test]
     fn interpolate_midpoint() {
-        // x=5, x0=0, x1=10, y0=0, y1=100 => y=50
-        let r = interpolate(&[f(5.0), f(0.0), f(10.0), f(0.0), f(100.0)], &ctx()).unwrap();
+        // x=5 between (x1=0,y1=0) and (x2=10,y2=100) => y=50
+        let r = interpolate(&[f(5.0), f(0.0), f(0.0), f(10.0), f(100.0)], &ctx()).unwrap();
         assert_numeric(r, 50.0, 1e-10);
     }
 
     #[test]
     fn interpolate_at_start() {
-        let r = interpolate(&[f(0.0), f(0.0), f(10.0), f(0.0), f(100.0)], &ctx()).unwrap();
+        let r = interpolate(&[f(0.0), f(0.0), f(0.0), f(10.0), f(100.0)], &ctx()).unwrap();
         assert_numeric(r, 0.0, 1e-10);
     }
 
     #[test]
     fn interpolate_at_end() {
-        let r = interpolate(&[f(10.0), f(0.0), f(10.0), f(0.0), f(100.0)], &ctx()).unwrap();
+        let r = interpolate(&[f(10.0), f(0.0), f(0.0), f(10.0), f(100.0)], &ctx()).unwrap();
         assert_numeric(r, 100.0, 1e-10);
     }
 
     #[test]
-    fn interpolate_same_x_error() {
-        assert!(interpolate(&[f(5.0), f(5.0), f(5.0), f(0.0), f(100.0)], &ctx()).is_err());
+    fn interpolate_same_x_returns_y1() {
+        // x2 == x1 collapses to y1.
+        let r = interpolate(&[f(5.0), f(5.0), f(42.0), f(5.0), f(100.0)], &ctx()).unwrap();
+        assert_numeric(r, 42.0, 1e-10);
     }
 
     #[test]

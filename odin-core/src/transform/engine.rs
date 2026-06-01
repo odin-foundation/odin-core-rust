@@ -60,6 +60,10 @@ struct ExecContext<'a> {
     missing_policy: MissingPolicy,
     /// Policy for evaluation/verb errors (`fail`/`warn`).
     error_policy: ErrorPolicy,
+    /// Named `%sequence` counters, incremented per call.
+    sequence_counters: HashMap<String, i64>,
+    /// Strict type checking — verb argument errors surface as T002.
+    strict_types: bool,
 }
 
 /// Policy applied to a coded evaluation error (`onError`, default fail).
@@ -215,6 +219,8 @@ pub fn execute_with_options(
         validation_policy: ValidationPolicy::from_options(&transform.target.options),
         missing_policy: MissingPolicy::from_options(&transform.target.options),
         error_policy: ErrorPolicy::from_options(&transform.target.options),
+        sequence_counters: HashMap::new(),
+        strict_types: transform.strict_types,
     };
 
     // 2. Build output object
@@ -280,12 +286,21 @@ pub fn execute_with_options(
         transform.target.format.clone()
     };
 
+    // Positional directives (:pos/:len) only apply to fixed-width output; on any
+    // other format they are invalid modifiers — report T007 (warn by default).
+    if is_known_output_format(&effective_format) && !effective_format.eq_ignore_ascii_case("fixed-width") {
+        check_invalid_positional_modifiers(&all_segments, &effective_format, &mut ctx.warnings);
+    }
+
     let formatted = if is_known_output_format(&effective_format) {
         if effective_format.eq_ignore_ascii_case("odin") {
             let include_header = transform.target.options.get("header").is_some_and(|v| v == "true");
             formatters::format_odin_with_modifiers(&output, &ctx.field_modifiers, include_header)
         } else if effective_format.eq_ignore_ascii_case("fixed-width") {
-            // Fixed-width export uses segment mapping directives for positioning
+            // Fixed-width export uses segment mapping directives for positioning.
+            // A field whose :pos + :len exceeds the declared lineWidth overflows
+            // the line — report T010 (warn by default).
+            check_fixed_width_overflow(&all_segments, &transform.target.options, &mut ctx.warnings);
             formatters::format_fixed_width_from_segments(&output, &all_segments, &transform.target.options)
         } else if effective_format.eq_ignore_ascii_case("xml") {
             formatters::format_xml_full(&output, &transform.target.options, &ctx.field_modifiers, &transform.target.namespaces)
@@ -514,6 +529,8 @@ fn execute_multi_record(
         validation_policy: ValidationPolicy::from_options(&transform.target.options),
         missing_policy: MissingPolicy::from_options(&transform.target.options),
         error_policy: ErrorPolicy::from_options(&transform.target.options),
+        sequence_counters: HashMap::new(),
+        strict_types: transform.strict_types,
     };
 
     let mut output = DynValue::Object(Vec::new());
@@ -1897,6 +1914,28 @@ fn execute_verb_call(
         evaluated_args.push(val);
     }
 
+    // Stateful sequence verbs are handled here so the counter persists across
+    // mappings. `%sequence` returns 1 on first use then increments; an optional
+    // second argument sets the starting value. `%resetSequence` clears it.
+    if call.verb == "sequence" {
+        if let Some(name) = evaluated_args.first().and_then(DynValue::as_str) {
+            let name = name.to_string();
+            let start = evaluated_args.get(1).and_then(DynValue::as_i64).unwrap_or(1);
+            let next = match ctx.sequence_counters.get(&name) {
+                Some(cur) => cur + 1,
+                None => start,
+            };
+            ctx.sequence_counters.insert(name, next);
+            return Ok(DynValue::Integer(next));
+        }
+    }
+    if call.verb == "resetSequence" {
+        if let Some(name) = evaluated_args.first().and_then(DynValue::as_str) {
+            ctx.sequence_counters.remove(name);
+            return Ok(DynValue::Integer(0));
+        }
+    }
+
     // Look up verb in registry. Custom verbs (is_custom) act as echo/passthrough
     // if not explicitly registered — they return their first argument.
     let verb_fn = match ctx.verbs.get(&call.verb) {
@@ -1922,7 +1961,16 @@ fn execute_verb_call(
         overflow: std::cell::Cell::new(None),
     };
 
-    let result = verb_fn(&evaluated_args, &verb_ctx)?;
+    let result = match verb_fn(&evaluated_args, &verb_ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            // Under strict types, an uncoded verb argument error is a T002.
+            if ctx.strict_types && !e.starts_with('[') {
+                return Err(format!("[{}] {e}", transform_error_codes::T002_INVALID_VERB_ARGS));
+            }
+            return Err(e);
+        }
+    };
 
     // Drain verb-context signals before reborrowing `ctx` mutably.
     let miss = verb_ctx.lookup_miss.take();
@@ -2669,6 +2717,86 @@ fn resolve_mut_path<'a>(output: &'a mut DynValue, path: &str) -> Option<&'a mut 
 // ─────────────────────────────────────────────────────────────────────────────
 // Output formatting
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Scan fixed-width segment mappings for a field whose `:pos` + `:len` exceeds
+/// the declared `lineWidth`, surfacing a T010 warning for each.
+fn check_fixed_width_overflow(
+    segments: &[TransformSegment],
+    options: &HashMap<String, String>,
+    warnings: &mut Vec<TransformWarning>,
+) {
+    let Some(line_width) = options.get("lineWidth").and_then(|w| w.parse::<usize>().ok()) else {
+        return;
+    };
+    fn walk(seg: &TransformSegment, line_width: usize, warnings: &mut Vec<TransformWarning>) {
+        for mapping in &seg.mappings {
+            let dirs = collect_fwf_overflow_directives(mapping);
+            let pos = dirs.iter().find(|d| d.name == "pos").and_then(directive_as_usize);
+            let len = dirs.iter().find(|d| d.name == "len").and_then(directive_as_usize);
+            if let (Some(p), Some(l)) = (pos, len) {
+                if p + l > line_width {
+                    warnings.push(TransformWarning {
+                        message: format!(
+                            "[{}] Field at position {p} with length {l} exceeds line width {line_width}",
+                            transform_error_codes::T010_POSITION_OVERFLOW,
+                        ),
+                        path: Some(mapping.target.clone()),
+                    });
+                }
+            }
+        }
+        for child in &seg.children {
+            walk(child, line_width, warnings);
+        }
+    }
+    for seg in segments {
+        walk(seg, line_width, warnings);
+    }
+}
+
+/// Surface T010 if a mapping carries `:pos`/`:len` on a non-fixed-width target.
+fn check_invalid_positional_modifiers(
+    segments: &[TransformSegment],
+    format: &str,
+    warnings: &mut Vec<TransformWarning>,
+) {
+    fn walk(seg: &TransformSegment, format: &str, warnings: &mut Vec<TransformWarning>) {
+        for mapping in &seg.mappings {
+            let dirs = collect_fwf_overflow_directives(mapping);
+            if dirs.iter().any(|d| d.name == "pos" || d.name == "len") {
+                warnings.push(TransformWarning {
+                    message: format!(
+                        "[{}] Positional modifier (:pos/:len) is not valid for the {format} format",
+                        transform_error_codes::T007_INVALID_MODIFIER,
+                    ),
+                    path: Some(mapping.target.clone()),
+                });
+            }
+        }
+        for child in &seg.children {
+            walk(child, format, warnings);
+        }
+    }
+    for seg in segments {
+        walk(seg, format, warnings);
+    }
+}
+
+/// Gather `:pos`/`:len` directives for a mapping (direct or on verb-arg references).
+fn collect_fwf_overflow_directives(
+    mapping: &crate::types::transform::FieldMapping,
+) -> Vec<crate::types::values::OdinDirective> {
+    let mut dirs = mapping.directives.clone();
+    use crate::types::transform::{FieldExpression, VerbArg};
+    if let FieldExpression::Transform(call) = &mapping.expression {
+        for arg in &call.args {
+            if let VerbArg::Reference(_, ref_dirs) = arg {
+                dirs.extend(ref_dirs.iter().cloned());
+            }
+        }
+    }
+    dirs
+}
 
 fn format_output(
     output: &DynValue,

@@ -5,6 +5,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::types::transform::DynValue;
 use super::VerbContext;
 
+/// Read the `key` of a `%groupBy` `{ key, items }` group record.
+#[cfg(test)]
+fn group_key(group: &DynValue) -> String {
+    match group.get("key") {
+        Some(DynValue::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Read the `items` array of a `%groupBy` `{ key, items }` group record.
+#[cfg(test)]
+fn group_items(group: &DynValue) -> Vec<DynValue> {
+    match group.get("items") {
+        Some(DynValue::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: compare two DynValues with a comparison operator string
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,8 +248,15 @@ pub(super) fn at(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Stri
         return Err("at: requires 2 arguments (array, index)".to_string());
     }
     let arr = extract_arr(&args[0]).ok_or("at: first argument must be an array")?;
-    let idx = args[1].as_i64().ok_or("at: second argument must be an integer")? as usize;
-    Ok(arr.get(idx).cloned().unwrap_or(DynValue::Null))
+    let mut idx = args[1].as_i64().ok_or("at: second argument must be an integer")?;
+    // Negative indices count from the end.
+    if idx < 0 {
+        idx += arr.len() as i64;
+    }
+    if idx < 0 || idx >= arr.len() as i64 {
+        return Ok(DynValue::Null);
+    }
+    Ok(arr.get(idx as usize).cloned().unwrap_or(DynValue::Null))
 }
 
 /// slice: arity 3 — slice array from start to end index.
@@ -375,10 +400,14 @@ pub(super) fn group_by(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
             groups.push((key, vec![item.clone()]));
         }
     }
-    let result: Vec<(String, DynValue)> = groups.into_iter()
-        .map(|(k, v)| (k, DynValue::Array(v)))
+    // Each group becomes a { key, items } record, preserving insertion order.
+    let result: Vec<DynValue> = groups.into_iter()
+        .map(|(k, v)| DynValue::Object(vec![
+            ("key".to_string(), DynValue::String(k)),
+            ("items".to_string(), DynValue::Array(v)),
+        ]))
         .collect();
-    Ok(DynValue::Object(result))
+    Ok(DynValue::Array(result))
 }
 
 /// partition: arity 4 — split array into [matching, non-matching].
@@ -493,7 +522,26 @@ pub(super) fn pluck(args: &[DynValue], ctx: &VerbContext) -> Result<DynValue, St
 }
 
 /// `row_number`: arity 1 — return current loop index from context.
-pub(super) fn row_number(_args: &[DynValue], ctx: &VerbContext) -> Result<DynValue, String> {
+pub(super) fn row_number(args: &[DynValue], ctx: &VerbContext) -> Result<DynValue, String> {
+    // With an array argument, tag each element with a 1-based `_rowNum`,
+    // wrapping primitives as `{ _rowNum, value }`.
+    if let Some(arr) = args.first().and_then(extract_arr) {
+        let result: Vec<DynValue> = arr.into_iter().enumerate().map(|(i, item)| {
+            let row = DynValue::Integer(i as i64 + 1);
+            match item {
+                DynValue::Object(mut fields) => {
+                    fields.insert(0, ("_rowNum".to_string(), row));
+                    DynValue::Object(fields)
+                }
+                other => DynValue::Object(vec![
+                    ("_rowNum".to_string(), row),
+                    ("value".to_string(), other),
+                ]),
+            }
+        }).collect();
+        return Ok(DynValue::Array(result));
+    }
+    // No array argument: fall back to the current loop index.
     match ctx.loop_vars.get("$index") {
         Some(v) => Ok(v.clone()),
         None => Ok(DynValue::Integer(0)),
@@ -859,7 +907,7 @@ pub(super) fn avg(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Str
     if count == 0 {
         return Ok(DynValue::Null);
     }
-    Ok(DynValue::Float(total / count as f64))
+    Ok(super::numeric_verbs::numeric_result(total / count as f64))
 }
 
 /// `first_verb`: arity 1 — first element of array.
@@ -1941,11 +1989,11 @@ mod tests {
             obj(vec![("color", s("red")), ("n", i(3))]),
         ]);
         let result = group_by(&[data, s("color")], &ctx()).unwrap();
-        if let DynValue::Object(pairs) = result {
-            assert_eq!(pairs.len(), 2);
-            assert_eq!(pairs[0].0, "red");
-            assert_eq!(pairs[1].0, "blue");
-        } else { panic!("expected object"); }
+        if let DynValue::Array(groups) = result {
+            assert_eq!(groups.len(), 2);
+            assert_eq!(group_key(&groups[0]), "red");
+            assert_eq!(group_key(&groups[1]), "blue");
+        } else { panic!("expected array"); }
     }
 
     #[test]
@@ -2258,7 +2306,7 @@ mod tests {
     #[test]
     fn avg_basic() {
         let data = arr(vec![i(10), i(20), i(30)]);
-        assert_eq!(avg(&[data], &ctx()).unwrap(), f(20.0));
+        assert_eq!(avg(&[data], &ctx()).unwrap(), i(20));
     }
 
     #[test]
@@ -2269,7 +2317,7 @@ mod tests {
     #[test]
     fn avg_single() {
         let data = arr(vec![i(7)]);
-        assert_eq!(avg(&[data], &ctx()).unwrap(), f(7.0));
+        assert_eq!(avg(&[data], &ctx()).unwrap(), i(7));
     }
 
     // ── first_verb ──────────────────────────────────────────────────────────
@@ -3247,7 +3295,7 @@ mod extended_tests {
     #[test]
     fn group_by_empty_array() {
         let result = group_by(&[arr(vec![]), s("key")], &ctx()).unwrap();
-        if let DynValue::Object(pairs) = result { assert_eq!(pairs.len(), 0); } else { panic!(); }
+        if let DynValue::Array(groups) = result { assert_eq!(groups.len(), 0); } else { panic!(); }
     }
 
     #[test]
@@ -3257,9 +3305,9 @@ mod extended_tests {
             obj(vec![("type", s("A")), ("v", i(2))]),
         ]);
         let result = group_by(&[data, s("type")], &ctx()).unwrap();
-        if let DynValue::Object(pairs) = result {
-            assert_eq!(pairs.len(), 1);
-            assert_eq!(pairs[0].0, "A");
+        if let DynValue::Array(groups) = result {
+            assert_eq!(groups.len(), 1);
+            assert_eq!(group_key(&groups[0]), "A");
         } else { panic!(); }
     }
 
@@ -3270,10 +3318,10 @@ mod extended_tests {
             obj(vec![("type", s("A")), ("v", i(2))]),
         ]);
         let result = group_by(&[data, s("type")], &ctx()).unwrap();
-        if let DynValue::Object(pairs) = result {
-            assert_eq!(pairs.len(), 2);
+        if let DynValue::Array(groups) = result {
+            assert_eq!(groups.len(), 2);
             // First item has no "type" field, so key is "null"
-            assert!(pairs.iter().any(|(k, _)| k == "null"));
+            assert!(groups.iter().any(|g| group_key(g) == "null"));
         } else { panic!(); }
     }
 
@@ -3285,8 +3333,8 @@ mod extended_tests {
             obj(vec![("score", i(10))]),
         ]);
         let result = group_by(&[data, s("score")], &ctx()).unwrap();
-        if let DynValue::Object(pairs) = result {
-            assert_eq!(pairs.len(), 2);
+        if let DynValue::Array(groups) = result {
+            assert_eq!(groups.len(), 2);
         } else { panic!(); }
     }
 
@@ -3786,19 +3834,19 @@ mod extended_tests {
     #[test]
     fn avg_floats() {
         let data = arr(vec![f(1.0), f(2.0), f(3.0)]);
-        assert_eq!(avg(&[data], &ctx()).unwrap(), f(2.0));
+        assert_eq!(avg(&[data], &ctx()).unwrap(), i(2));
     }
 
     #[test]
     fn avg_mixed_int_float() {
         let data = arr(vec![i(1), f(2.0), i(3)]);
-        assert_eq!(avg(&[data], &ctx()).unwrap(), f(2.0));
+        assert_eq!(avg(&[data], &ctx()).unwrap(), i(2));
     }
 
     #[test]
     fn avg_with_non_numeric_skipped() {
         let data = arr(vec![i(10), s("abc"), i(20)]);
-        assert_eq!(avg(&[data], &ctx()).unwrap(), f(15.0));
+        assert_eq!(avg(&[data], &ctx()).unwrap(), i(15));
     }
 
     #[test]
@@ -4746,10 +4794,10 @@ mod extended_tests_2 {
             obj(vec![("active", b(true)), ("name", s("C"))]),
         ]);
         let result = group_by(&[data, s("active")], &ctx()).unwrap();
-        if let DynValue::Object(pairs) = result {
-            assert_eq!(pairs.len(), 2);
-            let true_group = pairs.iter().find(|(k, _)| k == "true").unwrap();
-            if let DynValue::Array(items) = &true_group.1 { assert_eq!(items.len(), 2); } else { panic!(); }
+        if let DynValue::Array(groups) = result {
+            assert_eq!(groups.len(), 2);
+            let true_group = groups.iter().find(|g| group_key(g) == "true").unwrap();
+            assert_eq!(group_items(true_group).len(), 2);
         } else { panic!(); }
     }
 
@@ -4760,9 +4808,9 @@ mod extended_tests_2 {
             obj(vec![("k", s("x")), ("v", i(2))]),
         ]);
         let result = group_by(&[data, s("k")], &ctx()).unwrap();
-        if let DynValue::Object(pairs) = result {
-            assert_eq!(pairs.len(), 1);
-            assert_eq!(pairs[0].0, "x");
+        if let DynValue::Array(groups) = result {
+            assert_eq!(groups.len(), 1);
+            assert_eq!(group_key(&groups[0]), "x");
         } else { panic!(); }
     }
 
@@ -4773,8 +4821,8 @@ mod extended_tests_2 {
             obj(vec![("cat", s("x")), ("name", s("B"))]),
         ]);
         let result = group_by(&[data, s("cat")], &ctx()).unwrap();
-        if let DynValue::Object(pairs) = result {
-            let null_group = pairs.iter().find(|(k, _)| k == "null");
+        if let DynValue::Array(groups) = result {
+            let null_group = groups.iter().find(|g| group_key(g) == "null");
             assert!(null_group.is_some());
         } else { panic!(); }
     }

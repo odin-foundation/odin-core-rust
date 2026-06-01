@@ -724,8 +724,8 @@ fn split_array_items(s: &str) -> Vec<&str> {
         match bytes[i] {
             b'\\' if in_string => escape = true,
             b'"' => in_string = !in_string,
-            b'[' if !in_string => depth += 1,
-            b']' if !in_string => depth -= 1,
+            b'[' | b'{' if !in_string => depth += 1,
+            b']' | b'}' if !in_string => depth -= 1,
             b',' if !in_string && depth == 0 => {
                 items.push(&s[start..i]);
                 start = i + 1;

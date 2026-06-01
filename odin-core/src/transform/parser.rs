@@ -513,6 +513,9 @@ fn build_segment(
     // Ordered loop directives (path, optional alias). Repeated `:loop` lines
     // are stored under `_loop`, `_loop2`, … and drive a nested cross-product.
     let mut loops: Vec<(String, Option<String>)> = Vec::new();
+    // `_from` array path, and a deferred `_loop = "@"` that iterates it.
+    let mut from_path: Option<String> = None;
+    let mut self_loop_alias: Option<Option<String>> = None;
     let mut literal_body: Option<String> = None;
     let mut has_literal = false;
     let mut counter: Option<String> = None;
@@ -570,10 +573,26 @@ fn build_segment(
                     } else {
                         (raw, None)
                     };
-                    if source_path.is_none() {
-                        source_path = Some(path.clone());
+                    // `_from` names the array to iterate; a `_loop = "@"` next to it
+                    // is just the iteration marker, not a separate cross-product loop.
+                    let path_marks_self = {
+                        let p = path.strip_prefix('@').unwrap_or(&path).trim();
+                        p.is_empty()
+                    };
+                    if field == "_from" {
+                        from_path = Some(path.clone());
+                        if source_path.is_none() {
+                            source_path = Some(path.clone());
+                        }
+                    } else if path_marks_self {
+                        // Defer: resolved against `_from` after the field loop.
+                        self_loop_alias = Some(alias);
+                    } else {
+                        if source_path.is_none() {
+                            source_path = Some(path.clone());
+                        }
+                        loops.push((path, alias));
                     }
-                    loops.push((path, alias));
                 }
                 "_literal" => {
                     has_literal = true;
@@ -630,6 +649,15 @@ fn build_segment(
         } else {
             let m = build_field_mapping(field, value, modifiers);
             item_order.push(ItemRef::Mapping(m));
+        }
+    }
+
+    // A `_loop = "@"` iterates the `_from` array when present; otherwise it
+    // iterates the source/current element directly (path "@").
+    if let Some(alias) = self_loop_alias {
+        match from_path.clone() {
+            Some(fp) => loops.push((fp, alias)),
+            None => loops.push(("@".to_string(), alias)),
         }
     }
 
