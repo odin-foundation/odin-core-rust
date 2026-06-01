@@ -384,6 +384,169 @@ pub(super) fn parse_date_value(raw: &str, line: usize, col: usize) -> Result<Odi
     })
 }
 
+pub(super) fn validate_timestamp_value(
+    raw: &str,
+    line: usize,
+    col: usize,
+) -> Result<(), ParseError> {
+    // YYYY-MM-DDThh:mm[:ss[.sss]][Z|±hh:mm]
+    let (date_part, rest) = match raw.split_once('T') {
+        Some(parts) => parts,
+        None => return Err(invalid_temporal("timestamp", raw, line, col)),
+    };
+
+    if date_part.len() != 10 || !is_date_like(date_part) {
+        return Err(invalid_temporal("timestamp", raw, line, col));
+    }
+    parse_date_value(date_part, line, col)?;
+
+    // Split trailing timezone designator from the time portion.
+    let (time_part, offset) = split_offset(rest);
+    let (hour, minute, second) = parse_time_components(time_part, raw, "timestamp", line, col)?;
+    validate_time_components(hour, minute, second, raw, line, col)?;
+
+    // "Z" needs no numeric range check; numeric offsets do.
+    if let Some(off) = offset {
+        if off != "Z" {
+            validate_offset(off, raw, line, col)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_time_value(
+    raw: &str,
+    line: usize,
+    col: usize,
+) -> Result<(), ParseError> {
+    // Thh:mm[:ss[.sss]]
+    let body = match raw.strip_prefix('T') {
+        Some(b) => b,
+        None => return Err(invalid_temporal("time", raw, line, col)),
+    };
+    let (hour, minute, second) = parse_time_components(body, raw, "time", line, col)?;
+    validate_time_components(hour, minute, second, raw, line, col)
+}
+
+fn split_offset(rest: &str) -> (&str, Option<&str>) {
+    if let Some(stripped) = rest.strip_suffix('Z') {
+        return (stripped, Some("Z"));
+    }
+    // Search for a +/- offset after the time portion (skip leading sign of nothing).
+    if let Some(idx) = rest.rfind(['+', '-']) {
+        if idx > 0 {
+            return (&rest[..idx], Some(&rest[idx..]));
+        }
+    }
+    (rest, None)
+}
+
+fn parse_time_components(
+    body: &str,
+    raw: &str,
+    kind: &str,
+    line: usize,
+    col: usize,
+) -> Result<(u8, u8, u8), ParseError> {
+    let mut parts = body.split(':');
+    let hour_s = parts.next();
+    let min_s = parts.next();
+    let sec_s = parts.next();
+    if parts.next().is_some() {
+        return Err(invalid_temporal(kind, raw, line, col));
+    }
+    let (hour_s, min_s) = match (hour_s, min_s) {
+        (Some(h), Some(m)) if h.len() == 2 && m.len() == 2 => (h, m),
+        _ => return Err(invalid_temporal(kind, raw, line, col)),
+    };
+    let hour = hour_s
+        .parse::<u8>()
+        .map_err(|_| invalid_temporal(kind, raw, line, col))?;
+    let minute = min_s
+        .parse::<u8>()
+        .map_err(|_| invalid_temporal(kind, raw, line, col))?;
+    let second = match sec_s {
+        None => 0u8,
+        Some(s) => {
+            // Optional fractional seconds.
+            let whole = s.split('.').next().unwrap_or(s);
+            if whole.len() != 2 {
+                return Err(invalid_temporal(kind, raw, line, col));
+            }
+            whole
+                .parse::<u8>()
+                .map_err(|_| invalid_temporal(kind, raw, line, col))?
+        }
+    };
+    Ok((hour, minute, second))
+}
+
+fn validate_time_components(
+    hour: u8,
+    minute: u8,
+    second: u8,
+    raw: &str,
+    line: usize,
+    col: usize,
+) -> Result<(), ParseError> {
+    // Hour 24 is valid only as end-of-day midnight (24:00:00).
+    if hour == 24 {
+        if minute != 0 || second != 0 {
+            return Err(temporal_field("hour", hour, raw, line, col));
+        }
+    } else if hour > 23 {
+        return Err(temporal_field("hour", hour, raw, line, col));
+    }
+    if minute > 59 {
+        return Err(temporal_field("minute", minute, raw, line, col));
+    }
+    if second > 60 {
+        return Err(temporal_field("second", second, raw, line, col));
+    }
+    Ok(())
+}
+
+fn validate_offset(off: &str, raw: &str, line: usize, col: usize) -> Result<(), ParseError> {
+    // ±hh:mm
+    let bytes = off.as_bytes();
+    if bytes.len() != 6 || (bytes[0] != b'+' && bytes[0] != b'-') || bytes[3] != b':' {
+        return Err(invalid_temporal("timestamp", raw, line, col));
+    }
+    let off_hour = off[1..3]
+        .parse::<u8>()
+        .map_err(|_| invalid_temporal("timestamp", raw, line, col))?;
+    let off_min = off[4..6]
+        .parse::<u8>()
+        .map_err(|_| invalid_temporal("timestamp", raw, line, col))?;
+    if off_hour > 23 || off_min > 59 {
+        return Err(ParseError::with_message(
+            ParseErrorCode::UnexpectedCharacter,
+            line,
+            col,
+            &format!("Invalid timezone offset {off} in {raw}"),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_temporal(kind: &str, raw: &str, line: usize, col: usize) -> ParseError {
+    ParseError::with_message(
+        ParseErrorCode::UnexpectedCharacter,
+        line,
+        col,
+        &format!("Invalid {kind} format: {raw}"),
+    )
+}
+
+fn temporal_field(field: &str, value: u8, raw: &str, line: usize, col: usize) -> ParseError {
+    ParseError::with_message(
+        ParseErrorCode::UnexpectedCharacter,
+        line,
+        col,
+        &format!("Invalid {field} {value} in {raw}"),
+    )
+}
+
 fn days_in_month(year: i32, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,

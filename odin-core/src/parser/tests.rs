@@ -703,3 +703,266 @@ fn bare_literal_block_captured_as_literal_body() {
     assert_eq!(d.get_string("HDR._literalBody"), Some("\nHDR|${@x}\n"));
     assert_eq!(d.get_string("HDR._literal"), Some("true"));
 }
+
+// ─── Timestamp Component Validation ──────────────────────────────────────────
+
+use crate::OdinValue;
+
+fn ts_raw(d: &crate::OdinDocument, path: &str) -> String {
+    match d.get(path).unwrap() {
+        OdinValue::Timestamp { raw, .. } => raw.clone(),
+        other => panic!("expected timestamp, got {other:?}"),
+    }
+}
+
+fn time_value(d: &crate::OdinDocument, path: &str) -> String {
+    match d.get(path).unwrap() {
+        OdinValue::Time { value, .. } => value.clone(),
+        other => panic!("expected time, got {other:?}"),
+    }
+}
+
+#[test]
+fn timestamp_valid_components() {
+    let d = Odin::parse("ts = 2024-06-15T23:59:59Z").unwrap();
+    assert_eq!(ts_raw(&d, "ts"), "2024-06-15T23:59:59Z");
+}
+
+#[test]
+fn timestamp_with_positive_offset() {
+    let d = Odin::parse("ts = 2024-06-15T10:30:00+05:30").unwrap();
+    assert_eq!(ts_raw(&d, "ts"), "2024-06-15T10:30:00+05:30");
+}
+
+#[test]
+fn timestamp_with_negative_offset() {
+    let d = Odin::parse("ts = 2024-06-15T10:30:00-08:00").unwrap();
+    assert_eq!(ts_raw(&d, "ts"), "2024-06-15T10:30:00-08:00");
+}
+
+#[test]
+fn timestamp_with_milliseconds() {
+    let d = Odin::parse("ts = 2024-06-15T10:30:00.123Z").unwrap();
+    assert_eq!(ts_raw(&d, "ts"), "2024-06-15T10:30:00.123Z");
+}
+
+#[test]
+fn timestamp_zero_offset() {
+    let d = Odin::parse("ts = 2024-06-15T10:30:00+00:00").unwrap();
+    assert_eq!(ts_raw(&d, "ts"), "2024-06-15T10:30:00+00:00");
+}
+
+#[test]
+fn timestamp_no_seconds() {
+    let d = Odin::parse("ts = 2024-06-15T10:30Z").unwrap();
+    assert_eq!(ts_raw(&d, "ts"), "2024-06-15T10:30Z");
+}
+
+#[test]
+fn timestamp_leap_second_allowed() {
+    let d = Odin::parse("ts = 2016-12-31T23:59:60Z").unwrap();
+    assert_eq!(ts_raw(&d, "ts"), "2016-12-31T23:59:60Z");
+}
+
+#[test]
+fn timestamp_bad_date_portion_errors() {
+    assert_eq!(Odin::parse("ts = 2024-13-40T10:30:00Z").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn timestamp_bad_hour_errors() {
+    assert_eq!(Odin::parse("ts = 2024-06-15T25:30:00Z").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn timestamp_bad_minute_errors() {
+    assert_eq!(Odin::parse("ts = 2024-06-15T10:61:00Z").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn timestamp_bad_second_errors() {
+    assert_eq!(Odin::parse("ts = 2024-06-15T10:30:61Z").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn timestamp_bad_offset_errors() {
+    assert_eq!(Odin::parse("ts = 2024-06-15T10:30:00+25:00").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn timestamp_bad_offset_minute_errors() {
+    assert_eq!(Odin::parse("ts = 2024-06-15T10:30:00+05:99").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn timestamp_fully_malformed_errors() {
+    assert_eq!(Odin::parse("ts = 2024-13-40T99:99:99Z").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn timestamp_raises_p001_explicit() {
+    let err = Odin::parse("ts = 2024-06-15T25:00:00Z").unwrap_err();
+    assert_eq!(err.error_code.code(), "P001");
+}
+
+// ─── Time Component Validation ───────────────────────────────────────────────
+
+#[test]
+fn time_valid() {
+    let d = Odin::parse("t = T14:30:00").unwrap();
+    assert_eq!(time_value(&d, "t"), "T14:30:00");
+}
+
+#[test]
+fn time_valid_no_seconds() {
+    let d = Odin::parse("t = T14:30").unwrap();
+    assert_eq!(time_value(&d, "t"), "T14:30");
+}
+
+#[test]
+fn time_with_fractional_seconds() {
+    let d = Odin::parse("t = T14:30:00.123").unwrap();
+    assert_eq!(time_value(&d, "t"), "T14:30:00.123");
+}
+
+#[test]
+fn time_leap_second_allowed() {
+    let d = Odin::parse("t = T23:59:60").unwrap();
+    assert_eq!(time_value(&d, "t"), "T23:59:60");
+}
+
+#[test]
+fn time_end_of_day_midnight_allowed() {
+    let d = Odin::parse("t = T24:00:00").unwrap();
+    assert_eq!(time_value(&d, "t"), "T24:00:00");
+}
+
+#[test]
+fn time_bad_hour_errors() {
+    assert_eq!(Odin::parse("t = T25:00:00").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn time_hour_24_nonzero_minutes_errors() {
+    assert_eq!(Odin::parse("t = T24:30:00").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn time_hour_24_nonzero_seconds_errors() {
+    assert_eq!(Odin::parse("t = T24:00:30").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn time_bad_minute_errors() {
+    assert_eq!(Odin::parse("t = T14:61:00").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn time_bad_second_errors() {
+    assert_eq!(Odin::parse("t = T14:30:61").unwrap_err().code(), "P001");
+}
+
+#[test]
+fn time_raises_p001_explicit() {
+    let err = Odin::parse("t = T25:00:00").unwrap_err();
+    assert_eq!(err.error_code.code(), "P001");
+}
+
+// ─── Chain Overlay (current-state) ───────────────────────────────────────────
+
+fn cc_str(d: &crate::OdinDocument, path: &str) -> Option<String> {
+    d.get(path).map(|v| match v {
+        OdinValue::String { value, .. } => value.clone(),
+        other => format!("{other:?}"),
+    })
+}
+
+#[test]
+fn overlay_replaces_repeated_path() {
+    let d = Odin::collapse_chain("{p}\nname = \"A\"\n\n---\n\n{p}\nname = \"B\"").unwrap();
+    assert_eq!(cc_str(&d, "p.name").as_deref(), Some("B"));
+}
+
+#[test]
+fn overlay_keeps_untouched_paths() {
+    let d = Odin::collapse_chain("{p}\nname = \"A\"\nkeep = \"x\"\n\n---\n\n{p}\nname = \"B\"").unwrap();
+    assert_eq!(cc_str(&d, "p.keep").as_deref(), Some("x"));
+    assert_eq!(cc_str(&d, "p.name").as_deref(), Some("B"));
+}
+
+#[test]
+fn overlay_adds_new_paths() {
+    let d = Odin::collapse_chain("{p}\nname = \"A\"\n\n---\n\n{p}\nextra = \"new\"").unwrap();
+    assert_eq!(cc_str(&d, "p.extra").as_deref(), Some("new"));
+}
+
+#[test]
+fn overlay_null_removes_field() {
+    let d = Odin::collapse_chain("{p}\nname = \"A\"\nold = \"gone\"\n\n---\n\n{p}\nold = ~").unwrap();
+    assert!(d.get("p.old").is_none());
+    assert_eq!(cc_str(&d, "p.name").as_deref(), Some("A"));
+}
+
+#[test]
+fn overlay_null_removes_subtree() {
+    let d = Odin::collapse_chain("{p}\na.b = \"x\"\na.c = \"y\"\nkeep = \"z\"\n\n---\n\n{p}\na = ~").unwrap();
+    assert!(d.get("p.a.b").is_none());
+    assert!(d.get("p.a.c").is_none());
+    assert_eq!(cc_str(&d, "p.keep").as_deref(), Some("z"));
+}
+
+#[test]
+fn overlay_reassign_after_removal() {
+    let d = Odin::collapse_chain("{p}\nx = \"old\"\n\n---\n\n{p}\nx = ~\n\n---\n\n{p}\nx = \"new\"").unwrap();
+    assert_eq!(cc_str(&d, "p.x").as_deref(), Some("new"));
+}
+
+#[test]
+fn overlay_array_clear() {
+    let d = Odin::collapse_chain(
+        "{p}\ntags[0] = \"x\"\ntags[1] = \"y\"\nkeep = \"z\"\n\n---\n\n{p}\ntags[] = ~",
+    )
+    .unwrap();
+    assert!(d.get("p.tags[0]").is_none());
+    assert!(d.get("p.tags[1]").is_none());
+    assert_eq!(cc_str(&d, "p.keep").as_deref(), Some("z"));
+}
+
+#[test]
+fn overlay_array_repopulate_after_clear() {
+    let d = Odin::collapse_chain(
+        "{p}\ntags[0] = \"x\"\n\n---\n\n{p}\ntags[] = ~\n\n---\n\n{p}\ntags[0] = \"fresh\"",
+    )
+    .unwrap();
+    assert_eq!(cc_str(&d, "p.tags[0]").as_deref(), Some("fresh"));
+}
+
+#[test]
+fn overlay_metadata_isolation() {
+    let d = Odin::collapse_chain(
+        "{$}\nid = \"first\"\nrole = \"base\"\n\n{p}\nn = \"A\"\n\n---\n\n{$}\nid = \"second\"\n\n{p}\nn = \"B\"",
+    )
+    .unwrap();
+    assert_eq!(cc_str(&d, "$.id").as_deref(), Some("second"));
+    assert!(d.get("$.role").is_none());
+    assert_eq!(cc_str(&d, "p.n").as_deref(), Some("B"));
+}
+
+#[test]
+fn overlay_three_document_chain() {
+    let d = Odin::collapse_chain("{p}\nv = \"1\"\n\n---\n\n{p}\nv = \"2\"\n\n---\n\n{p}\nv = \"3\"").unwrap();
+    assert_eq!(cc_str(&d, "p.v").as_deref(), Some("3"));
+}
+
+#[test]
+fn overlay_single_document_passthrough() {
+    let d = Odin::collapse_chain("{p}\nv = \"1\"").unwrap();
+    assert_eq!(cc_str(&d, "p.v").as_deref(), Some("1"));
+}
+
+#[test]
+fn overlay_accepts_preparsed_documents() {
+    let docs = Odin::parse_documents("{p}\nv = \"1\"\n\n---\n\n{p}\nv = \"2\"").unwrap();
+    let d = Odin::collapse_documents(&docs);
+    assert_eq!(cc_str(&d, "p.v").as_deref(), Some("2"));
+}

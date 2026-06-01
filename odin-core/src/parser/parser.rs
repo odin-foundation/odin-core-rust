@@ -1706,6 +1706,9 @@ impl<'a> Parser<'a> {
         }
         let raw = &self.source[start..self.pos];
         if raw.contains('T') {
+            if let Err(e) = super::parse_values::validate_timestamp_value(raw, line, col) {
+                return ValueStep::Err(e);
+            }
             ValueStep::Ok(OdinValues::timestamp(0, raw))
         } else {
             match super::parse_values::parse_date_value(raw, line, col) {
@@ -1715,7 +1718,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_time(&mut self, _line: usize, _col: usize) -> ValueStep {
+    fn parse_time(&mut self, line: usize, col: usize) -> ValueStep {
         let start = self.pos;
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
@@ -1724,6 +1727,9 @@ impl<'a> Parser<'a> {
             }
         }
         let raw = &self.source[start..self.pos];
+        if let Err(e) = super::parse_values::validate_time_value(raw, line, col) {
+            return ValueStep::Err(e);
+        }
         ValueStep::Ok(OdinValues::time(raw))
     }
 

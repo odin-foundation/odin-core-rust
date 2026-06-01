@@ -220,6 +220,67 @@ impl Odin {
         parser::parse_documents(input, None)
     }
 
+    /// Collapse chained ODIN text into its computed current state.
+    ///
+    /// Applies overlay semantics across the chain: later documents overlay
+    /// earlier ones, a repeated path replaces the earlier value, `field = ~`
+    /// removes the field and its descendants, and `field[] = ~` clears the
+    /// array. The result carries the final document's metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the input is not valid ODIN.
+    pub fn collapse_chain(input: &str) -> Result<OdinDocument, ParseError> {
+        let docs = parser::parse_documents(input, None)?;
+        Ok(Self::collapse_documents(&docs))
+    }
+
+    /// Collapse a pre-parsed chain of documents into its current state.
+    ///
+    /// See [`Odin::collapse_chain`] for overlay semantics.
+    pub fn collapse_documents(docs: &[OdinDocument]) -> OdinDocument {
+        let mut assignments: OrderedMap<String, OdinValue> = OrderedMap::new();
+        let mut modifiers: OrderedMap<String, OdinModifiers> = OrderedMap::new();
+        let mut metadata: OrderedMap<String, OdinValue> = OrderedMap::new();
+
+        for doc in docs {
+            metadata = doc.metadata.clone();
+
+            for path in doc.paths().into_iter().cloned().collect::<Vec<_>>() {
+                let Some(value) = doc.get(&path) else { continue };
+
+                if value.is_null() {
+                    if let Some(array_path) = path.strip_suffix("[]") {
+                        collapse_clear_array(&mut assignments, &mut modifiers, array_path);
+                    } else {
+                        collapse_remove_path(&mut assignments, &mut modifiers, &path);
+                    }
+                    continue;
+                }
+
+                assignments.insert(path.clone(), value.clone());
+                match doc.modifiers.get(&path) {
+                    Some(mods) => {
+                        modifiers.insert(path.clone(), mods.clone());
+                    }
+                    None => {
+                        modifiers.remove(&path);
+                    }
+                }
+            }
+        }
+
+        OdinDocument {
+            metadata,
+            assignments,
+            modifiers,
+            imports: Vec::new(),
+            schemas: Vec::new(),
+            conditionals: Vec::new(),
+            comments: Vec::new(),
+        }
+    }
+
     /// Create a new document builder.
     pub fn builder() -> OdinDocumentBuilder {
         OdinDocumentBuilder::new()
@@ -380,6 +441,47 @@ impl Odin {
     /// Each field is placed at a specific position with a specific length.
     pub fn to_fixed_width(doc: &OdinDocument, options: &FixedWidthExportOptions) -> String {
         export::odin_doc_to_fixed_width(doc, options)
+    }
+}
+
+/// Remove a path and any nested descendants from the working maps.
+fn collapse_remove_path(
+    assignments: &mut OrderedMap<String, OdinValue>,
+    modifiers: &mut OrderedMap<String, OdinModifiers>,
+    path: &str,
+) {
+    let dot_prefix = format!("{path}.");
+    let bracket_prefix = format!("{path}[");
+    let to_remove: Vec<String> = assignments
+        .keys()
+        .filter(|k| {
+            k.as_str() == path
+                || k.starts_with(&dot_prefix)
+                || k.starts_with(&bracket_prefix)
+        })
+        .cloned()
+        .collect();
+    for key in to_remove {
+        assignments.remove(&key);
+        modifiers.remove(&key);
+    }
+}
+
+/// Clear all indexed elements of an array path from the working maps.
+fn collapse_clear_array(
+    assignments: &mut OrderedMap<String, OdinValue>,
+    modifiers: &mut OrderedMap<String, OdinModifiers>,
+    array_path: &str,
+) {
+    let prefix = format!("{array_path}[");
+    let to_remove: Vec<String> = assignments
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for key in to_remove {
+        assignments.remove(&key);
+        modifiers.remove(&key);
     }
 }
 

@@ -33,10 +33,22 @@ struct Expected {
     documents: Option<Vec<ExpectedDocument>>,
     #[serde(default)]
     directives: Option<Vec<ExpectedDirective>>,
+    #[serde(default, rename = "currentState")]
+    current_state: Option<CurrentState>,
     #[serde(default)]
     _note: Option<String>,
     #[serde(default)]
     _computed: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CurrentState {
+    #[serde(default)]
+    assignments: std::collections::HashMap<String, ExpectedValue>,
+    #[serde(default)]
+    metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    absent: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +195,11 @@ fn run_single_test(test: &TestCase) -> TestResult {
         None => return TestResult::Skip("No expected or expectError defined".to_string()),
     };
 
+    // Computed current-state of a chain
+    if let Some(ref current_state) = expected.current_state {
+        return run_current_state_test(test, current_state);
+    }
+
     // Check if this is a multi-document test
     if let Some(ref documents) = expected.documents {
         return run_multi_document_test(test, documents, expected.directives.as_deref());
@@ -281,6 +298,59 @@ fn run_multi_document_test(
                     return TestResult::Skip(format!("Doc {}: {}", i, msg));
                 }
                 TestResult::Pass => {}
+            }
+        }
+    }
+
+    TestResult::Pass
+}
+
+fn run_current_state_test(test: &TestCase, current_state: &CurrentState) -> TestResult {
+    let current = match Odin::collapse_chain(&test.input) {
+        Ok(d) => d,
+        Err(e) => return TestResult::Fail(format!("collapse_chain failed: {}", e)),
+    };
+
+    // Check surviving assignments
+    let result = check_assignments(&current, &current_state.assignments);
+    if let TestResult::Fail(msg) = result {
+        return TestResult::Fail(msg);
+    }
+
+    // Check final-document metadata
+    if let Some(ref metadata) = current_state.metadata {
+        for (key, expected_val) in metadata {
+            let lookup = format!("$.{key}");
+            match current.get(&lookup) {
+                Some(val) => {
+                    if let Some(exp_str) = expected_val.as_str() {
+                        let actual_str = match val {
+                            OdinValue::String { value, .. } => value.clone(),
+                            OdinValue::Date { raw, .. } | OdinValue::Timestamp { raw, .. } => {
+                                raw.clone()
+                            }
+                            other => format!("{}", other),
+                        };
+                        if actual_str != exp_str {
+                            return TestResult::Fail(format!(
+                                "metadata '{}' expected \"{}\", got \"{}\"",
+                                key, exp_str, actual_str
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    return TestResult::Fail(format!("missing metadata '{}'", key));
+                }
+            }
+        }
+    }
+
+    // Check removed paths
+    if let Some(ref absent) = current_state.absent {
+        for path in absent {
+            if current.get(path).is_some() {
+                return TestResult::Fail(format!("expected '{}' to be absent", path));
             }
         }
     }
@@ -644,6 +714,16 @@ fn golden_parse_directives() {
 #[test]
 fn golden_parse_document_chaining() {
     run_test_suite("composition/document-chaining.json");
+}
+
+#[test]
+fn golden_parse_chain_overlay() {
+    run_test_suite("composition/chain-overlay.json");
+}
+
+#[test]
+fn golden_parse_temporal_validation() {
+    run_test_suite("temporal/temporal-validation.json");
 }
 
 #[test]
