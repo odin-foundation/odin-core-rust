@@ -35,7 +35,7 @@
 )]
 //! # ODIN Core
 //!
-//! Reference implementation of the ODIN (Open Data Interchange Notation) format in Rust.
+//! Implementation of the ODIN (Open Data Interchange Notation) format in Rust.
 //!
 //! ODIN is a data interchange format designed for the AI era, combining token efficiency,
 //! nesting capability, type safety, and human readability.
@@ -548,7 +548,7 @@ pub enum PathSegment<'a> {
 }
 
 impl Odin {
-    /// Build a path from typed segments (matching TS `Odin.path()`).
+    /// Build a path from typed segments.
     ///
     /// ```rust
     /// use odin_core::{Odin, PathSegment};
@@ -671,7 +671,7 @@ mod export {
     /// Convert a numeric string to a JSON value, rendering whole-number floats as integers.
     fn float_str_to_json_value(s: &str) -> serde_json::Value {
         if let Ok(f) = s.parse::<f64>() {
-            // Whole numbers render without decimal point (matching JS behavior)
+            // Whole numbers render without decimal point
             if f.fract() == 0.0 && f.is_finite() && f.abs() < 1e21 {
                 serde_json::Value::Number(serde_json::Number::from(f as i64))
             } else {
@@ -716,7 +716,7 @@ mod export {
     /// preserve ODIN type information.
     pub fn odin_doc_to_xml(doc: &OdinDocument, preserve_types: bool, preserve_modifiers: bool) -> String {
         // Modifiers imply types — emitting modifier attributes without the
-        // odin namespace would be malformed. Matches .NET/Java behavior.
+        // odin namespace would be malformed.
         let preserve_types = preserve_types || preserve_modifiers;
 
         let est = doc.assignments.len() * 96 + 160;

@@ -2,8 +2,8 @@
 //!
 //! Validates regex patterns before compilation to detect potentially unsafe patterns.
 //!
-//! Note: Rust's `regex` crate uses a Thompson NFA engine which is inherently
-//! resistant to catastrophic backtracking (unlike PCRE/JS engines). However,
+//! Note: the `regex` crate uses a Thompson NFA engine which is inherently
+//! resistant to catastrophic backtracking (unlike backtracking engines). However,
 //! we still enforce complexity limits to prevent excessive memory/time usage
 //! from large or deeply nested patterns.
 
@@ -163,7 +163,7 @@ fn count_quantifiers(pattern: &str) -> usize {
 }
 
 /// Detect nested quantifiers (e.g., `(a+)+`, `(a*)*`, `(a+b*)+`).
-/// These cause catastrophic backtracking in PCRE/JS but are safe in Rust regex.
+/// These cause catastrophic backtracking in backtracking engines but are safe with the Thompson NFA `regex` crate.
 fn detect_nested_quantifiers(pattern: &str) -> Option<String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0;

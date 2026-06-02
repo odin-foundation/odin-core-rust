@@ -1487,9 +1487,8 @@ mod tests {
 
     #[test]
     fn dense_scalar_records_serialize_without_loss() {
-        // Pure scalar columns, every row populated. The TypeScript SDK
-        // emits this as tabular; the Rust SDK emits flat assignments.
-        // Either way, every assignment must be present in the output.
+        // Pure scalar columns, every row populated, emitted as flat
+        // assignments. Every assignment must be present in the output.
         let doc = OdinDocumentBuilder::new()
             .set("rows[0].name", OdinValues::string("Alice"))
             .set("rows[0].age", OdinValues::integer(30))

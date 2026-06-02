@@ -330,8 +330,8 @@ fn qxml_parse_element_body(
         }
     }
     for (name, vals) in child_map {
-        // Always wrap <item> elements as arrays (common collection pattern),
-        // matching TS reference behavior for consistent 1-vs-N handling.
+        // Always wrap <item> elements as arrays (common collection pattern)
+        // for consistent 1-vs-N handling.
         if name == "item" {
             entries.push((name, DynValue::Array(vals)));
         } else if vals.len() == 1 {

@@ -359,7 +359,7 @@ fn value_to_json(value: &OdinValue) -> serde_compatible::JsonValue {
             JsonValue::Array(json_items)
         }
         OdinValue::Object { value, .. } => {
-            // Object values are opaque Records in TS; represent as null for now
+            // Object values are opaque records; represent as null for now
             let _ = value;
             JsonValue::Null
         }

@@ -10,7 +10,7 @@ use rustc_hash::FxBuildHasher;
 
 /// An insertion-order preserving map with O(1) key lookups.
 ///
-/// Iteration order equals insertion order (matches JavaScript `Map` semantics).
+/// Iteration order equals insertion order.
 #[derive(Clone)]
 pub struct OrderedMap<K: Clone + Eq + std::hash::Hash, V: Clone> {
     inner: IndexMap<K, V, FxBuildHasher>,
@@ -29,7 +29,7 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone + PartialEq> PartialEq for Ordere
         if self.inner.len() != other.inner.len() {
             return false;
         }
-        // Insertion-order-sensitive comparison (matches previous semantics).
+        // Insertion-order-sensitive comparison.
         self.inner
             .iter()
             .zip(other.inner.iter())

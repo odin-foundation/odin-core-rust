@@ -940,7 +940,7 @@ pub(super) fn uuid_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
     };
     let is_seeded = seed.is_some();
     let bytes = if let Some(s) = seed {
-        // Deterministic: two DJB2 hashes — matches TypeScript's exact algorithm
+        // Deterministic: two DJB2 hashes
         let mut hash1: u32 = 5381;
         let mut hash2: u32 = 52711;
         for &byte in s.as_bytes() {
@@ -951,7 +951,7 @@ pub(super) fn uuid_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
         hash1 &= 0xFFFF_FFFF;
         hash2 &= 0xFFFF_FFFF;
         let mut b = [0u8; 16];
-        // Use signed shift to match JavaScript's >> operator (sign-extending)
+        // Use signed shift (sign-extending)
         let sh1 = hash1 as i32;
         let sh2 = hash2 as i32;
         for i in 0..8 {

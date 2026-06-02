@@ -173,7 +173,7 @@ fn format_float(n: f64) -> String {
 /// Uses scientific notation for very large or very small values.
 fn format_float_raw(n: f64) -> String {
     if n.abs() >= 1e15 || (n != 0.0 && n.abs() < 1e-4) {
-        // Use scientific notation matching JS Number.toString() behavior
+        // Use scientific notation for very large/small magnitudes
         format_scientific(n)
     } else {
         let mut buf = ryu::Buffer::new();
@@ -181,14 +181,14 @@ fn format_float_raw(n: f64) -> String {
     }
 }
 
-/// Format a number in scientific notation like JS: `6.022e+23`.
+/// Format a number in scientific notation: `6.022e+23`.
 fn format_scientific(n: f64) -> String {
     if n == 0.0 {
         return "0".to_string();
     }
-    // Use Rust's built-in {:e} formatting and normalize to match JS output
+    // Use the built-in {:e} formatting and normalize the exponent sign
     let s = format!("{n:e}");
-    // Rust formats as "6.022e23", JS wants "6.022e+23"
+    // {:e} formats as "6.022e23"; emit "6.022e+23"
     if let Some(e_pos) = s.find('e') {
         let coeff = &s[..e_pos];
         let exp_str = &s[e_pos + 1..];
@@ -800,7 +800,7 @@ fn collect_expr_directives(expr: &crate::types::transform::FieldExpression, dirs
 /// for per-field positioning (`:pos`, `:len`, `:leftPad`, `:rightPad`).
 ///
 /// This is the export-mode formatter that builds positional output from transform
-/// segment definitions, matching the TypeScript `formatFixedWidthLine()`.
+/// segment definitions.
 pub fn format_fixed_width_from_segments(
     output: &DynValue,
     segments: &[&crate::types::transform::TransformSegment],
@@ -1870,7 +1870,7 @@ fn write_odin_section_with_mods(
             }
         }
         // Phase 2: Array subsections first, then object subsections.
-        // This matches the TS formatter behavior where arrays appear before objects.
+        // Arrays appear before objects.
         for (child_key, child_val) in entries {
             if let DynValue::Array(items) = child_val {
                 write_odin_array_subsection_with_parent(output, child_key, items, Some(key));
@@ -1941,7 +1941,7 @@ fn write_odin_subsection_with_mods_inner(
         }
     }
 
-    // Phase 2: Array subsections first, then object subsections (matches TS behavior)
+    // Phase 2: Array subsections first, then object subsections
     for (child_key, child_val) in fields {
         if let DynValue::Array(items) = child_val {
             write_odin_array_subsection_with_parent(output, child_key, items, Some(full_path));
@@ -2038,7 +2038,7 @@ fn write_odin_section(output: &mut String, name: &str, fields: &[(String, DynVal
         }
     }
 
-    // Phase 2: Array subsections first, then object subsections (matches TS behavior)
+    // Phase 2: Array subsections first, then object subsections
     for (key, val) in fields {
         if let DynValue::Array(items) = val {
             write_odin_array_subsection_with_parent(output, key, items, Some(&path_buf));
@@ -3908,8 +3908,8 @@ mod extended_tests {
     // Round-trip tests for tabular emission and the ragged-sub-array fix.
     //
     // These exercise the FULL pipeline: build a DynValue, format it as ODIN
-    // text via the transform formatter, parse the text back via the Rust
-    // SDK's actual parser, and verify the resulting JSON matches what JSON
+    // text via the transform formatter, parse the text back via the
+    // actual parser, and verify the resulting JSON matches what JSON
     // would have produced from the original DynValue. Any data loss in the
     // formatter (e.g. nested arrays being silently dropped to `~`) shows up
     // here as a failed structural comparison.

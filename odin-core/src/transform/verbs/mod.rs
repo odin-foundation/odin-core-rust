@@ -1,6 +1,6 @@
 //! Verb implementations for the transform engine.
 //!
-//! Organized into 13 categories matching the TypeScript reference:
+//! Organized into 13 categories:
 //! - core: concat, upper, lower, trim, coalesce, ifNull, ifEmpty, ifElse, lookup
 //! - coercion: coerceString, coerceNumber, coerceBoolean, coerceDate, tryCoerce, toArray, toObject
 //! - logic: and, or, not, eq, ne, lt, lte, gt, gte, between, isNull, isString, typeOf, cond
@@ -626,7 +626,7 @@ fn coerce_num(v: &DynValue) -> Option<DynValue> {
     }
 }
 
-/// Coerce any `DynValue` to a string representation (matches TS toString).
+/// Coerce any `DynValue` to a string representation.
 /// Public accessor for `coerce_str` (used by engine for directive processing).
 pub fn coerce_str_pub(v: &DynValue) -> String {
     coerce_str(v)
@@ -698,7 +698,7 @@ fn verb_divide(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String
         return Ok(DynValue::Null);
     }
     let result = x / y;
-    // TS divide always returns number type (not integer)
+    // divide always returns number type (not integer)
     Ok(DynValue::Float(result))
 }
 
@@ -729,7 +729,7 @@ fn verb_round(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String>
     let places = args.get(1).and_then(super::super::types::transform::DynValue::as_i64).unwrap_or(0);
     let factor = 10_f64.powi(places as i32);
     let result = (val * factor).round() / factor;
-    // Promote to Integer when result has no fractional part (matches TypeScript behavior)
+    // Promote to Integer when result has no fractional part
     if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
         Ok(DynValue::Integer(result as i64))
     } else {
@@ -1795,7 +1795,7 @@ fn verb_format_locale_date(args: &[DynValue], _ctx: &VerbContext) -> Result<DynV
 }
 
 // =============================================================================
-// Extended tests for verb parity with TypeScript SDK
+// Extended tests for verbs
 // =============================================================================
 
 #[cfg(test)]

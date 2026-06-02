@@ -20,7 +20,7 @@ use crate::types::transform::DynValue;
 use super::VerbContext;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Simple PRNG (Mulberry32) — matches TypeScript's seeded random implementation
+// Mulberry32 seeded PRNG
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn mulberry32(seed: u32) -> impl FnMut() -> f64 {
@@ -41,7 +41,7 @@ fn time_seed() -> u32 {
 }
 
 fn string_to_seed(s: &str) -> u32 {
-    // DJB2 hash — matches TypeScript's stringToSeed: ((hash << 5) - hash + char) | 0
+    // DJB2 hash: ((hash << 5) - hash + char) | 0
     let mut hash: u32 = 0;
     for b in s.bytes() {
         hash = (hash.wrapping_shl(5).wrapping_sub(hash)).wrapping_add(u32::from(b));

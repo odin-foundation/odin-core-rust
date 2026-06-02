@@ -1465,7 +1465,7 @@ const FORMATTING_DIRECTIVE_NAMES: &[&str] = &[
 
 /// Collect formatting directives from a `FieldExpression`'s verb args.
 ///
-/// Mirrors the TypeScript `collectFormattingDirectives()` — extracts directives like
+/// Extracts directives like
 /// `:pos`, `:len`, `:leftPad`, `:rightPad` from verb arg references and returns them.
 /// The directives remain on the verb args (copy, not move) since the engine may
 /// conditionally apply them as extraction directives for raw-text source formats.
