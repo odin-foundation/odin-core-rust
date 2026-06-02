@@ -14,18 +14,19 @@
 //! An expression is parsed to an AST once and cached by its source string; each
 //! document validation evaluates the cached AST against that document's values.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::types::values::OdinValue;
 
 const EPSILON: f64 = 1e-9;
 
-/// A resolved operand value.
+/// A resolved operand value. String operands borrow from the document value or
+/// the parsed node, avoiding a clone on every evaluation.
 #[derive(Clone, Debug)]
-enum Operand {
+enum Operand<'a> {
     Number(f64),
-    Str(String),
+    Str(Cow<'a, str>),
     Bool(bool),
     Null,
 }
@@ -43,7 +44,7 @@ enum Token {
 
 /// A parsed, document-independent invariant expression node.
 #[derive(Clone, Debug)]
-enum Node {
+pub(crate) enum Node {
     Number(f64),
     Str(String),
     Bool(bool),
@@ -57,13 +58,13 @@ enum Node {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum LogicOp { And, Or }
+pub(crate) enum LogicOp { And, Or }
 
 #[derive(Clone, Copy, Debug)]
-enum CmpOp { Gt, Lt, Gte, Lte }
+pub(crate) enum CmpOp { Gt, Lt, Gte, Lte }
 
 #[derive(Clone, Copy, Debug)]
-enum MulOp { Mul, Div, Rem }
+pub(crate) enum MulOp { Mul, Div, Rem }
 
 /// Outcome of evaluating an invariant expression.
 pub struct InvariantResult {
@@ -148,29 +149,13 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, ()> {
     Ok(tokens)
 }
 
-/// A parse result: the cached AST, or `Err` for a malformed expression.
-type AstEntry = Result<Arc<Node>, ()>;
+/// A parse result: the prepared AST, or `Err` for a malformed expression.
+pub(crate) type AstEntry = Result<Arc<Node>, ()>;
 
-/// Compiled, document-independent invariant ASTs keyed by source string.
-fn ast_cache() -> &'static Mutex<HashMap<String, AstEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, AstEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Return the cached AST for an expression, parsing and caching it on first use.
-fn get_ast(expr: &str) -> AstEntry {
-    if let Ok(cache) = ast_cache().lock() {
-        if let Some(entry) = cache.get(expr) {
-            return entry.clone();
-        }
-    }
-
-    let parsed = parse_to_ast(expr).map(Arc::new);
-
-    if let Ok(mut cache) = ast_cache().lock() {
-        return cache.entry(expr.to_string()).or_insert(parsed).clone();
-    }
-    parsed
+/// Parse an invariant expression into a prepared AST, stored on the per-schema
+/// memo so evaluation needs no global lock. Returns `Err` on malformed input.
+pub(crate) fn parse_invariant(expr: &str) -> AstEntry {
+    parse_to_ast(expr).map(Arc::new)
 }
 
 /// Parse an invariant expression to an AST. Returns `Err` on malformed input.
@@ -184,23 +169,18 @@ fn parse_to_ast(expr: &str) -> Result<Node, ()> {
     Ok(ast)
 }
 
-/// Parse and evaluate an invariant expression. `resolve` returns the document
-/// value at a field name, or `None` if absent.
-///
-/// The parsed AST is cached by expression source, so re-validating documents
-/// against the same schema reuses the compiled form.
-pub fn evaluate_invariant<F>(expr: &str, resolve: F) -> Result<InvariantResult, ()>
+/// Evaluate a prepared invariant AST against a document. `resolve` returns a
+/// borrowed document value at a field name, or `None` if absent.
+pub(crate) fn evaluate_ast<'a, F>(ast: &'a Node, resolve: F) -> InvariantResult
 where
-    F: Fn(&str) -> Option<OdinValue>,
+    F: Fn(&str) -> Option<&'a OdinValue>,
 {
-    let ast = get_ast(expr)?;
-
     let mut state = EvalState {
         resolve: &resolve,
         absent_operand: false,
         null_operand: false,
     };
-    let final_val = eval_node(&ast, &mut state);
+    let final_val = eval_node(ast, &mut state);
 
     let value = if state.null_operand {
         Some(false)
@@ -210,7 +190,7 @@ where
         Some(to_bool(&final_val))
     };
 
-    Ok(InvariantResult { value, null_operand: state.null_operand })
+    InvariantResult { value, null_operand: state.null_operand }
 }
 
 struct AstParser {
@@ -363,19 +343,19 @@ impl AstParser {
 }
 
 /// Per-evaluation state tracking absent/null operands.
-struct EvalState<'a, F: Fn(&str) -> Option<OdinValue>> {
-    resolve: &'a F,
+struct EvalState<'a, 'b, F: Fn(&str) -> Option<&'a OdinValue>> {
+    resolve: &'b F,
     absent_operand: bool,
     null_operand: bool,
 }
 
-fn eval_node<F>(node: &Node, state: &mut EvalState<'_, F>) -> Operand
+fn eval_node<'a, 'b, F>(node: &'a Node, state: &mut EvalState<'a, 'b, F>) -> Operand<'a>
 where
-    F: Fn(&str) -> Option<OdinValue>,
+    F: Fn(&str) -> Option<&'a OdinValue>,
 {
     match node {
         Node::Number(n) => Operand::Number(*n),
-        Node::Str(s) => Operand::Str(s.clone()),
+        Node::Str(s) => Operand::Str(Cow::Borrowed(s.as_str())),
         Node::Bool(b) => Operand::Bool(*b),
         Node::Field(name) => match (state.resolve)(name) {
             None => {
@@ -386,7 +366,7 @@ where
                 state.null_operand = true;
                 Operand::Null
             }
-            Some(value) => operand_from_value(&value),
+            Some(value) => operand_from_value(value),
         },
         Node::Not(operand) => Operand::Bool(!to_bool(&eval_node(operand, state))),
         Node::Logic { op, left, right } => {
@@ -434,14 +414,14 @@ where
     }
 }
 
-/// Extract a comparable operand from an `OdinValue`.
-fn operand_from_value(value: &OdinValue) -> Operand {
+/// Extract a comparable operand from an `OdinValue`, borrowing string contents.
+fn operand_from_value(value: &OdinValue) -> Operand<'_> {
     match value {
         OdinValue::Number { value: v, .. }
         | OdinValue::Currency { value: v, .. }
         | OdinValue::Percent { value: v, .. } => Operand::Number(*v),
         OdinValue::Integer { value: v, .. } => Operand::Number(*v as f64),
-        OdinValue::String { value: v, .. } => Operand::Str(v.clone()),
+        OdinValue::String { value: v, .. } => Operand::Str(Cow::Borrowed(v.as_str())),
         OdinValue::Boolean { value: v, .. } => Operand::Bool(*v),
         OdinValue::Date { .. } | OdinValue::Timestamp { .. } => {
             Operand::Number(temporal_ms(value).unwrap_or(f64::NAN))

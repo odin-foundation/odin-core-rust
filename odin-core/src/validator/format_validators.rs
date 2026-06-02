@@ -5,31 +5,58 @@
 /// - `Some(Err(message))` if the value is invalid for the format
 /// - `None` if the format name is not recognized
 pub fn validate_format(value: &str, format: &str) -> Option<Result<(), String>> {
-    match format.to_ascii_lowercase().as_str() {
-        "email" => Some(validate_email(value)),
-        "url" => Some(validate_url(value)),
-        "uri" => Some(validate_uri(value)),
-        "uuid" => Some(validate_uuid(value)),
-        "ssn" => Some(validate_ssn(value)),
-        "vin" => Some(validate_vin(value)),
-        "phone" => Some(validate_phone(value)),
-        "zip" => Some(validate_zip(value)),
-        "hostname" => Some(validate_hostname(value)),
-        "ipv4" => Some(validate_ipv4(value)),
-        "ipv6" => Some(validate_ipv6(value)),
-        "datetime" | "date-time" => Some(validate_datetime(value)),
-        "creditcard" | "credit-card" => Some(validate_creditcard(value)),
-        "iban" => Some(validate_iban(value)),
-        "bic" | "swift" => Some(validate_bic(value)),
-        "routing" => Some(validate_routing(value)),
-        "cusip" => Some(validate_cusip(value)),
-        "isin" => Some(validate_isin(value)),
-        "lei" => Some(validate_lei(value)),
-        "npi" => Some(validate_npi(value)),
-        "dea" => Some(validate_dea(value)),
-        "imei" => Some(validate_imei(value)),
-        "iccid" => Some(validate_iccid(value)),
-        "date-iso" => {
+    // Allocation-free dispatch: case-insensitive compare against each name
+    // without lowercasing `format` into a heap String.
+    let eq = |name: &str| format.eq_ignore_ascii_case(name);
+
+    if eq("email") {
+        Some(validate_email(value))
+    } else if eq("url") {
+        Some(validate_url(value))
+    } else if eq("uri") {
+        Some(validate_uri(value))
+    } else if eq("uuid") {
+        Some(validate_uuid(value))
+    } else if eq("ssn") {
+        Some(validate_ssn(value))
+    } else if eq("vin") {
+        Some(validate_vin(value))
+    } else if eq("phone") {
+        Some(validate_phone(value))
+    } else if eq("zip") {
+        Some(validate_zip(value))
+    } else if eq("hostname") {
+        Some(validate_hostname(value))
+    } else if eq("ipv4") {
+        Some(validate_ipv4(value))
+    } else if eq("ipv6") {
+        Some(validate_ipv6(value))
+    } else if eq("datetime") || eq("date-time") {
+        Some(validate_datetime(value))
+    } else if eq("creditcard") || eq("credit-card") {
+        Some(validate_creditcard(value))
+    } else if eq("iban") {
+        Some(validate_iban(value))
+    } else if eq("bic") || eq("swift") {
+        Some(validate_bic(value))
+    } else if eq("routing") {
+        Some(validate_routing(value))
+    } else if eq("cusip") {
+        Some(validate_cusip(value))
+    } else if eq("isin") {
+        Some(validate_isin(value))
+    } else if eq("lei") {
+        Some(validate_lei(value))
+    } else if eq("npi") {
+        Some(validate_npi(value))
+    } else if eq("dea") {
+        Some(validate_dea(value))
+    } else if eq("imei") {
+        Some(validate_imei(value))
+    } else if eq("iccid") {
+        Some(validate_iccid(value))
+    } else if eq("date-iso") {
+        {
             let b = value.as_bytes();
             let valid = b.len() == 10
                 && b[0..4].iter().all(|c| c.is_ascii_digit())
@@ -43,13 +70,20 @@ pub fn validate_format(value: &str, format: &str) -> Option<Result<(), String>> 
                 Err(format!("Value '{}' does not match date-iso format (YYYY-MM-DD)", value))
             })
         }
-        "naic" => Some(validate_naic(value)),
-        "fein" => Some(validate_fein(value)),
-        "currency-code" => Some(validate_currency_code(value)),
-        "country-alpha2" => Some(validate_country_alpha2(value)),
-        "country-alpha3" => Some(validate_country_alpha3(value)),
-        "state-us" => Some(validate_state_us(value)),
-        _ => None,
+    } else if eq("naic") {
+        Some(validate_naic(value))
+    } else if eq("fein") {
+        Some(validate_fein(value))
+    } else if eq("currency-code") {
+        Some(validate_currency_code(value))
+    } else if eq("country-alpha2") {
+        Some(validate_country_alpha2(value))
+    } else if eq("country-alpha3") {
+        Some(validate_country_alpha3(value))
+    } else if eq("state-us") {
+        Some(validate_state_us(value))
+    } else {
+        None
     }
 }
 
@@ -198,14 +232,24 @@ fn validate_uuid(value: &str) -> Result<(), String> {
 }
 
 fn validate_ssn(value: &str) -> Result<(), String> {
-    let digits = extract_digits(value);
+    let bytes = value.as_bytes();
 
-    if digits.len() == 9 {
+    // Count digits and capture the first three, single-pass, no allocation.
+    let mut digit_count = 0usize;
+    let mut first_three = [0u8; 3];
+    for &b in bytes {
+        if b.is_ascii_digit() {
+            if digit_count < 3 {
+                first_three[digit_count] = b;
+            }
+            digit_count += 1;
+        }
+    }
+
+    if digit_count == 9 {
         // Could be ###-##-#### or #########
-        let valid_format = value.len() == 9
-            || (value.len() == 11
-                && value.as_bytes()[3] == b'-'
-                && value.as_bytes()[6] == b'-');
+        let valid_format = bytes.len() == 9
+            || (bytes.len() == 11 && bytes[3] == b'-' && bytes[6] == b'-');
         if !valid_format {
             return Err("Invalid SSN format".to_string());
         }
@@ -214,7 +258,7 @@ fn validate_ssn(value: &str) -> Result<(), String> {
     }
 
     // Area code (first 3 digits) cannot be 000
-    if digits[0] == '0' && digits[1] == '0' && digits[2] == '0' {
+    if first_three == [b'0', b'0', b'0'] {
         return Err("Invalid SSN - area code cannot be 000".to_string());
     }
 
@@ -299,32 +343,37 @@ fn validate_zip(value: &str) -> Result<(), String> {
 }
 
 fn validate_ipv4(value: &str) -> Result<(), String> {
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() != 4 {
-        return Err("Invalid IPv4 format".to_string());
+    let err = || Err("Invalid IPv4 format".to_string());
+    let mut part_count = 0usize;
+
+    for part in value.split('.') {
+        part_count += 1;
+        if part_count > 4 {
+            return err();
+        }
+        let bytes = part.as_bytes();
+        if bytes.is_empty() || bytes.len() > 3 {
+            return err();
+        }
+        // Must be all digits.
+        let mut n: u32 = 0;
+        for &b in bytes {
+            if !b.is_ascii_digit() {
+                return err();
+            }
+            n = n * 10 + u32::from(b - b'0');
+        }
+        // No leading zeros (except "0" itself).
+        if bytes.len() > 1 && bytes[0] == b'0' {
+            return err();
+        }
+        if n > 255 {
+            return err();
+        }
     }
 
-    for part in &parts {
-        if part.is_empty() || part.len() > 3 {
-            return Err("Invalid IPv4 format".to_string());
-        }
-        // Must be all digits
-        for b in part.bytes() {
-            if !b.is_ascii_digit() {
-                return Err("Invalid IPv4 format".to_string());
-            }
-        }
-        // No leading zeros (except "0" itself)
-        if part.len() > 1 && part.starts_with('0') {
-            return Err("Invalid IPv4 format".to_string());
-        }
-        let n: u32 = match part.parse() {
-            Ok(v) => v,
-            Err(_) => return Err("Invalid IPv4 format".to_string()),
-        };
-        if n > 255 {
-            return Err("Invalid IPv4 format".to_string());
-        }
+    if part_count != 4 {
+        return err();
     }
 
     Ok(())
@@ -345,40 +394,38 @@ fn validate_ipv6(value: &str) -> Result<(), String> {
         let left = &value[..first];
         let right = &value[first + 2..];
 
-        let left_groups: Vec<&str> = if left.is_empty() {
-            Vec::new()
-        } else {
-            left.split(':').collect()
-        };
-        let right_groups: Vec<&str> = if right.is_empty() {
-            Vec::new()
-        } else {
-            right.split(':').collect()
-        };
-
-        let total = left_groups.len() + right_groups.len();
-        if total > 7 {
-            return Err("Invalid IPv6 format".to_string());
-        }
-
-        for group in left_groups.iter().chain(right_groups.iter()) {
-            if !is_valid_ipv6_group(group) {
-                return Err("Invalid IPv6 format".to_string());
+        // Count and validate groups without collecting into Vecs.
+        let mut total = 0usize;
+        for side in [left, right] {
+            if side.is_empty() {
+                continue;
+            }
+            for group in side.split(':') {
+                total += 1;
+                if total > 7 {
+                    return Err("Invalid IPv6 format".to_string());
+                }
+                if !is_valid_ipv6_group(group) {
+                    return Err("Invalid IPv6 format".to_string());
+                }
             }
         }
 
         Ok(())
     } else {
         // Full notation: exactly 8 groups
-        let groups: Vec<&str> = value.split(':').collect();
-        if groups.len() != 8 {
-            return Err("Invalid IPv6 format".to_string());
-        }
-
-        for group in &groups {
+        let mut count = 0usize;
+        for group in value.split(':') {
+            count += 1;
+            if count > 8 {
+                return Err("Invalid IPv6 format".to_string());
+            }
             if !is_valid_ipv6_group(group) {
                 return Err("Invalid IPv6 format".to_string());
             }
+        }
+        if count != 8 {
+            return Err("Invalid IPv6 format".to_string());
         }
 
         Ok(())
@@ -398,32 +445,38 @@ fn is_valid_ipv6_group(group: &str) -> bool {
 }
 
 fn validate_creditcard(value: &str) -> Result<(), String> {
-    // Extract digits only (allow spaces and dashes as formatting)
-    let digits: Vec<u8> = value
-        .bytes()
-        .filter(u8::is_ascii_digit)
-        .map(|b| b - b'0')
-        .collect();
-
-    // Verify only valid characters were present
-    for b in value.bytes() {
-        if !b.is_ascii_digit() && b != b' ' && b != b'-' {
+    // Single pass: reject invalid chars, count digits, and accumulate the Luhn
+    // sum from the right by walking bytes in reverse — no digit Vec.
+    let mut digit_count = 0usize;
+    let mut sum: u32 = 0;
+    for &b in value.as_bytes().iter().rev() {
+        if b.is_ascii_digit() {
+            let mut n = u32::from(b - b'0');
+            if digit_count % 2 == 1 {
+                n *= 2;
+                if n > 9 {
+                    n -= 9;
+                }
+            }
+            sum += n;
+            digit_count += 1;
+        } else if b != b' ' && b != b'-' {
             return Err("Invalid credit card format".to_string());
         }
     }
 
-    if digits.len() < 13 || digits.len() > 19 {
+    if digit_count < 13 || digit_count > 19 {
         return Err("Invalid credit card format".to_string());
     }
 
-    // Luhn checksum
-    if !luhn_check(&digits) {
+    if sum % 10 != 0 {
         return Err("Invalid credit card checksum".to_string());
     }
 
     Ok(())
 }
 
+#[cfg(test)]
 fn luhn_check(digits: &[u8]) -> bool {
     let mut sum: u32 = 0;
     for (i, &d) in digits.iter().rev().enumerate() {
@@ -709,10 +762,6 @@ fn validate_state_us(value: &str) -> Result<(), String> {
 
 fn is_hex_digit(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || (b'A'..=b'F').contains(&b)
-}
-
-fn extract_digits(value: &str) -> Vec<char> {
-    value.chars().filter(char::is_ascii_digit).collect()
 }
 
 // ---------------------------------------------------------------------------

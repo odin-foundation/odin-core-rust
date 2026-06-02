@@ -55,6 +55,9 @@ pub(crate) struct SchemaValidationMemo {
     /// fields must be enforced per-document (the only document-dependent part of
     /// field-composition expansion). When false, `base_fields` is the final set.
     has_typeref_augmentation: bool,
+    /// Invariant expressions parsed to ASTs once, keyed by trimmed source. Lets
+    /// per-document invariant evaluation read a prepared AST with no global lock.
+    invariant_asts: HashMap<String, invariant_evaluator::AstEntry>,
 }
 
 /// The address of an optional registry, used as an identity key.
@@ -83,12 +86,26 @@ fn build_schema_memo(
             .filter(|m| !m.is_empty())
             .any(|m| lookup_type(&expanded, registry, m).is_some())
     });
+    // Parse every invariant expression once, keyed by its trimmed source.
+    let mut invariant_asts: HashMap<String, invariant_evaluator::AstEntry> = HashMap::new();
+    for constraints in expanded.constraints.values() {
+        for constraint in constraints {
+            if let SchemaObjectConstraint::Invariant(expr) = constraint {
+                let trimmed = expr.trim();
+                if !invariant_asts.contains_key(trimmed) {
+                    invariant_asts
+                        .insert(trimmed.to_string(), invariant_evaluator::parse_invariant(trimmed));
+                }
+            }
+        }
+    }
     SchemaValidationMemo {
         registry_addr: registry_addr(registry),
         type_ref_errors,
         definition_errors,
         base_fields,
         has_typeref_augmentation,
+        invariant_asts,
         expanded,
     }
 }
@@ -207,7 +224,7 @@ pub fn validate_with_registry(
     // 4. Validate object-level constraints
     for (path, obj_constraints) in &schema.constraints {
         for constraint in obj_constraints {
-            validate_object_constraint(doc, path, constraint, &mut errors);
+            validate_object_constraint(doc, path, constraint, &memo.invariant_asts, &mut errors);
             if opts.fail_fast && !errors.is_empty() {
                 return ValidationResult::invalid(errors);
             }
@@ -821,11 +838,12 @@ fn validate_object_constraint(
     doc: &OdinDocument,
     path: &str,
     constraint: &SchemaObjectConstraint,
+    invariant_asts: &HashMap<String, invariant_evaluator::AstEntry>,
     errors: &mut Vec<ValidationError>,
 ) {
     match constraint {
         SchemaObjectConstraint::Invariant(expr) => {
-            validate_invariant(doc, path, expr, errors);
+            validate_invariant(doc, path, expr, invariant_asts, errors);
         }
         SchemaObjectConstraint::Cardinality { fields, min, max } => {
             validate_cardinality(doc, path, fields, min, max, errors);
@@ -837,18 +855,14 @@ fn validate_invariant(
     doc: &OdinDocument,
     path: &str,
     expr: &str,
+    invariant_asts: &HashMap<String, invariant_evaluator::AstEntry>,
     errors: &mut Vec<ValidationError>,
 ) {
     let expr = expr.trim();
 
-    let resolve = |name: &str| -> Option<OdinValue> {
-        let full = if path.is_empty() { name.to_string() } else { format!("{path}.{name}") };
-        doc.get(&full).cloned()
-    };
-
-    let result = match invariant_evaluator::evaluate_invariant(expr, resolve) {
-        Ok(r) => r,
-        Err(()) => {
+    let ast = match invariant_asts.get(expr) {
+        Some(Ok(ast)) => ast,
+        Some(Err(())) | None => {
             errors.push(ValidationError::new(
                 ValidationErrorCode::InvariantViolation,
                 path,
@@ -857,6 +871,24 @@ fn validate_invariant(
             return;
         }
     };
+
+    // Resolve operands by borrowing from the document. A single reusable buffer
+    // builds `path.name` lookups without a per-operand allocation.
+    let lookup = std::cell::RefCell::new(String::new());
+    let resolve = |name: &str| -> Option<&OdinValue> {
+        if path.is_empty() {
+            doc.get(name)
+        } else {
+            let mut buf = lookup.borrow_mut();
+            buf.clear();
+            buf.push_str(path);
+            buf.push('.');
+            buf.push_str(name);
+            doc.get(&buf)
+        }
+    };
+
+    let result = invariant_evaluator::evaluate_ast(ast, resolve);
 
     // Absent operands: invariant does not apply.
     if result.value.is_none() && !result.null_operand {
