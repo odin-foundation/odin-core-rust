@@ -72,6 +72,7 @@ pub mod serializer;
 pub mod validator;
 pub mod transform;
 pub mod diff;
+pub mod forms;
 pub mod resolver;
 pub(crate) mod utils;
 
