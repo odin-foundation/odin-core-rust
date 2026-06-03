@@ -15272,3 +15272,195 @@ mod enforcement_gaps_tests {
         assert!(r.success);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// %expr evaluation and engine control-flow behaviors (multi-sink, lazy branches)
+// driven end-to-end through parse + execute.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod expr_and_control_flow_tests {
+    use crate::Odin;
+    use crate::transform::engine::execute;
+    use crate::types::transform::DynValue;
+
+    fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }
+    fn i(v: i64) -> DynValue { DynValue::Integer(v) }
+    fn obj(pairs: Vec<(&str, DynValue)>) -> DynValue {
+        DynValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    fn header() -> &'static str {
+        "{$}\nodin = \"1.0.0\"\ntransform = \"1.0.0\"\ndirection = \"json->json\"\ntarget.format = \"json\"\n"
+    }
+
+    fn run(body: &str, source: &DynValue) -> crate::types::transform::TransformResult {
+        let text = format!("{}\n{}", header(), body);
+        let t = Odin::parse_transform(&text).unwrap();
+        execute(&t, source)
+    }
+
+    // Read a scalar field from a named output segment.
+    fn field(r: &crate::types::transform::TransformResult, seg: &str, key: &str) -> DynValue {
+        r.output.as_ref().unwrap()
+            .get(seg).and_then(|v| v.as_object())
+            .and_then(|o| o.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+            .unwrap_or(DynValue::Null)
+    }
+
+    // Evaluate a single %expr formula and read out.r.
+    fn expr(formula: &str) -> DynValue {
+        let body = format!("{{out}}\nr = %expr \"{formula}\"");
+        let r = run(&body, &obj(vec![("seed", i(0))]));
+        assert!(r.success, "transform failed: {:?}", r.errors);
+        field(&r, "out", "r")
+    }
+
+    // ── %expr precedence / associativity ──────────────────────────────────────
+
+    #[test]
+    fn expr_multiply_before_add() {
+        assert_eq!(expr("2 + 3 * 4"), i(14));
+    }
+
+    #[test]
+    fn expr_power_right_associative() {
+        assert_eq!(expr("2^3^2"), i(512));
+    }
+
+    #[test]
+    fn expr_unary_minus_looser_than_power() {
+        assert_eq!(expr("-2^2"), i(-4));
+    }
+
+    #[test]
+    fn expr_parens_negate_base() {
+        assert_eq!(expr("(-2)^2"), i(4));
+    }
+
+    // ── %expr operators ───────────────────────────────────────────────────────
+
+    #[test]
+    fn expr_division_yields_fraction() {
+        assert_eq!(expr("1 / 2"), DynValue::Float(0.5));
+    }
+
+    #[test]
+    fn expr_modulo() {
+        assert_eq!(expr("5 % 2"), i(1));
+    }
+
+    #[test]
+    fn expr_divide_by_zero_is_null() {
+        assert_eq!(expr("1 / 0"), DynValue::Null);
+    }
+
+    // ── %expr functions ───────────────────────────────────────────────────────
+
+    #[test]
+    fn expr_abs() {
+        assert_eq!(expr("abs(-7)"), i(7));
+    }
+
+    #[test]
+    fn expr_min_plus_max() {
+        assert_eq!(expr("min(3, 5, 1) + max(3, 5, 1)"), i(6));
+    }
+
+    #[test]
+    fn expr_round_default_scale() {
+        assert_eq!(expr("round(3.7)"), i(4));
+    }
+
+    // ── %expr variables under an explicit bindings object ─────────────────────
+
+    #[test]
+    fn expr_pythagoras_with_bindings() {
+        let body = "{out}\nr = %expr \"sqrt(x^2 + y^2)\" @.v";
+        let src = obj(vec![("v", obj(vec![("x", i(3)), ("y", i(4))]))]);
+        let r = run(body, &src);
+        assert!(r.success, "transform failed: {:?}", r.errors);
+        assert_eq!(field(&r, "out", "r"), i(5));
+    }
+
+    // ── %expr compile errors surface as transform failures (T015) ─────────────
+
+    #[test]
+    fn expr_unknown_function_fails() {
+        let r = run("{out}\nr = %expr \"sin(x)\" @.v", &obj(vec![("v", obj(vec![("x", i(1))]))]));
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T015")));
+    }
+
+    #[test]
+    fn expr_unbalanced_parens_fails() {
+        let r = run("{out}\nr = %expr \"(1 + 2\"", &obj(vec![("seed", i(0))]));
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T015")));
+    }
+
+    #[test]
+    fn expr_unbound_variable_fails() {
+        let r = run("{out}\nr = %expr \"a + b\"", &obj(vec![("seed", i(0))]));
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.code.as_deref() == Some("T015")));
+    }
+
+    // ── multi-sink: two accumulators advance in one loop pass ─────────────────
+
+    #[test]
+    fn two_accumulators_advance_in_one_pass() {
+        let body = "{$accumulator}\ntotal = ##0\ntotal._persist = true\ncount = ##0\ncount._persist = true\n\n{lines[]}\n_loop = \"@items\"\namount = @.amount\n_ = %accumulate total @.amount\n_count = %accumulate count ##1\n\n{summary}\ntotal = \"@$accumulator.total\"\ncount = \"@$accumulator.count\"";
+        let src = obj(vec![("items", DynValue::Array(vec![
+            obj(vec![("amount", i(10))]),
+            obj(vec![("amount", i(20))]),
+            obj(vec![("amount", i(30))]),
+        ]))]);
+        let r = run(body, &src);
+        assert!(r.success, "transform failed: {:?}", r.errors);
+        assert_eq!(field(&r, "summary", "total"), i(60));
+        assert_eq!(field(&r, "summary", "count"), i(3));
+    }
+
+    #[test]
+    fn two_set_sinks_capture_last_values() {
+        let body = "{$accumulator}\nlastVal = ##0\nlastVal._persist = true\nlastLabel = \"\"\nlastLabel._persist = true\n\n{lines[]}\n_loop = \"@items\"\nval = @.v\n_ = %set lastVal @.v\n_label = %set lastLabel @.label\n\n{summary}\nfinalVal = \"@$accumulator.lastVal\"\nfinalLabel = \"@$accumulator.lastLabel\"";
+        let src = obj(vec![("items", DynValue::Array(vec![
+            obj(vec![("v", i(10)), ("label", s("a"))]),
+            obj(vec![("v", i(20)), ("label", s("b"))]),
+            obj(vec![("v", i(30)), ("label", s("c"))]),
+        ]))]);
+        let r = run(body, &src);
+        assert!(r.success, "transform failed: {:?}", r.errors);
+        assert_eq!(field(&r, "summary", "finalVal"), i(30));
+        assert_eq!(field(&r, "summary", "finalLabel"), s("c"));
+    }
+
+    // ── lazy control-flow: only the selected branch's side effects fire ───────
+
+    #[test]
+    fn short_circuit_eval_skips_unselected_branches() {
+        let body = "{$accumulator}\nandRhs = ##0\nandRhs._persist = true\norRhs = ##0\norRhs._persist = true\nchosen = ##0\nchosen._persist = true\nskipped = ##0\nskipped._persist = true\n\n{_eval}\n_a = %and ?false %accumulate andRhs ##1\n_b = %or ?true %accumulate orRhs ##1\n_c = %ifElse ?true %accumulate chosen ##1 %accumulate skipped ##1\n\n{out}\nandRhsRan = \"@$accumulator.andRhs\"\norRhsRan = \"@$accumulator.orRhs\"\nchosenRan = \"@$accumulator.chosen\"\nskippedRan = \"@$accumulator.skipped\"";
+        let r = run(body, &obj(vec![("seed", i(0))]));
+        assert!(r.success, "transform failed: {:?}", r.errors);
+        assert_eq!(field(&r, "out", "andRhsRan"), i(0));
+        assert_eq!(field(&r, "out", "orRhsRan"), i(0));
+        assert_eq!(field(&r, "out", "chosenRan"), i(1));
+        assert_eq!(field(&r, "out", "skippedRan"), i(0));
+    }
+
+    #[test]
+    fn coalesce_stops_at_first_non_null() {
+        let body = "{$accumulator}\nx = ##0\nx._persist = true\n\n{_eval}\n_ = %coalesce \"first\" %accumulate x ##1\n\n{out}\nran = \"@$accumulator.x\"";
+        let r = run(body, &obj(vec![("seed", i(0))]));
+        assert!(r.success, "transform failed: {:?}", r.errors);
+        assert_eq!(field(&r, "out", "ran"), i(0));
+    }
+
+    #[test]
+    fn ifelse_selects_value_branches() {
+        let r = run("{out}\nbig = %ifElse %gt ##5 ##3 \"big\" \"small\"\nsmall = %ifElse %gt ##1 ##3 \"big\" \"small\"", &obj(vec![("seed", i(0))]));
+        assert!(r.success, "transform failed: {:?}", r.errors);
+        assert_eq!(field(&r, "out", "big"), s("big"));
+        assert_eq!(field(&r, "out", "small"), s("small"));
+    }
+}

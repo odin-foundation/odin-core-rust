@@ -273,3 +273,131 @@ pub fn compile_expr(formula: &str, binding_path: Option<&str>) -> Result<VerbArg
     let tokens = tokenize(formula)?;
     Parser { tokens, pos: 0, binding_path }.parse()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verb_of(arg: &VerbArg) -> &str {
+        match arg {
+            VerbArg::Verb(c) => c.verb.as_str(),
+            _ => panic!("expected verb node, got {arg:?}"),
+        }
+    }
+    fn child<'a>(arg: &'a VerbArg, idx: usize) -> &'a VerbArg {
+        match arg {
+            VerbArg::Verb(c) => &c.args[idx],
+            _ => panic!("expected verb node, got {arg:?}"),
+        }
+    }
+
+    // ── precedence / associativity tree shape ─────────────────────────────────
+
+    #[test]
+    fn add_then_multiply_nests_multiply_inside_add() {
+        // 2 + 3 * 4 -> add(2, multiply(3, 4))
+        let tree = compile_expr("2 + 3 * 4", None).unwrap();
+        assert_eq!(verb_of(&tree), "add");
+        assert_eq!(verb_of(child(&tree, 1)), "multiply");
+    }
+
+    #[test]
+    fn power_is_right_associative() {
+        // 2^3^2 -> pow(2, pow(3, 2))
+        let tree = compile_expr("2^3^2", None).unwrap();
+        assert_eq!(verb_of(&tree), "pow");
+        assert_eq!(verb_of(child(&tree, 1)), "pow");
+    }
+
+    #[test]
+    fn unary_minus_binds_looser_than_power() {
+        // -2^2 -> negate(pow(2, 2))
+        let tree = compile_expr("-2^2", None).unwrap();
+        assert_eq!(verb_of(&tree), "negate");
+        assert_eq!(verb_of(child(&tree, 0)), "pow");
+    }
+
+    #[test]
+    fn parens_negate_base_before_power() {
+        // (-2)^2 -> pow(negate(2), 2)
+        let tree = compile_expr("(-2)^2", None).unwrap();
+        assert_eq!(verb_of(&tree), "pow");
+        assert_eq!(verb_of(child(&tree, 0)), "negate");
+    }
+
+    #[test]
+    fn operators_compile_to_their_verbs() {
+        assert_eq!(verb_of(&compile_expr("1 / 2", None).unwrap()), "divide");
+        assert_eq!(verb_of(&compile_expr("5 % 2", None).unwrap()), "mod");
+    }
+
+    #[test]
+    fn round_one_arg_supplies_default_scale() {
+        // round(3.7) gets a second literal arg of 0.
+        let tree = compile_expr("round(3.7)", None).unwrap();
+        assert_eq!(verb_of(&tree), "round");
+        match &tree {
+            VerbArg::Verb(c) => assert_eq!(c.args.len(), 2),
+            _ => panic!("expected verb"),
+        }
+    }
+
+    #[test]
+    fn whitelisted_functions_compile() {
+        assert_eq!(verb_of(&compile_expr("abs(-7)", None).unwrap()), "abs");
+        assert_eq!(verb_of(&compile_expr("sqrt(9)", None).unwrap()), "sqrt");
+        assert_eq!(verb_of(&compile_expr("min(3, 5, 1)", None).unwrap()), "minOf");
+        assert_eq!(verb_of(&compile_expr("max(3, 5, 1)", None).unwrap()), "maxOf");
+    }
+
+    // ── variables under an explicit bindings object ───────────────────────────
+
+    #[test]
+    fn variable_resolves_under_binding_path() {
+        let tree = compile_expr("x", Some("@.v")).unwrap();
+        match tree {
+            VerbArg::Reference(path, _) => assert_eq!(path, "@.v.x"),
+            other => panic!("expected reference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pythagoras_uses_bindings() {
+        let tree = compile_expr("sqrt(x^2 + y^2)", Some("@.v")).unwrap();
+        assert_eq!(verb_of(&tree), "sqrt");
+        // inner: add(pow(@.v.x, 2), pow(@.v.y, 2))
+        let inner = child(&tree, 0);
+        assert_eq!(verb_of(inner), "add");
+        let lhs = child(inner, 0);
+        assert_eq!(verb_of(lhs), "pow");
+        match child(lhs, 0) {
+            VerbArg::Reference(path, _) => assert_eq!(path, "@.v.x"),
+            other => panic!("expected reference, got {other:?}"),
+        }
+    }
+
+    // ── compile errors ────────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_function_is_error() {
+        let err = compile_expr("sin(x)", Some("@.v")).unwrap_err();
+        assert!(err.to_string().contains("unknown function"));
+    }
+
+    #[test]
+    fn unbalanced_parens_is_error() {
+        assert!(compile_expr("(1 + 2", None).is_err());
+    }
+
+    #[test]
+    fn variable_without_bindings_is_error() {
+        let err = compile_expr("a + b", None).unwrap_err();
+        assert!(err.to_string().contains("bindings object"));
+    }
+
+    #[test]
+    fn error_carries_t015_code() {
+        let err = compile_expr("(1 + 2", None).unwrap_err();
+        assert!(err.to_string().contains("T015"));
+    }
+}

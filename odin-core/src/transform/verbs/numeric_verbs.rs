@@ -5035,3 +5035,162 @@ mod extended_tests {
         assert_numeric(r, 365.0, 1e-10);
     }
 }
+
+#[cfg(test)]
+mod number_theory_and_financial_tests {
+    use super::*;
+
+    fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }
+    fn i(v: i64) -> DynValue { DynValue::Integer(v) }
+    fn d(v: &str) -> DynValue { DynValue::Date(v.to_string()) }
+    fn arr(items: Vec<DynValue>) -> DynValue { DynValue::Array(items) }
+    fn null() -> DynValue { DynValue::Null }
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<std::collections::HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<std::collections::HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<std::collections::HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
+        VerbContext {
+            source: &NULL,
+            loop_vars: LV.get_or_init(std::collections::HashMap::new),
+            accumulators: ACC.get_or_init(std::collections::HashMap::new),
+            tables: TBL.get_or_init(std::collections::HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
+        }
+    }
+
+    fn as_f64(v: &DynValue) -> f64 {
+        match v {
+            DynValue::Integer(n) => *n as f64,
+            DynValue::Float(x) | DynValue::Currency(x, _, _) | DynValue::Percent(x) => *x,
+            _ => panic!("expected numeric, got {v:?}"),
+        }
+    }
+
+    // ── gcd ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn gcd_basic() {
+        assert_eq!(gcd(&[i(12), i(18)], &ctx()).unwrap(), i(6));
+    }
+
+    #[test]
+    fn gcd_with_zero_returns_other() {
+        assert_eq!(gcd(&[i(0), i(12)], &ctx()).unwrap(), i(12));
+    }
+
+    #[test]
+    fn gcd_uses_absolute_value() {
+        assert_eq!(gcd(&[i(-12), i(18)], &ctx()).unwrap(), i(6));
+    }
+
+    #[test]
+    fn gcd_too_few_args_is_null() {
+        assert_eq!(gcd(&[i(12)], &ctx()).unwrap(), null());
+    }
+
+    // ── lcm ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn lcm_basic() {
+        assert_eq!(lcm(&[i(4), i(6)], &ctx()).unwrap(), i(12));
+    }
+
+    #[test]
+    fn lcm_with_zero_is_zero() {
+        assert_eq!(lcm(&[i(0), i(4)], &ctx()).unwrap(), i(0));
+    }
+
+    #[test]
+    fn lcm_overflow_is_null() {
+        assert_eq!(lcm(&[i(9_007_199_254_740_991), i(7)], &ctx()).unwrap(), null());
+    }
+
+    // ── factorial ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn factorial_five() {
+        assert_eq!(factorial(&[i(5)], &ctx()).unwrap(), i(120));
+    }
+
+    #[test]
+    fn factorial_zero_is_one() {
+        assert_eq!(factorial(&[i(0)], &ctx()).unwrap(), i(1));
+    }
+
+    #[test]
+    fn factorial_max_is_eighteen() {
+        assert_eq!(factorial(&[i(18)], &ctx()).unwrap(), i(6_402_373_705_728_000));
+    }
+
+    #[test]
+    fn factorial_over_range_is_null() {
+        assert_eq!(factorial(&[i(19)], &ctx()).unwrap(), null());
+    }
+
+    #[test]
+    fn factorial_negative_is_null() {
+        assert_eq!(factorial(&[i(-1)], &ctx()).unwrap(), null());
+    }
+
+    // ── xnpv ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn xnpv_dated_cash_flows() {
+        let amounts = arr(vec![
+            DynValue::Float(-1000.0), DynValue::Float(110.0), DynValue::Float(110.0),
+            DynValue::Float(110.0), DynValue::Float(1100.0),
+        ]);
+        let dates = arr(vec![d("2020-01-01"), d("2021-01-01"), d("2022-01-01"), d("2023-01-01"), d("2024-01-01")]);
+        let r = xnpv(&[DynValue::Float(0.09), amounts, dates], &ctx()).unwrap();
+        assert!((as_f64(&r) - 57.460446077146344).abs() < 1e-6, "got {r:?}");
+    }
+
+    #[test]
+    fn xnpv_length_mismatch_is_null() {
+        let amounts = arr(vec![DynValue::Float(-1000.0), DynValue::Float(110.0)]);
+        let dates = arr(vec![d("2020-01-01")]);
+        assert_eq!(xnpv(&[DynValue::Float(0.09), amounts, dates], &ctx()).unwrap(), null());
+    }
+
+    #[test]
+    fn xnpv_too_few_args_is_null() {
+        assert_eq!(xnpv(&[DynValue::Float(0.09)], &ctx()).unwrap(), null());
+    }
+
+    // ── xirr ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn xirr_dated_cash_flows() {
+        let amounts = arr(vec![
+            DynValue::Float(-1000.0), DynValue::Float(110.0), DynValue::Float(110.0),
+            DynValue::Float(110.0), DynValue::Float(1100.0),
+        ]);
+        let dates = arr(vec![d("2020-01-01"), d("2021-01-01"), d("2022-01-01"), d("2023-01-01"), d("2024-01-01")]);
+        let r = xirr(&[amounts, dates], &ctx()).unwrap();
+        assert!((as_f64(&r) - 0.10777982564924497).abs() < 1e-9, "got {r:?}");
+    }
+
+    #[test]
+    fn xirr_single_flow_is_null() {
+        let amounts = arr(vec![DynValue::Float(-1000.0)]);
+        let dates = arr(vec![d("2020-01-01")]);
+        assert_eq!(xirr(&[amounts, dates], &ctx()).unwrap(), null());
+    }
+
+    #[test]
+    fn xirr_length_mismatch_is_null() {
+        let amounts = arr(vec![DynValue::Float(-1000.0), DynValue::Float(110.0)]);
+        let dates = arr(vec![d("2020-01-01")]);
+        assert_eq!(xirr(&[amounts, dates], &ctx()).unwrap(), null());
+    }
+
+    // ── addMonths / addYears clamp ──────────────────────────────────────────
+
+    #[test]
+    fn add_months_jan31_non_leap_clamps_to_feb28() {
+        let r = add_months(&[d("2023-01-31"), i(1)], &ctx()).unwrap();
+        assert_eq!(r, s("2023-02-28"));
+    }
+}

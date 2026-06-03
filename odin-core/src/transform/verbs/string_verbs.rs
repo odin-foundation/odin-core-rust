@@ -4701,3 +4701,286 @@ mod extended_tests_2 {
         assert!(r.is_err());
     }
 }
+
+#[cfg(test)]
+mod web_encoding_markup_tests {
+    use super::*;
+
+    fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }
+    fn i(v: i64) -> DynValue { DynValue::Integer(v) }
+    fn null() -> DynValue { DynValue::Null }
+    fn arr(items: Vec<DynValue>) -> DynValue { DynValue::Array(items) }
+    fn obj(pairs: Vec<(&str, DynValue)>) -> DynValue {
+        DynValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<std::collections::HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<std::collections::HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<std::collections::HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
+        VerbContext {
+            source: &NULL,
+            loop_vars: LV.get_or_init(std::collections::HashMap::new),
+            accumulators: ACC.get_or_init(std::collections::HashMap::new),
+            tables: TBL.get_or_init(std::collections::HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
+        }
+    }
+    fn text(v: DynValue) -> String {
+        match v { DynValue::String(s) => s, other => panic!("expected string, got {other:?}") }
+    }
+
+    // ── base64urlEncode / Decode ──────────────────────────────────────────────
+
+    #[test]
+    fn base64url_encode_strips_padding_and_url_safe() {
+        let r = verb_base64url_encode(&[s("hello world?>>")], &ctx()).unwrap();
+        assert_eq!(r, s("aGVsbG8gd29ybGQ_Pj4"));
+    }
+
+    #[test]
+    fn base64url_round_trips() {
+        let enc = verb_base64url_encode(&[s("hello world?>>")], &ctx()).unwrap();
+        let dec = verb_base64url_decode(&[enc], &ctx()).unwrap();
+        assert_eq!(dec, s("hello world?>>"));
+    }
+
+    #[test]
+    fn base64url_decode_accepts_standard_padded() {
+        assert_eq!(verb_base64url_decode(&[s("SGVsbG8=")], &ctx()).unwrap(), s("Hello"));
+    }
+
+    #[test]
+    fn base64url_decode_empty() {
+        assert_eq!(verb_base64url_decode(&[s("")], &ctx()).unwrap(), s(""));
+    }
+
+    // ── hmac ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hmac_sha256_lowercase_hex() {
+        let r = verb_hmac(&[s("message"), s("secret")], &ctx()).unwrap();
+        assert_eq!(r, s("8b5f48702995c1598c573db1e21866a9b825d4a794d169d7060a03605796360b"));
+    }
+
+    #[test]
+    fn hmac_sha1_variant() {
+        let r = verb_hmac(&[s("message"), s("secret"), s("sha1")], &ctx()).unwrap();
+        assert_eq!(r, s("0caf649feee4953d87bf903ac1176c45e028df16"));
+    }
+
+    #[test]
+    fn hmac_unknown_alg_is_null() {
+        assert_eq!(verb_hmac(&[s("m"), s("k"), s("md5")], &ctx()).unwrap(), null());
+    }
+
+    #[test]
+    fn hmac_too_few_args_is_null() {
+        assert_eq!(verb_hmac(&[s("m")], &ctx()).unwrap(), null());
+    }
+
+    // ── stableStringify ───────────────────────────────────────────────────────
+
+    #[test]
+    fn stable_stringify_sorts_nested_keys() {
+        let doc = obj(vec![
+            ("b", i(2)),
+            ("a", i(1)),
+            ("nested", obj(vec![("y", i(2)), ("x", i(1))])),
+        ]);
+        let r = verb_stable_stringify(&[doc], &ctx()).unwrap();
+        assert_eq!(r, s("{\"a\":1,\"b\":2,\"nested\":{\"x\":1,\"y\":2}}"));
+    }
+
+    #[test]
+    fn stable_stringify_preserves_array_order() {
+        let r = verb_stable_stringify(&[arr(vec![i(3), i(1), i(2)])], &ctx()).unwrap();
+        assert_eq!(r, s("[3,1,2]"));
+    }
+
+    #[test]
+    fn stable_stringify_scalar() {
+        assert_eq!(verb_stable_stringify(&[i(42)], &ctx()).unwrap(), s("42"));
+    }
+
+    // ── canonicalHash ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn canonical_hash_independent_of_key_order() {
+        let a = obj(vec![("b", i(2)), ("a", i(1))]);
+        let b = obj(vec![("a", i(1)), ("b", i(2))]);
+        let ha = verb_canonical_hash(&[a], &ctx()).unwrap();
+        let hb = verb_canonical_hash(&[b], &ctx()).unwrap();
+        assert_eq!(ha, hb);
+        assert_eq!(ha, s("43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"));
+    }
+
+    // ── parseUrl ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_url_full() {
+        let r = verb_parse_url(&[s("https://example.com:8080/a/b?z=1&a=2#frag")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![
+            ("scheme", s("https")),
+            ("host", s("example.com")),
+            ("port", i(8080)),
+            ("path", s("/a/b")),
+            ("query", obj(vec![("a", s("2")), ("z", s("1"))])),
+            ("fragment", s("frag")),
+        ]));
+    }
+
+    #[test]
+    fn parse_url_null_port() {
+        let r = verb_parse_url(&[s("https://example.com/x")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![
+            ("scheme", s("https")),
+            ("host", s("example.com")),
+            ("port", null()),
+            ("path", s("/x")),
+            ("query", obj(vec![])),
+            ("fragment", s("")),
+        ]));
+    }
+
+    #[test]
+    fn parse_url_invalid_is_null() {
+        assert_eq!(verb_parse_url(&[s("not a url")], &ctx()).unwrap(), null());
+    }
+
+    // ── buildUrl ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_url_assembles_parts() {
+        let parts = obj(vec![
+            ("scheme", s("https")),
+            ("host", s("example.com")),
+            ("port", i(8080)),
+            ("path", s("/a/b")),
+            ("query", obj(vec![("z", i(1)), ("a", i(2))])),
+            ("fragment", s("frag")),
+        ]);
+        let r = verb_build_url(&[parts], &ctx()).unwrap();
+        assert_eq!(r, s("https://example.com:8080/a/b?a=2&z=1#frag"));
+    }
+
+    #[test]
+    fn build_url_missing_scheme_is_null() {
+        let bad = obj(vec![("host", s("example.com"))]);
+        assert_eq!(verb_build_url(&[bad], &ctx()).unwrap(), null());
+    }
+
+    // ── parseQuery ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_query_sorts_keys() {
+        let r = verb_parse_query(&[s("z=1&a=2")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("a", s("2")), ("z", s("1"))]));
+    }
+
+    #[test]
+    fn parse_query_strips_leading_question_mark() {
+        let r = verb_parse_query(&[s("?a=2")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("a", s("2"))]));
+    }
+
+    // ── buildQuery ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_query_sorts_keys() {
+        let params = obj(vec![("z", i(1)), ("a", i(2))]);
+        assert_eq!(verb_build_query(&[params], &ctx()).unwrap(), s("a=2&z=1"));
+    }
+
+    #[test]
+    fn build_query_skips_null() {
+        let with_null = obj(vec![("a", i(1)), ("b", null())]);
+        assert_eq!(verb_build_query(&[with_null], &ctx()).unwrap(), s("a=1"));
+    }
+
+    #[test]
+    fn build_query_non_object_is_null() {
+        assert_eq!(verb_build_query(&[s("x")], &ctx()).unwrap(), null());
+    }
+
+    // ── escapeHtml ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn escape_html_escapes_specials() {
+        let r = verb_escape_html(&[s("<p>1 & 2</p>")], &ctx()).unwrap();
+        assert_eq!(r, s("&lt;p&gt;1 &amp; 2&lt;/p&gt;"));
+    }
+
+    #[test]
+    fn escape_html_empty() {
+        assert_eq!(verb_escape_html(&[s("")], &ctx()).unwrap(), s(""));
+    }
+
+    #[test]
+    fn escape_html_apostrophe_numeric() {
+        assert_eq!(text(verb_escape_html(&[s("'")], &ctx()).unwrap()), "&#39;");
+    }
+
+    // ── escapeXml ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn escape_xml_uses_apos() {
+        let r = verb_escape_xml(&[s("x = 'a' & b")], &ctx()).unwrap();
+        assert_eq!(r, s("x = &apos;a&apos; &amp; b"));
+    }
+
+    #[test]
+    fn escape_xml_angles_and_quotes() {
+        let r = verb_escape_xml(&[s("<a href=\"u\">")], &ctx()).unwrap();
+        assert_eq!(r, s("&lt;a href=&quot;u&quot;&gt;"));
+    }
+
+    #[test]
+    fn escape_xml_plain_unchanged() {
+        assert_eq!(verb_escape_xml(&[s("no specials")], &ctx()).unwrap(), s("no specials"));
+    }
+
+    // ── unescapeHtml ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn unescape_html_named_entities() {
+        let r = verb_unescape_html(&[s("&lt;p&gt;1 &amp; 2&lt;/p&gt;")], &ctx()).unwrap();
+        assert_eq!(r, s("<p>1 & 2</p>"));
+    }
+
+    #[test]
+    fn unescape_html_numeric_refs() {
+        let r = verb_unescape_html(&[s("&#65;&#x42;")], &ctx()).unwrap();
+        assert_eq!(r, s("AB"));
+    }
+
+    // ── stripTags ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_tags_removes_tags() {
+        let r = verb_strip_tags(&[s("<p>Hello <b>world</b></p>")], &ctx()).unwrap();
+        assert_eq!(r, s("Hello world"));
+    }
+
+    #[test]
+    fn strip_tags_plain_unchanged() {
+        assert_eq!(verb_strip_tags(&[s("no tags here")], &ctx()).unwrap(), s("no tags here"));
+    }
+
+    // ── template ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn template_fills_placeholders() {
+        let data = obj(vec![("name", s("Ada")), ("age", i(36))]);
+        let r = verb_template(&[s("Hi {name}, you are {age}"), data], &ctx()).unwrap();
+        assert_eq!(r, s("Hi Ada, you are 36"));
+    }
+
+    #[test]
+    fn template_missing_key_is_empty() {
+        let data = obj(vec![("name", s("Ada")), ("age", i(36))]);
+        let r = verb_template(&[s("a{missing}b"), data], &ctx()).unwrap();
+        assert_eq!(r, s("ab"));
+    }
+}

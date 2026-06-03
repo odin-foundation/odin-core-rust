@@ -6193,3 +6193,378 @@ mod extended_tests_2 {
         assert!(compare_values(&s("42"), "eq", &i(42)));
     }
 }
+
+#[cfg(test)]
+mod object_set_verb_tests {
+    use super::*;
+
+    fn s(v: &str) -> DynValue { DynValue::String(v.to_string()) }
+    fn i(v: i64) -> DynValue { DynValue::Integer(v) }
+    fn b(v: bool) -> DynValue { DynValue::Bool(v) }
+    fn null() -> DynValue { DynValue::Null }
+    fn arr(items: Vec<DynValue>) -> DynValue { DynValue::Array(items) }
+    fn obj(pairs: Vec<(&str, DynValue)>) -> DynValue {
+        DynValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+    fn ctx() -> VerbContext<'static> {
+        static NULL: DynValue = DynValue::Null;
+        static LV: std::sync::OnceLock<std::collections::HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static ACC: std::sync::OnceLock<std::collections::HashMap<String, DynValue>> = std::sync::OnceLock::new();
+        static TBL: std::sync::OnceLock<std::collections::HashMap<String, crate::types::transform::LookupTable>> = std::sync::OnceLock::new();
+        VerbContext {
+            source: &NULL,
+            loop_vars: LV.get_or_init(std::collections::HashMap::new),
+            accumulators: ACC.get_or_init(std::collections::HashMap::new),
+            tables: TBL.get_or_init(std::collections::HashMap::new),
+            lookup_miss: std::cell::Cell::new(None),
+            overflow: std::cell::Cell::new(None),
+        }
+    }
+
+    fn rec() -> DynValue {
+        obj(vec![("name", s("Ada")), ("role", s("admin")), ("active", b(true))])
+    }
+
+    // ── pick ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pick_keeps_named_keys_in_request_order() {
+        let r = pick(&[rec(), s("name"), s("role")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("name", s("Ada")), ("role", s("admin"))]));
+    }
+
+    #[test]
+    fn pick_skips_absent_keys() {
+        let r = pick(&[rec(), s("name"), s("zzz")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("name", s("Ada"))]));
+    }
+
+    #[test]
+    fn pick_non_object_is_null() {
+        assert_eq!(pick(&[s("x"), s("name")], &ctx()).unwrap(), null());
+    }
+
+    // ── omit ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn omit_drops_named_keys() {
+        let r = omit(&[rec(), s("active")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("name", s("Ada")), ("role", s("admin"))]));
+    }
+
+    #[test]
+    fn omit_absent_key_keeps_all() {
+        let r = omit(&[rec(), s("zzz")], &ctx()).unwrap();
+        assert_eq!(r, rec());
+    }
+
+    #[test]
+    fn omit_non_object_is_null() {
+        assert_eq!(omit(&[s("x"), s("name")], &ctx()).unwrap(), null());
+    }
+
+    // ── fromEntries ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn from_entries_builds_object() {
+        let pairs = arr(vec![
+            arr(vec![s("name"), s("Ada")]),
+            arr(vec![s("role"), s("admin")]),
+        ]);
+        let r = from_entries(&[pairs], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("name", s("Ada")), ("role", s("admin"))]));
+    }
+
+    #[test]
+    fn from_entries_last_wins_on_collision() {
+        let pairs = arr(vec![
+            arr(vec![s("k"), i(1)]),
+            arr(vec![s("k"), i(2)]),
+        ]);
+        let r = from_entries(&[pairs], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("k", i(2))]));
+    }
+
+    #[test]
+    fn from_entries_non_array_is_null() {
+        assert_eq!(from_entries(&[s("x")], &ctx()).unwrap(), null());
+    }
+
+    // ── invert ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn invert_swaps_keys_and_values() {
+        let m = obj(vec![("a", s("x")), ("b", s("y"))]);
+        let r = invert(&[m], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("x", s("a")), ("y", s("b"))]));
+    }
+
+    #[test]
+    fn invert_collision_last_wins() {
+        let m = obj(vec![("a", s("same")), ("b", s("same"))]);
+        let r = invert(&[m], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("same", s("b"))]));
+    }
+
+    #[test]
+    fn invert_non_object_is_null() {
+        assert_eq!(invert(&[s("x")], &ctx()).unwrap(), null());
+    }
+
+    // ── defaults ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn defaults_object_wins_fills_missing() {
+        let src = obj(vec![("name", s("Ada"))]);
+        let def = obj(vec![("name", s("Anon")), ("role", s("guest"))]);
+        let r = defaults(&[src, def], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("name", s("Ada")), ("role", s("guest"))]));
+    }
+
+    #[test]
+    fn defaults_non_object_source_returns_fallback() {
+        let def = obj(vec![("name", s("Anon")), ("role", s("guest"))]);
+        let r = defaults(&[s("x"), def.clone()], &ctx()).unwrap();
+        assert_eq!(r, def);
+    }
+
+    // ── renameKeys ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rename_keys_renames_and_preserves_position() {
+        let src = obj(vec![("fn", s("Ada")), ("keep", s("as-is"))]);
+        let mapping = obj(vec![("fn", s("firstName"))]);
+        let r = rename_keys(&[src, mapping], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("firstName", s("Ada")), ("keep", s("as-is"))]));
+    }
+
+    #[test]
+    fn rename_keys_non_object_is_null() {
+        let mapping = obj(vec![("fn", s("firstName"))]);
+        assert_eq!(rename_keys(&[s("x"), mapping], &ctx()).unwrap(), null());
+    }
+
+    // ── compactObject ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn compact_object_drops_empties_keeps_zero_and_false() {
+        let r = obj(vec![
+            ("name", s("Ada")),
+            ("middle", null()),
+            ("nickname", s("")),
+            ("zero", i(0)),
+            ("flag", b(false)),
+        ]);
+        let out = compact_object(&[r], &ctx()).unwrap();
+        assert_eq!(out, obj(vec![("name", s("Ada")), ("zero", i(0)), ("flag", b(false))]));
+    }
+
+    #[test]
+    fn compact_object_non_object_is_null() {
+        assert_eq!(compact_object(&[s("x")], &ctx()).unwrap(), null());
+    }
+
+    // ── intersection ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn intersection_deduped_first_order() {
+        let a = arr(vec![i(1), i(2), i(2), i(3)]);
+        let bb = arr(vec![i(2), i(3), i(4)]);
+        assert_eq!(intersection(&[a, bb], &ctx()).unwrap(), arr(vec![i(2), i(3)]));
+    }
+
+    #[test]
+    fn intersection_single_common() {
+        let a = arr(vec![i(1), i(2), i(2), i(3)]);
+        let c = arr(vec![i(3), i(5)]);
+        assert_eq!(intersection(&[a, c], &ctx()).unwrap(), arr(vec![i(3)]));
+    }
+
+    // ── union ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn union_dedupes_across_both() {
+        let a = arr(vec![i(1), i(2), i(2)]);
+        let bb = arr(vec![i(2), i(3)]);
+        assert_eq!(union(&[a, bb], &ctx()).unwrap(), arr(vec![i(1), i(2), i(3)]));
+    }
+
+    #[test]
+    fn union_with_empty_yields_other() {
+        let empty = arr(vec![]);
+        let bb = arr(vec![i(2), i(3)]);
+        assert_eq!(union(&[empty, bb], &ctx()).unwrap(), arr(vec![i(2), i(3)]));
+    }
+
+    // ── difference ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn difference_first_not_in_second_deduped() {
+        let a = arr(vec![i(1), i(1), i(2), i(3)]);
+        let bb = arr(vec![i(2), i(3), i(4)]);
+        assert_eq!(difference(&[a, bb], &ctx()).unwrap(), arr(vec![i(1)]));
+    }
+
+    #[test]
+    fn difference_no_overlap_dedupes_first() {
+        let a = arr(vec![i(1), i(1), i(2), i(3)]);
+        let c = arr(vec![i(9), i(8)]);
+        assert_eq!(difference(&[a, c], &ctx()).unwrap(), arr(vec![i(1), i(2), i(3)]));
+    }
+
+    // ── symmetricDifference ───────────────────────────────────────────────────
+
+    #[test]
+    fn symmetric_difference_xor() {
+        let a = arr(vec![i(1), i(2), i(3)]);
+        let bb = arr(vec![i(2), i(3), i(4)]);
+        assert_eq!(symmetric_difference(&[a, bb], &ctx()).unwrap(), arr(vec![i(1), i(4)]));
+    }
+
+    #[test]
+    fn symmetric_difference_dedupes() {
+        let e = arr(vec![i(1), i(1), i(2)]);
+        let f = arr(vec![i(2), i(3)]);
+        assert_eq!(symmetric_difference(&[e, f], &ctx()).unwrap(), arr(vec![i(1), i(3)]));
+    }
+
+    // ── countBy ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_by_field_sorted_keys() {
+        let items = arr(vec![
+            obj(vec![("region", s("east"))]),
+            obj(vec![("region", s("west"))]),
+            obj(vec![("region", s("east"))]),
+        ]);
+        let r = count_by(&[items, s("region")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("east", i(2)), ("west", i(1))]));
+    }
+
+    #[test]
+    fn count_by_value_without_field() {
+        let tags = arr(vec![s("a"), s("b"), s("a"), s("a")]);
+        let r = count_by(&[tags], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![("a", i(3)), ("b", i(1))]));
+    }
+
+    #[test]
+    fn count_by_non_array_is_null() {
+        assert_eq!(count_by(&[s("x")], &ctx()).unwrap(), null());
+    }
+
+    // ── keyBy ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn key_by_last_wins_on_collision() {
+        let users = arr(vec![
+            obj(vec![("id", s("u1")), ("name", s("Ada"))]),
+            obj(vec![("id", s("u2")), ("name", s("Bo"))]),
+            obj(vec![("id", s("u1")), ("name", s("Ada2"))]),
+        ]);
+        let r = key_by(&[users, s("id")], &ctx()).unwrap();
+        assert_eq!(r, obj(vec![
+            ("u1", obj(vec![("id", s("u1")), ("name", s("Ada2"))])),
+            ("u2", obj(vec![("id", s("u2")), ("name", s("Bo"))])),
+        ]));
+    }
+
+    #[test]
+    fn key_by_non_array_is_null() {
+        assert_eq!(key_by(&[s("x"), s("id")], &ctx()).unwrap(), null());
+    }
+
+    // ── explode ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn explode_one_row_per_element() {
+        let orders = arr(vec![
+            obj(vec![("id", s("o1")), ("tags", arr(vec![s("red"), s("blue")]))]),
+            obj(vec![("id", s("o2")), ("tags", arr(vec![]))]),
+        ]);
+        let r = explode(&[orders, s("tags")], &ctx()).unwrap();
+        assert_eq!(r, arr(vec![
+            obj(vec![("id", s("o1")), ("tags", s("red"))]),
+            obj(vec![("id", s("o1")), ("tags", s("blue"))]),
+            obj(vec![("id", s("o2")), ("tags", arr(vec![]))]),
+        ]));
+    }
+
+    #[test]
+    fn explode_missing_field_keeps_row() {
+        let plain = arr(vec![
+            obj(vec![("id", s("p1"))]),
+            obj(vec![("id", s("p2"))]),
+        ]);
+        let r = explode(&[plain, s("tags")], &ctx()).unwrap();
+        assert_eq!(r, arr(vec![
+            obj(vec![("id", s("p1"))]),
+            obj(vec![("id", s("p2"))]),
+        ]));
+    }
+
+    // ── window ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn window_pairs() {
+        let nums = arr(vec![i(1), i(2), i(3)]);
+        let r = window(&[nums, i(2)], &ctx()).unwrap();
+        assert_eq!(r, arr(vec![
+            arr(vec![i(1), i(2)]),
+            arr(vec![i(2), i(3)]),
+        ]));
+    }
+
+    #[test]
+    fn window_size_one() {
+        let nums = arr(vec![i(1), i(2), i(3)]);
+        let r = window(&[nums, i(1)], &ctx()).unwrap();
+        assert_eq!(r, arr(vec![arr(vec![i(1)]), arr(vec![i(2)]), arr(vec![i(3)])]));
+    }
+
+    #[test]
+    fn window_larger_than_array_is_empty() {
+        let nums = arr(vec![i(1), i(2)]);
+        assert_eq!(window(&[nums, i(5)], &ctx()).unwrap(), arr(vec![]));
+    }
+
+    // ── countIf / sumIf / avgIf ───────────────────────────────────────────────
+
+    fn orders() -> DynValue {
+        arr(vec![
+            obj(vec![("status", s("paid")), ("amount", i(100))]),
+            obj(vec![("status", s("open")), ("amount", i(200))]),
+            obj(vec![("status", s("paid")), ("amount", i(300))]),
+        ])
+    }
+
+    #[test]
+    fn count_if_matches() {
+        assert_eq!(count_if(&[orders(), s("status"), s("="), s("paid")], &ctx()).unwrap(), i(2));
+    }
+
+    #[test]
+    fn count_if_no_match_is_zero() {
+        assert_eq!(count_if(&[orders(), s("status"), s("="), s("void")], &ctx()).unwrap(), i(0));
+    }
+
+    #[test]
+    fn sum_if_sums_named_field() {
+        assert_eq!(sum_if(&[orders(), s("status"), s("="), s("paid"), s("amount")], &ctx()).unwrap(), i(400));
+    }
+
+    #[test]
+    fn sum_if_no_match_is_zero() {
+        assert_eq!(sum_if(&[orders(), s("status"), s("="), s("void"), s("amount")], &ctx()).unwrap(), i(0));
+    }
+
+    #[test]
+    fn avg_if_averages_named_field() {
+        assert_eq!(avg_if(&[orders(), s("status"), s("="), s("paid"), s("amount")], &ctx()).unwrap(), i(200));
+    }
+
+    #[test]
+    fn avg_if_no_match_is_null() {
+        assert_eq!(avg_if(&[orders(), s("status"), s("="), s("void"), s("amount")], &ctx()).unwrap(), null());
+    }
+}
