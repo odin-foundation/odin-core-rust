@@ -214,6 +214,15 @@ fn register_builtins(builtins: &mut HashMap<String, VerbFn>) {
         builtins.insert("sha256".to_string(), string_verbs::verb_sha256);
         builtins.insert("md5".to_string(), string_verbs::verb_md5);
         builtins.insert("crc32".to_string(), string_verbs::verb_crc32);
+        builtins.insert("base64urlEncode".to_string(), string_verbs::verb_base64url_encode);
+        builtins.insert("base64urlDecode".to_string(), string_verbs::verb_base64url_decode);
+        builtins.insert("hmac".to_string(), string_verbs::verb_hmac);
+        builtins.insert("stableStringify".to_string(), string_verbs::verb_stable_stringify);
+        builtins.insert("canonicalHash".to_string(), string_verbs::verb_canonical_hash);
+        builtins.insert("parseUrl".to_string(), string_verbs::verb_parse_url);
+        builtins.insert("buildUrl".to_string(), string_verbs::verb_build_url);
+        builtins.insert("parseQuery".to_string(), string_verbs::verb_parse_query);
+        builtins.insert("buildQuery".to_string(), string_verbs::verb_build_query);
 
         // Array verbs (30)
         builtins.insert("filter".to_string(), collection_verbs::filter);
@@ -255,6 +264,25 @@ fn register_builtins(builtins: &mut HashMap<String, VerbFn>) {
         builtins.insert("has".to_string(), collection_verbs::has);
         builtins.insert("get".to_string(), collection_verbs::get_verb);
         builtins.insert("merge".to_string(), collection_verbs::merge);
+        builtins.insert("pick".to_string(), collection_verbs::pick);
+        builtins.insert("omit".to_string(), collection_verbs::omit);
+        builtins.insert("fromEntries".to_string(), collection_verbs::from_entries);
+        builtins.insert("invert".to_string(), collection_verbs::invert);
+        builtins.insert("defaults".to_string(), collection_verbs::defaults);
+        builtins.insert("renameKeys".to_string(), collection_verbs::rename_keys);
+        builtins.insert("compactObject".to_string(), collection_verbs::compact_object);
+        builtins.insert("intersection".to_string(), collection_verbs::intersection);
+        builtins.insert("union".to_string(), collection_verbs::union);
+        builtins.insert("difference".to_string(), collection_verbs::difference);
+        builtins.insert("symmetricDifference".to_string(), collection_verbs::symmetric_difference);
+        builtins.insert("countBy".to_string(), collection_verbs::count_by);
+        builtins.insert("keyBy".to_string(), collection_verbs::key_by);
+        builtins.insert("explode".to_string(), collection_verbs::explode);
+        builtins.insert("window".to_string(), collection_verbs::window);
+        builtins.insert("countIf".to_string(), collection_verbs::count_if);
+        builtins.insert("sumIf".to_string(), collection_verbs::sum_if);
+        builtins.insert("avgIf".to_string(), collection_verbs::avg_if);
+        builtins.insert("__exprError".to_string(), verb_expr_error);
 
         // Aggregation verbs (9)
         builtins.insert("accumulate".to_string(), collection_verbs::accumulate);
@@ -307,6 +335,11 @@ fn register_builtins(builtins: &mut HashMap<String, VerbFn>) {
         builtins.insert("parseInt".to_string(), numeric_verbs::parse_int);
         builtins.insert("safeDivide".to_string(), numeric_verbs::safe_divide);
         builtins.insert("formatLocaleNumber".to_string(), numeric_verbs::format_locale_number);
+        builtins.insert("gcd".to_string(), numeric_verbs::gcd);
+        builtins.insert("lcm".to_string(), numeric_verbs::lcm);
+        builtins.insert("factorial".to_string(), numeric_verbs::factorial);
+        builtins.insert("xnpv".to_string(), numeric_verbs::xnpv);
+        builtins.insert("xirr".to_string(), numeric_verbs::xirr);
 
         // DateTime verbs (26)
         builtins.insert("today".to_string(), numeric_verbs::today);
@@ -401,6 +434,11 @@ fn register_builtins(builtins: &mut HashMap<String, VerbFn>) {
         builtins.insert("pivot".to_string(), collection_verbs::pivot);
         builtins.insert("unpivot".to_string(), collection_verbs::unpivot);
         builtins.insert("formatPhone".to_string(), string_verbs::verb_format_phone);
+        builtins.insert("escapeHtml".to_string(), string_verbs::verb_escape_html);
+        builtins.insert("unescapeHtml".to_string(), string_verbs::verb_unescape_html);
+        builtins.insert("escapeXml".to_string(), string_verbs::verb_escape_xml);
+        builtins.insert("stripTags".to_string(), string_verbs::verb_strip_tags);
+        builtins.insert("template".to_string(), string_verbs::verb_template);
         builtins.insert("movingAvg".to_string(), numeric_verbs::moving_avg);
         builtins.insert("businessDays".to_string(), numeric_verbs::business_days);
         builtins.insert("nextBusinessDay".to_string(), numeric_verbs::next_business_day);
@@ -472,35 +510,34 @@ fn verb_coerce_string(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue,
     }
 }
 
+/// Surfaces a compiled `%expr` formula error (carries its `[T015] …` code).
+fn verb_expr_error(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    Err(coerce_str(args.first().unwrap_or(&DynValue::Null)))
+}
+
 fn verb_coerce_number(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::Integer(n)) => Ok(DynValue::Float(*n as f64)),
-        Some(DynValue::Float(n)) => Ok(DynValue::Float(*n)),
-        Some(DynValue::String(s)) => {
-            s.parse::<f64>()
-                .map(DynValue::Float)
-                .map_err(|_| format!("coerceNumber: cannot parse '{s}' as number"))
-        }
-        Some(DynValue::Bool(b)) => Ok(DynValue::Float(if *b { 1.0 } else { 0.0 })),
-        Some(DynValue::Null) => Ok(DynValue::Null),
-        _ => Err("coerceNumber: unsupported type".to_string()),
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(numeric_verbs::numeric_result(to_number(&args[0])))
+}
+
+fn to_boolean(v: &DynValue) -> bool {
+    match v {
+        DynValue::Bool(b) => *b,
+        DynValue::Null => false,
+        DynValue::String(s) => matches!(s.to_lowercase().as_str(), "true" | "yes" | "y" | "1"),
+        DynValue::Integer(n) => *n != 0,
+        DynValue::Float(f) | DynValue::Currency(f, _, _) | DynValue::Percent(f) => *f != 0.0,
+        DynValue::FloatRaw(s) | DynValue::CurrencyRaw(s, _, _) => s.parse::<f64>().map(|f| f != 0.0).unwrap_or(false),
+        DynValue::Date(_) | DynValue::Timestamp(_) => true,
+        DynValue::Time(s) | DynValue::Duration(s) | DynValue::Reference(s) | DynValue::Binary(s) => !s.is_empty(),
+        DynValue::Array(a) => !a.is_empty(),
+        DynValue::Object(_) => true,
     }
 }
 
 fn verb_coerce_boolean(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::Bool(b)) => Ok(DynValue::Bool(*b)),
-        Some(DynValue::String(s)) => {
-            let lower = s.trim().to_lowercase();
-            Ok(DynValue::Bool(
-                !matches!(lower.as_str(), "" | "false" | "0" | "no" | "n" | "off"),
-            ))
-        }
-        Some(DynValue::Integer(n)) => Ok(DynValue::Bool(*n != 0)),
-        Some(DynValue::Float(n)) => Ok(DynValue::Bool(*n != 0.0)),
-        Some(DynValue::Null) => Ok(DynValue::Bool(false)),
-        _ => Err("coerceBoolean: unsupported type".to_string()),
-    }
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(DynValue::Bool(to_boolean(&args[0])))
 }
 
 fn dyn_values_equal(a: &DynValue, b: &DynValue) -> bool {
@@ -626,6 +663,50 @@ fn coerce_num(v: &DynValue) -> Option<DynValue> {
     }
 }
 
+/// Coerce any value to f64. Null, unparseable strings, objects, and unknown
+/// kinds yield 0; booleans yield 0/1; arrays yield their length.
+pub(super) fn to_number(v: &DynValue) -> f64 {
+    match v {
+        DynValue::Integer(n) => *n as f64,
+        DynValue::Float(f) | DynValue::Currency(f, _, _) | DynValue::Percent(f) => *f,
+        DynValue::CurrencyRaw(s, _, _) | DynValue::FloatRaw(s) => s.parse::<f64>().unwrap_or(0.0),
+        DynValue::String(s) => parse_leading_number(s),
+        DynValue::Bool(b) => if *b { 1.0 } else { 0.0 },
+        DynValue::Array(a) => a.len() as f64,
+        DynValue::Null | DynValue::Object(_)
+        | DynValue::Reference(_) | DynValue::Binary(_)
+        | DynValue::Time(_) | DynValue::Duration(_) => 0.0,
+        DynValue::Date(s) | DynValue::Timestamp(s) => parse_leading_number(s),
+    }
+}
+
+/// Round half toward positive infinity (floor(x + 0.5)).
+pub(super) fn js_round(x: f64) -> f64 {
+    (x + 0.5).floor()
+}
+
+/// parseFloat-style: parse a leading numeric prefix, NaN -> 0.
+fn parse_leading_number(s: &str) -> f64 {
+    let t = s.trim_start();
+    let bytes = t.as_bytes();
+    let mut end = 0;
+    let mut seen_dot = false;
+    let mut seen_e = false;
+    while end < bytes.len() {
+        let c = bytes[end];
+        match c {
+            b'0'..=b'9' => {}
+            b'+' | b'-' if end == 0 => {}
+            b'+' | b'-' if end > 0 && (bytes[end - 1] | 0x20) == b'e' => {}
+            b'.' if !seen_dot && !seen_e => seen_dot = true,
+            b'e' | b'E' if !seen_e && end > 0 => seen_e = true,
+            _ => break,
+        }
+        end += 1;
+    }
+    t[..end].parse::<f64>().unwrap_or(0.0)
+}
+
 /// Coerce any `DynValue` to a string representation.
 /// Public accessor for `coerce_str` (used by engine for directive processing).
 pub fn coerce_str_pub(v: &DynValue) -> String {
@@ -653,88 +734,46 @@ fn verb_add(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
         return Err("add: requires 2 arguments".to_string());
     }
-    let a = coerce_num(&args[0]).ok_or("add: expected numeric arguments")?;
-    let b = coerce_num(&args[1]).ok_or("add: expected numeric arguments")?;
-    if let (DynValue::Integer(x), DynValue::Integer(y)) = (&a, &b) { Ok(DynValue::Integer(x + y)) } else {
-        let x = a.as_f64().unwrap_or(0.0);
-        let y = b.as_f64().unwrap_or(0.0);
-        Ok(numeric_verbs::numeric_result(x + y))
-    }
+    Ok(numeric_verbs::numeric_result(to_number(&args[0]) + to_number(&args[1])))
 }
 
 fn verb_subtract(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
         return Err("subtract: requires 2 arguments".to_string());
     }
-    let a = coerce_num(&args[0]).ok_or("subtract: expected numeric arguments")?;
-    let b = coerce_num(&args[1]).ok_or("subtract: expected numeric arguments")?;
-    if let (DynValue::Integer(x), DynValue::Integer(y)) = (&a, &b) { Ok(DynValue::Integer(x - y)) } else {
-        let x = a.as_f64().unwrap_or(0.0);
-        let y = b.as_f64().unwrap_or(0.0);
-        Ok(numeric_verbs::numeric_result(x - y))
-    }
+    Ok(numeric_verbs::numeric_result(to_number(&args[0]) - to_number(&args[1])))
 }
 
 fn verb_multiply(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
         return Err("multiply: requires 2 arguments".to_string());
     }
-    let a = coerce_num(&args[0]).ok_or("multiply: expected numeric arguments")?;
-    let b = coerce_num(&args[1]).ok_or("multiply: expected numeric arguments")?;
-    if let (DynValue::Integer(x), DynValue::Integer(y)) = (&a, &b) { Ok(DynValue::Integer(x * y)) } else {
-        let x = a.as_f64().unwrap_or(0.0);
-        let y = b.as_f64().unwrap_or(0.0);
-        Ok(numeric_verbs::numeric_result(x * y))
-    }
+    Ok(numeric_verbs::numeric_result(to_number(&args[0]) * to_number(&args[1])))
 }
 
 fn verb_divide(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
         return Err("divide: requires 2 arguments".to_string());
     }
-    let x = coerce_num(&args[0]).map_or(0.0, |v| v.as_f64().unwrap_or(0.0));
-    let y = coerce_num(&args[1]).map_or(0.0, |v| v.as_f64().unwrap_or(0.0));
+    let x = to_number(&args[0]);
+    let y = to_number(&args[1]);
     if y == 0.0 {
         return Ok(DynValue::Null);
     }
-    let result = x / y;
-    // divide always returns number type (not integer)
-    Ok(DynValue::Float(result))
+    Ok(DynValue::Float(x / y))
 }
 
 fn verb_abs(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::Integer(n)) => Ok(DynValue::Integer(n.abs())),
-        Some(DynValue::Float(n)) => Ok(DynValue::Float(n.abs())),
-        Some(DynValue::String(s)) => {
-            if let Ok(i) = s.parse::<i64>() {
-                Ok(DynValue::Integer(i.abs()))
-            } else if let Ok(f) = s.parse::<f64>() {
-                Ok(DynValue::Float(f.abs()))
-            } else {
-                Err("abs: cannot parse string as number".to_string())
-            }
-        }
-        _ => Err("abs: expected numeric argument".to_string()),
-    }
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(numeric_verbs::numeric_result(to_number(&args[0]).abs()))
 }
 
 fn verb_round(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = match args.first() {
-        Some(DynValue::Float(n)) => *n,
-        Some(DynValue::Integer(n)) => return Ok(DynValue::Integer(*n)),
-        Some(DynValue::String(s)) => s.parse::<f64>().map_err(|_| "round: cannot parse string as number".to_string())?,
-        _ => return Err("round: expected numeric argument".to_string()),
-    };
-    let places = args.get(1).and_then(super::super::types::transform::DynValue::as_i64).unwrap_or(0);
-    let factor = 10_f64.powi(places as i32);
-    let result = (val * factor).round() / factor;
-    // Promote to Integer when result has no fractional part
-    if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
-        Ok(DynValue::Integer(result as i64))
-    } else {
-        Ok(DynValue::Float(result))
-    }
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let n = to_number(&args[0]);
+    let decimals = to_number(&args[1]).floor() as i32;
+    let factor = 10_f64.powi(decimals);
+    Ok(numeric_verbs::numeric_result(js_round(n * factor) / factor))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1178,15 +1217,12 @@ fn verb_cond(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> 
 
 fn verb_assert(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.is_empty() {
-        return Err("assert: requires at least 1 argument".to_string());
+        return Ok(DynValue::Null);
     }
-    if is_truthy(&args[0]) {
+    if to_boolean(&args[0]) {
         Ok(args[0].clone())
     } else {
-        let message = args.get(1)
-            .and_then(|v| v.as_str())
-            .unwrap_or("assertion failed");
-        Err(format!("assert: {message}"))
+        Ok(DynValue::Null)
     }
 }
 
@@ -1195,42 +1231,43 @@ fn verb_assert(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn verb_coerce_integer(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::Integer(n)) => Ok(DynValue::Integer(*n)),
-        Some(DynValue::Float(n)) => Ok(DynValue::Integer(*n as i64)),
-        Some(DynValue::String(s)) => {
-            // Try parsing as integer directly first
-            if let Ok(n) = s.parse::<i64>() {
-                return Ok(DynValue::Integer(n));
-            }
-            // Try parsing as float then truncating
-            if let Ok(n) = s.parse::<f64>() {
-                return Ok(DynValue::Integer(n as i64));
-            }
-            Err(format!("coerceInteger: cannot parse '{s}' as integer"))
-        }
-        Some(DynValue::Bool(b)) => Ok(DynValue::Integer(i64::from(*b))),
-        Some(DynValue::Null) => Ok(DynValue::Null),
-        _ => Err("coerceInteger: unsupported type".to_string()),
-    }
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(DynValue::Integer(to_number(&args[0]).floor() as i64))
 }
 
 fn verb_coerce_date(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     match args.first() {
         Some(DynValue::String(s)) => {
-            // Accept YYYY-MM-DD (10 chars) or strip time portion from timestamps
-            let date_part = if s.len() >= 10 && is_valid_date_prefix(s) {
-                &s[..10]
-            } else {
-                return Err(format!("coerceDate: '{s}' is not a valid date"));
-            };
-            let month: u32 = date_part[5..7].parse().unwrap_or(0);
-            let day: u32 = date_part[8..10].parse().unwrap_or(0);
-            if (1..=12).contains(&month) && (1..=31).contains(&day) {
-                Ok(DynValue::Date(date_part.to_string()))
-            } else {
-                Err(format!("coerceDate: '{s}' is not a valid date"))
+            let t = s.trim();
+            // ISO YYYY-MM-DD (or timestamp prefix).
+            if t.len() >= 10 && is_valid_date_prefix(t) {
+                let month: u32 = t[5..7].parse().unwrap_or(0);
+                let day: u32 = t[8..10].parse().unwrap_or(0);
+                if (1..=12).contains(&month) && (1..=31).contains(&day) {
+                    return Ok(DynValue::Date(t[..10].to_string()));
+                }
             }
+            // US slash format MM/DD/YYYY.
+            let parts: Vec<&str> = t.split('/').collect();
+            if parts.len() == 3 {
+                if let (Ok(m), Ok(d), Ok(y)) =
+                    (parts[0].parse::<u32>(), parts[1].parse::<u32>(), parts[2].parse::<i32>())
+                {
+                    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                        return Ok(DynValue::Date(format!("{y:04}-{m:02}-{d:02}")));
+                    }
+                }
+            }
+            // Compact YYYYMMDD.
+            if t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit()) {
+                let y: i32 = t[0..4].parse().unwrap_or(0);
+                let m: u32 = t[4..6].parse().unwrap_or(0);
+                let d: u32 = t[6..8].parse().unwrap_or(0);
+                if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                    return Ok(DynValue::Date(format!("{y:04}-{m:02}-{d:02}")));
+                }
+            }
+            Ok(DynValue::Null)
         }
         Some(DynValue::Integer(n)) => {
             // Unix timestamp (seconds) — convert to date
@@ -1247,8 +1284,7 @@ fn verb_coerce_date(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, S
             let y = if m <= 2 { y + 1 } else { y };
             Ok(DynValue::String(format!("{y:04}-{m:02}-{d:02}")))
         }
-        Some(DynValue::Null) => Ok(DynValue::Null),
-        _ => Err("coerceDate: expected string argument".to_string()),
+        _ => Ok(DynValue::Null),
     }
 }
 
@@ -1332,13 +1368,12 @@ fn verb_to_object(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Str
                         };
                         entries.push((key, pair[1].clone()));
                     }
-                    _ => return Err("toObject: array elements must be [key, value] pairs".to_string()),
+                    _ => {}
                 }
             }
             Ok(DynValue::Object(entries))
         }
-        Some(DynValue::Null) => Ok(DynValue::Null),
-        _ => Err("toObject: expected array of [key, value] pairs".to_string()),
+        _ => Ok(DynValue::Null),
     }
 }
 
@@ -2050,13 +2085,13 @@ mod extended_tests {
     #[test] fn coerce_str_from_null() { assert_eq!(verb_coerce_string(&[null()], &ctx()).unwrap(), null()); }
 
     // --- coerceNumber ---
-    #[test] fn coerce_num_from_int() { assert_eq!(verb_coerce_number(&[i(42)], &ctx()).unwrap(), f(42.0)); }
+    #[test] fn coerce_num_from_int() { assert_eq!(verb_coerce_number(&[i(42)], &ctx()).unwrap(), i(42)); }
     #[test] fn coerce_num_from_float() { assert_eq!(verb_coerce_number(&[f(3.14)], &ctx()).unwrap(), f(3.14)); }
     #[test] fn coerce_num_from_string() { assert_eq!(verb_coerce_number(&[s("3.14")], &ctx()).unwrap(), f(3.14)); }
-    #[test] fn coerce_num_from_bool_true() { assert_eq!(verb_coerce_number(&[b(true)], &ctx()).unwrap(), f(1.0)); }
-    #[test] fn coerce_num_from_bool_false() { assert_eq!(verb_coerce_number(&[b(false)], &ctx()).unwrap(), f(0.0)); }
-    #[test] fn coerce_num_from_null() { assert_eq!(verb_coerce_number(&[null()], &ctx()).unwrap(), null()); }
-    #[test] fn coerce_num_invalid_string() { assert!(verb_coerce_number(&[s("abc")], &ctx()).is_err()); }
+    #[test] fn coerce_num_from_bool_true() { assert_eq!(verb_coerce_number(&[b(true)], &ctx()).unwrap(), i(1)); }
+    #[test] fn coerce_num_from_bool_false() { assert_eq!(verb_coerce_number(&[b(false)], &ctx()).unwrap(), i(0)); }
+    #[test] fn coerce_num_from_null() { assert_eq!(verb_coerce_number(&[null()], &ctx()).unwrap(), i(0)); }
+    #[test] fn coerce_num_invalid_string() { assert_eq!(verb_coerce_number(&[s("abc")], &ctx()).unwrap(), i(0)); }
 
     // --- coerceBoolean ---
     #[test] fn coerce_bool_from_true() { assert_eq!(verb_coerce_boolean(&[b(true)], &ctx()).unwrap(), b(true)); }
@@ -2077,13 +2112,13 @@ mod extended_tests {
     #[test] fn coerce_int_from_string() { assert_eq!(verb_coerce_integer(&[s("42")], &ctx()).unwrap(), i(42)); }
     #[test] fn coerce_int_from_string_float() { assert_eq!(verb_coerce_integer(&[s("3.9")], &ctx()).unwrap(), i(3)); }
     #[test] fn coerce_int_from_bool() { assert_eq!(verb_coerce_integer(&[b(true)], &ctx()).unwrap(), i(1)); }
-    #[test] fn coerce_int_from_null() { assert_eq!(verb_coerce_integer(&[null()], &ctx()).unwrap(), null()); }
-    #[test] fn coerce_int_invalid() { assert!(verb_coerce_integer(&[s("abc")], &ctx()).is_err()); }
+    #[test] fn coerce_int_from_null() { assert_eq!(verb_coerce_integer(&[null()], &ctx()).unwrap(), i(0)); }
+    #[test] fn coerce_int_invalid() { assert_eq!(verb_coerce_integer(&[s("abc")], &ctx()).unwrap(), i(0)); }
 
     // --- coerceDate ---
     #[test] fn coerce_date_valid() { assert_eq!(verb_coerce_date(&[s("2024-01-15")], &ctx()).unwrap(), DynValue::Date("2024-01-15".to_string())); }
     #[test] fn coerce_date_timestamp() { assert_eq!(verb_coerce_date(&[s("2024-01-15T10:30:00")], &ctx()).unwrap(), DynValue::Date("2024-01-15".to_string())); }
-    #[test] fn coerce_date_invalid() { assert!(verb_coerce_date(&[s("not-a-date")], &ctx()).is_err()); }
+    #[test] fn coerce_date_invalid() { assert_eq!(verb_coerce_date(&[s("not-a-date")], &ctx()).unwrap(), null()); }
     #[test] fn coerce_date_null() { assert_eq!(verb_coerce_date(&[null()], &ctx()).unwrap(), null()); }
 
     // --- coerceTimestamp ---
@@ -2236,11 +2271,11 @@ mod extended_tests {
     #[test] fn abs_string_num() { assert_eq!(verb_abs(&[s("-42")], &ctx()).unwrap(), i(42)); }
 
     // --- round ---
-    #[test] fn round_basic() { assert_eq!(verb_round(&[f(3.6)], &ctx()).unwrap(), i(4)); }
-    #[test] fn round_down() { assert_eq!(verb_round(&[f(3.3)], &ctx()).unwrap(), i(3)); }
-    #[test] fn round_int() { assert_eq!(verb_round(&[i(5)], &ctx()).unwrap(), i(5)); }
+    #[test] fn round_basic() { assert_eq!(verb_round(&[f(3.6), i(0)], &ctx()).unwrap(), i(4)); }
+    #[test] fn round_down() { assert_eq!(verb_round(&[f(3.3), i(0)], &ctx()).unwrap(), i(3)); }
+    #[test] fn round_int() { assert_eq!(verb_round(&[i(5), i(0)], &ctx()).unwrap(), i(5)); }
     #[test] fn round_places() { assert_eq!(verb_round(&[f(3.456), i(2)], &ctx()).unwrap(), f(3.46)); }
-    #[test] fn round_half() { assert_eq!(verb_round(&[f(2.5)], &ctx()).unwrap(), i(3)); }
+    #[test] fn round_half() { assert_eq!(verb_round(&[f(2.5), i(0)], &ctx()).unwrap(), i(3)); }
 
     // --- floor ---
     #[test] fn floor_basic() { assert_eq!(numeric_verbs::floor(&[f(3.7)], &ctx()).unwrap(), i(3)); }
@@ -2269,7 +2304,7 @@ mod extended_tests {
     #[test] fn negate_zero() { assert_eq!(numeric_verbs::negate(&[i(0)], &ctx()).unwrap(), i(0)); }
     #[test] fn negate_float() { assert_eq!(numeric_verbs::negate(&[f(3.14)], &ctx()).unwrap(), f(-3.14)); }
     #[test] fn negate_string_num() { assert_eq!(numeric_verbs::negate(&[s("42")], &ctx()).unwrap(), i(-42)); }
-    #[test] fn negate_non_numeric() { assert!(numeric_verbs::negate(&[s("abc")], &ctx()).is_err()); }
+    #[test] fn negate_non_numeric() { assert_eq!(numeric_verbs::negate(&[s("abc")], &ctx()).unwrap(), i(0)); }
 
     // --- safeDivide ---
     #[test] fn safe_divide_basic() { assert_eq!(numeric_verbs::safe_divide(&[i(10), i(2), i(0)], &ctx()).unwrap(), f(5.0)); }
@@ -2285,23 +2320,23 @@ mod extended_tests {
     #[test] fn clamp_too_few() { assert!(numeric_verbs::clamp(&[f(5.0), f(0.0)], &ctx()).is_err()); }
 
     // --- sqrt ---
-    #[test] fn sqrt_basic() { assert_eq!(numeric_verbs::sqrt(&[f(9.0)], &ctx()).unwrap(), f(3.0)); }
-    #[test] fn sqrt_zero() { assert_eq!(numeric_verbs::sqrt(&[f(0.0)], &ctx()).unwrap(), f(0.0)); }
-    #[test] fn sqrt_negative() { assert!(numeric_verbs::sqrt(&[f(-1.0)], &ctx()).is_err()); }
-    #[test] fn sqrt_one() { assert_eq!(numeric_verbs::sqrt(&[f(1.0)], &ctx()).unwrap(), f(1.0)); }
+    #[test] fn sqrt_basic() { assert_eq!(numeric_verbs::sqrt(&[f(9.0)], &ctx()).unwrap(), i(3)); }
+    #[test] fn sqrt_zero() { assert_eq!(numeric_verbs::sqrt(&[f(0.0)], &ctx()).unwrap(), i(0)); }
+    #[test] fn sqrt_negative() { assert_eq!(numeric_verbs::sqrt(&[f(-1.0)], &ctx()).unwrap(), null()); }
+    #[test] fn sqrt_one() { assert_eq!(numeric_verbs::sqrt(&[f(1.0)], &ctx()).unwrap(), i(1)); }
 
     // --- pow ---
-    #[test] fn pow_basic() { assert_eq!(numeric_verbs::pow_verb(&[f(2.0), f(3.0)], &ctx()).unwrap(), f(8.0)); }
-    #[test] fn pow_zero_exp() { assert_eq!(numeric_verbs::pow_verb(&[f(5.0), f(0.0)], &ctx()).unwrap(), f(1.0)); }
-    #[test] fn pow_one_exp() { assert_eq!(numeric_verbs::pow_verb(&[f(5.0), f(1.0)], &ctx()).unwrap(), f(5.0)); }
+    #[test] fn pow_basic() { assert_eq!(numeric_verbs::pow_verb(&[f(2.0), f(3.0)], &ctx()).unwrap(), i(8)); }
+    #[test] fn pow_zero_exp() { assert_eq!(numeric_verbs::pow_verb(&[f(5.0), f(0.0)], &ctx()).unwrap(), i(1)); }
+    #[test] fn pow_one_exp() { assert_eq!(numeric_verbs::pow_verb(&[f(5.0), f(1.0)], &ctx()).unwrap(), i(5)); }
     #[test] fn pow_negative_exp() {
         let result = numeric_verbs::pow_verb(&[f(2.0), f(-1.0)], &ctx()).unwrap();
         if let DynValue::Float(v) = result { assert!((v - 0.5).abs() < 1e-10); } else { panic!("expected float"); }
     }
-    #[test] fn pow_too_few() { assert!(numeric_verbs::pow_verb(&[f(2.0)], &ctx()).is_err()); }
+    #[test] fn pow_too_few() { assert_eq!(numeric_verbs::pow_verb(&[f(2.0)], &ctx()).unwrap(), null()); }
 
     // --- exp ---
-    #[test] fn exp_zero() { assert_eq!(numeric_verbs::exp_verb(&[f(0.0)], &ctx()).unwrap(), f(1.0)); }
+    #[test] fn exp_zero() { assert_eq!(numeric_verbs::exp_verb(&[f(0.0)], &ctx()).unwrap(), i(1)); }
     #[test] fn exp_one() {
         let result = numeric_verbs::exp_verb(&[f(1.0)], &ctx()).unwrap();
         if let DynValue::Float(v) = result { assert!((v - std::f64::consts::E).abs() < 1e-10); } else { panic!("expected float"); }
@@ -2316,9 +2351,9 @@ mod extended_tests {
         let result = numeric_verbs::log_verb(&[f(100.0), f(10.0)], &ctx()).unwrap();
         assert!((result.as_f64().unwrap() - 2.0).abs() < 1e-10);
     }
-    #[test] fn log_zero() { assert!(numeric_verbs::log_verb(&[f(0.0)], &ctx()).is_err()); }
-    #[test] fn log_negative() { assert!(numeric_verbs::log_verb(&[f(-1.0)], &ctx()).is_err()); }
-    #[test] fn log_base_one() { assert!(numeric_verbs::log_verb(&[f(5.0), f(1.0)], &ctx()).is_err()); }
+    #[test] fn log_zero() { assert_eq!(numeric_verbs::log_verb(&[f(0.0)], &ctx()).unwrap(), null()); }
+    #[test] fn log_negative() { assert_eq!(numeric_verbs::log_verb(&[f(-1.0)], &ctx()).unwrap(), null()); }
+    #[test] fn log_base_one() { assert_eq!(numeric_verbs::log_verb(&[f(5.0), f(1.0)], &ctx()).unwrap(), null()); }
 
     // --- ln ---
     #[test] fn ln_e() {
@@ -2326,7 +2361,7 @@ mod extended_tests {
         assert!((result.as_f64().unwrap() - 1.0).abs() < 1e-10);
     }
     #[test] fn ln_one() { assert_eq!(numeric_verbs::ln(&[f(1.0)], &ctx()).unwrap(), i(0)); }
-    #[test] fn ln_negative() { assert!(numeric_verbs::ln(&[f(-1.0)], &ctx()).is_err()); }
+    #[test] fn ln_negative() { assert_eq!(numeric_verbs::ln(&[f(-1.0)], &ctx()).unwrap(), null()); }
 
     // --- log10 ---
     #[test] fn log10_100() {
@@ -2334,7 +2369,7 @@ mod extended_tests {
         assert!((result.as_f64().unwrap() - 2.0).abs() < 1e-10);
     }
     #[test] fn log10_one() { assert_eq!(numeric_verbs::log10(&[f(1.0)], &ctx()).unwrap(), i(0)); }
-    #[test] fn log10_negative() { assert!(numeric_verbs::log10(&[f(-1.0)], &ctx()).is_err()); }
+    #[test] fn log10_negative() { assert_eq!(numeric_verbs::log10(&[f(-1.0)], &ctx()).unwrap(), null()); }
 
     // --- sign ---
     #[test] fn sign_positive() { assert_eq!(numeric_verbs::sign(&[f(42.0)], &ctx()).unwrap(), i(1)); }
@@ -2361,12 +2396,11 @@ mod extended_tests {
 
     // --- assert ---
     #[test] fn assert_truthy() { assert_eq!(verb_assert(&[b(true)], &ctx()).unwrap(), b(true)); }
-    #[test] fn assert_falsy() { assert!(verb_assert(&[b(false)], &ctx()).is_err()); }
+    #[test] fn assert_falsy() { assert_eq!(verb_assert(&[b(false)], &ctx()).unwrap(), null()); }
     #[test] fn assert_custom_msg() {
-        let err = verb_assert(&[b(false), s("custom error")], &ctx()).unwrap_err();
-        assert!(err.contains("custom error"));
+        assert_eq!(verb_assert(&[b(false), s("custom error")], &ctx()).unwrap(), null());
     }
-    #[test] fn assert_empty() { assert!(verb_assert(&[], &ctx()).is_err()); }
+    #[test] fn assert_empty() { assert_eq!(verb_assert(&[], &ctx()).unwrap(), null()); }
 
     // =========================================================================
     // Registry tests
@@ -2650,20 +2684,20 @@ mod extended_tests_2 {
     #[test] fn coerce_str_from_negative() { assert_eq!(verb_coerce_string(&[i(-5)], &ctx()).unwrap(), s("-5")); }
 
     // coerceNumber: string edge cases
-    #[test] fn coerce_num_from_int_string() { assert_eq!(verb_coerce_number(&[s("42")], &ctx()).unwrap(), f(42.0)); }
+    #[test] fn coerce_num_from_int_string() { assert_eq!(verb_coerce_number(&[s("42")], &ctx()).unwrap(), i(42)); }
     #[test] fn coerce_num_from_negative_string() { assert_eq!(verb_coerce_number(&[s("-3.14")], &ctx()).unwrap(), f(-3.14)); }
-    #[test] fn coerce_num_from_zero_string() { assert_eq!(verb_coerce_number(&[s("0")], &ctx()).unwrap(), f(0.0)); }
+    #[test] fn coerce_num_from_zero_string() { assert_eq!(verb_coerce_number(&[s("0")], &ctx()).unwrap(), i(0)); }
 
     // coerceBoolean: more string variants
     #[test] fn coerce_bool_n() { assert_eq!(verb_coerce_boolean(&[s("n")], &ctx()).unwrap(), b(false)); }
     #[test] fn coerce_bool_off() { assert_eq!(verb_coerce_boolean(&[s("off")], &ctx()).unwrap(), b(false)); }
-    #[test] fn coerce_bool_on() { assert_eq!(verb_coerce_boolean(&[s("on")], &ctx()).unwrap(), b(true)); }
+    #[test] fn coerce_bool_on() { assert_eq!(verb_coerce_boolean(&[s("on")], &ctx()).unwrap(), b(false)); }
     #[test] fn coerce_bool_1_string() { assert_eq!(verb_coerce_boolean(&[s("1")], &ctx()).unwrap(), b(true)); }
     #[test] fn coerce_bool_from_float_nonzero() { assert_eq!(verb_coerce_boolean(&[f(0.5)], &ctx()).unwrap(), b(true)); }
     #[test] fn coerce_bool_from_float_zero() { assert_eq!(verb_coerce_boolean(&[f(0.0)], &ctx()).unwrap(), b(false)); }
 
     // coerceInteger: edge cases
-    #[test] fn coerce_int_from_negative_float() { assert_eq!(verb_coerce_integer(&[f(-3.9)], &ctx()).unwrap(), i(-3)); }
+    #[test] fn coerce_int_from_negative_float() { assert_eq!(verb_coerce_integer(&[f(-3.9)], &ctx()).unwrap(), i(-4)); }
     #[test] fn coerce_int_from_bool_false() { assert_eq!(verb_coerce_integer(&[b(false)], &ctx()).unwrap(), i(0)); }
     #[test] fn coerce_int_from_large_float() { assert_eq!(verb_coerce_integer(&[f(1e10)], &ctx()).unwrap(), i(10_000_000_000)); }
 
@@ -2720,7 +2754,7 @@ mod extended_tests_2 {
     #[test] fn add_string_numbers() { assert_eq!(verb_add(&[s("3"), s("4")], &ctx()).unwrap(), i(7)); }
     #[test] fn add_negative() { assert_eq!(verb_add(&[i(-3), i(-4)], &ctx()).unwrap(), i(-7)); }
     #[test] fn add_zero() { assert_eq!(verb_add(&[i(0), i(0)], &ctx()).unwrap(), i(0)); }
-    #[test] fn add_non_numeric() { assert!(verb_add(&[s("abc"), i(1)], &ctx()).is_err()); }
+    #[test] fn add_non_numeric() { assert_eq!(verb_add(&[s("abc"), i(1)], &ctx()).unwrap(), i(1)); }
     #[test] fn add_too_few() { assert!(verb_add(&[i(1)], &ctx()).is_err()); }
 
     // subtract
@@ -2728,7 +2762,7 @@ mod extended_tests_2 {
     #[test] fn subtract_negative_result() { assert_eq!(verb_subtract(&[i(3), i(10)], &ctx()).unwrap(), i(-7)); }
     #[test] fn subtract_floats() { assert_eq!(verb_subtract(&[f(5.5), f(2.5)], &ctx()).unwrap(), i(3)); }
     #[test] fn subtract_too_few() { assert!(verb_subtract(&[i(1)], &ctx()).is_err()); }
-    #[test] fn subtract_non_numeric() { assert!(verb_subtract(&[s("abc"), i(1)], &ctx()).is_err()); }
+    #[test] fn subtract_non_numeric() { assert_eq!(verb_subtract(&[s("abc"), i(1)], &ctx()).unwrap(), i(-1)); }
 
     // multiply
     #[test] fn multiply_ints() { assert_eq!(verb_multiply(&[i(3), i(4)], &ctx()).unwrap(), i(12)); }
@@ -2736,7 +2770,7 @@ mod extended_tests_2 {
     #[test] fn multiply_negative() { assert_eq!(verb_multiply(&[i(-3), i(4)], &ctx()).unwrap(), i(-12)); }
     #[test] fn multiply_floats() { assert_eq!(verb_multiply(&[f(2.5), f(4.0)], &ctx()).unwrap(), i(10)); }
     #[test] fn multiply_too_few() { assert!(verb_multiply(&[i(1)], &ctx()).is_err()); }
-    #[test] fn multiply_non_numeric() { assert!(verb_multiply(&[s("abc"), i(1)], &ctx()).is_err()); }
+    #[test] fn multiply_non_numeric() { assert_eq!(verb_multiply(&[s("abc"), i(1)], &ctx()).unwrap(), i(0)); }
 
     // divide
     #[test] fn divide_basic() { assert_eq!(verb_divide(&[i(10), i(2)], &ctx()).unwrap(), f(5.0)); }
@@ -2752,18 +2786,18 @@ mod extended_tests_2 {
     #[test] fn abs_negative_float() { assert_eq!(verb_abs(&[f(-3.14)], &ctx()).unwrap(), f(3.14)); }
     #[test] fn abs_string_number() { assert_eq!(verb_abs(&[s("-42")], &ctx()).unwrap(), i(42)); }
     #[test] fn abs_string_float() { assert_eq!(verb_abs(&[s("-3.14")], &ctx()).unwrap(), f(3.14)); }
-    #[test] fn abs_string_invalid() { assert!(verb_abs(&[s("abc")], &ctx()).is_err()); }
-    #[test] fn abs_null_error() { assert!(verb_abs(&[null()], &ctx()).is_err()); }
+    #[test] fn abs_string_invalid() { assert_eq!(verb_abs(&[s("abc")], &ctx()).unwrap(), i(0)); }
+    #[test] fn abs_null_error() { assert_eq!(verb_abs(&[null()], &ctx()).unwrap(), i(0)); }
 
     // round
-    #[test] fn round_basic() { assert_eq!(verb_round(&[f(3.7)], &ctx()).unwrap(), i(4)); }
-    #[test] fn round_down() { assert_eq!(verb_round(&[f(3.2)], &ctx()).unwrap(), i(3)); }
-    #[test] fn round_half() { assert_eq!(verb_round(&[f(2.5)], &ctx()).unwrap(), i(3)); }
-    #[test] fn round_negative() { assert_eq!(verb_round(&[f(-2.7)], &ctx()).unwrap(), i(-3)); }
-    #[test] fn round_int_passthrough() { assert_eq!(verb_round(&[i(42)], &ctx()).unwrap(), i(42)); }
+    #[test] fn round_basic() { assert_eq!(verb_round(&[f(3.7), i(0)], &ctx()).unwrap(), i(4)); }
+    #[test] fn round_down() { assert_eq!(verb_round(&[f(3.2), i(0)], &ctx()).unwrap(), i(3)); }
+    #[test] fn round_half() { assert_eq!(verb_round(&[f(2.5), i(0)], &ctx()).unwrap(), i(3)); }
+    #[test] fn round_negative() { assert_eq!(verb_round(&[f(-2.7), i(0)], &ctx()).unwrap(), i(-3)); }
+    #[test] fn round_int_passthrough() { assert_eq!(verb_round(&[i(42), i(0)], &ctx()).unwrap(), i(42)); }
     #[test] fn round_with_places() { assert_eq!(verb_round(&[f(3.14159), i(2)], &ctx()).unwrap(), f(3.14)); }
-    #[test] fn round_string_number() { assert_eq!(verb_round(&[s("3.7")], &ctx()).unwrap(), i(4)); }
-    #[test] fn round_invalid_string() { assert!(verb_round(&[s("abc")], &ctx()).is_err()); }
+    #[test] fn round_string_number() { assert_eq!(verb_round(&[s("3.7"), i(0)], &ctx()).unwrap(), i(4)); }
+    #[test] fn round_invalid_string() { assert_eq!(verb_round(&[s("abc"), i(0)], &ctx()).unwrap(), i(0)); }
 
     // negate
     #[test] fn negate2_positive_int() { assert_eq!(numeric_verbs::negate(&[i(5)], &ctx()).unwrap(), i(-5)); }
@@ -2771,17 +2805,17 @@ mod extended_tests_2 {
     #[test] fn negate2_float() { assert_eq!(numeric_verbs::negate(&[f(3.14)], &ctx()).unwrap(), f(-3.14)); }
     #[test] fn negate2_zero_int() { assert_eq!(numeric_verbs::negate(&[i(0)], &ctx()).unwrap(), i(0)); }
     #[test] fn negate2_string_num() { assert_eq!(numeric_verbs::negate(&[s("7")], &ctx()).unwrap(), i(-7)); }
-    #[test] fn negate2_non_numeric() { assert!(numeric_verbs::negate(&[s("abc")], &ctx()).is_err()); }
-    #[test] fn negate2_null_error() { assert!(numeric_verbs::negate(&[null()], &ctx()).is_err()); }
+    #[test] fn negate2_non_numeric() { assert_eq!(numeric_verbs::negate(&[s("abc")], &ctx()).unwrap(), i(0)); }
+    #[test] fn negate2_null_error() { assert_eq!(numeric_verbs::negate(&[null()], &ctx()).unwrap(), i(0)); }
 
     // =========================================================================
     // assert verb
     // =========================================================================
 
     #[test] fn assert_truthy_int() { assert_eq!(verb_assert(&[i(1)], &ctx()).unwrap(), i(1)); }
-    #[test] fn assert_falsy_zero() { assert!(verb_assert(&[i(0)], &ctx()).is_err()); }
+    #[test] fn assert_falsy_zero() { assert_eq!(verb_assert(&[i(0)], &ctx()).unwrap(), null()); }
     #[test] fn assert_truthy_string() { assert_eq!(verb_assert(&[s("yes")], &ctx()).unwrap(), s("yes")); }
-    #[test] fn assert_falsy_null() { assert!(verb_assert(&[null()], &ctx()).is_err()); }
+    #[test] fn assert_falsy_null() { assert_eq!(verb_assert(&[null()], &ctx()).unwrap(), null()); }
 
     // =========================================================================
     // Registry — comprehensive verb presence

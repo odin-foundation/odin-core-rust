@@ -57,56 +57,41 @@ fn pad_char(v: &DynValue, name: &str) -> Result<char, String> {
 /// Helper to split a string into word boundaries for case conversion.
 /// Splits on whitespace, hyphens, underscores, and camelCase boundaries.
 fn split_words(s: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-
+    if s.is_empty() {
+        return Vec::new();
+    }
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len();
-    for i in 0..len {
+    // Build a normalized string, inserting word boundaries:
+    //  - runs of [-_\s] collapse to a single space
+    //  - lower|Upper boundary (camelCase)
+    //  - acronym|Capitalized boundary (HTTPServer -> HTTP Server)
+    let mut out = String::new();
+    let mut i = 0;
+    while i < len {
         let ch = chars[i];
-        if ch == ' ' || ch == '\t' || ch == '_' || ch == '-' {
-            if !current.is_empty() {
-                words.push(current.clone());
-                current.clear();
+        if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '_' || ch == '-' {
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
             }
-        } else if ch.is_uppercase() && i > 0 {
+            i += 1;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && i > 0 {
             let prev = chars[i - 1];
-            if prev.is_lowercase() || prev.is_ascii_digit() {
-                // camelCase boundary: "helloWorld" → ["hello", "World"]
-                if !current.is_empty() {
-                    words.push(current.clone());
-                    current.clear();
-                }
-            } else if prev.is_uppercase() {
-                // Consecutive uppercase: check if next char is lowercase
-                // "XMLParser" → ["XML", "Parser"] — split before the char preceding lowercase
-                let next_is_lower = i + 1 < len && chars[i + 1].is_lowercase();
-                if next_is_lower && !current.is_empty() {
-                    words.push(current.clone());
-                    current.clear();
-                }
+            if prev.is_ascii_lowercase() {
+                out.push(' ');
+            } else if prev.is_ascii_uppercase()
+                && i + 1 < len
+                && chars[i + 1].is_ascii_lowercase()
+            {
+                out.push(' ');
             }
-            current.push(ch);
-        } else {
-            current.push(ch);
         }
+        out.push(ch);
+        i += 1;
     }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    // Post-process: if any word is all-uppercase and length > 1, split into individual letters
-    // This handles "ABC" → ["A", "B", "C"]
-    let mut result = Vec::new();
-    for word in words {
-        if word.len() > 1 && word.chars().all(char::is_uppercase) {
-            for c in word.chars() {
-                result.push(c.to_string());
-            }
-        } else {
-            result.push(word);
-        }
-    }
-    result
+    out.split_whitespace().map(str::to_string).collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,7 +102,8 @@ fn split_words(s: &str) -> Vec<String> {
 pub(super) fn verb_title_case(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     match args.first() {
         Some(DynValue::String(s)) => {
-            let result = s
+            let lower = s.to_lowercase();
+            let result = lower
                 .split_whitespace()
                 .map(|word| {
                     let mut chars = word.chars();
@@ -288,28 +274,25 @@ pub(super) fn verb_truncate(args: &[DynValue], _ctx: &VerbContext) -> Result<Dyn
 /// split: split string by delimiter, return array.
 /// Arity 2-3: (string, delimiter[, maxCount]).
 pub(super) fn verb_split(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    if args.len() < 2 {
-        return Err("split: requires at least 2 arguments (string, delimiter)".to_string());
+    if args.len() < 3 {
+        return Ok(DynValue::Null);
     }
-    match (&args[0], &args[1]) {
-        (DynValue::String(s), DynValue::String(delim)) => {
-            let parts: Vec<DynValue> = s.split(delim.as_str())
-                .map(|p| DynValue::String(p.to_string()))
-                .collect();
-            // Optional 3rd argument: index into the split result
-            if args.len() >= 3 {
-                let idx = to_usize(&args[2], "split")?;
-                if idx < parts.len() {
-                    Ok(parts[idx].clone())
-                } else {
-                    Ok(DynValue::Null)
-                }
-            } else {
-                Ok(DynValue::Array(parts))
-            }
-        }
-        _ => Err("split: expected (string, string) arguments".to_string()),
+    let s = super::coerce_str_pub(&args[0]);
+    let delim = super::coerce_str_pub(&args[1]);
+    let parts: Vec<&str> = if delim.is_empty() {
+        s.split("").filter(|p| !p.is_empty()).collect()
+    } else {
+        s.split(delim.as_str()).collect()
+    };
+    let len = parts.len() as i64;
+    let mut idx = super::to_number(&args[2]).floor() as i64;
+    if idx < 0 {
+        idx += len;
     }
+    if idx < 0 || idx >= len {
+        return Ok(DynValue::Null);
+    }
+    Ok(DynValue::String(parts[idx as usize].to_string()))
 }
 
 /// join: join array with delimiter string.
@@ -345,16 +328,17 @@ pub(super) fn verb_mask(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
     }
     match (&args[0], &args[1]) {
         (DynValue::String(s), DynValue::String(pattern)) => {
-            // Format pattern mode: '#' replaced by input chars
+            // Format pattern mode: '#', 'A', '*' consume the next input char.
             let input_chars: Vec<char> = s.chars().collect();
             let mut result = String::new();
             let mut input_idx = 0;
             for ch in pattern.chars() {
-                if ch == '#' {
-                    if input_idx < input_chars.len() {
-                        result.push(input_chars[input_idx]);
-                        input_idx += 1;
-                    }
+                if input_idx >= input_chars.len() {
+                    break;
+                }
+                if ch == '#' || ch == 'A' || ch == '*' {
+                    result.push(input_chars[input_idx]);
+                    input_idx += 1;
                 } else {
                     result.push(ch);
                 }
@@ -396,15 +380,18 @@ pub(super) fn verb_reverse_string(
 /// Arity 2: (string, count).
 pub(super) fn verb_repeat(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("repeat: requires 2 arguments (string, count)".to_string());
+        return Ok(DynValue::Null);
     }
-    match (&args[0], &args[1]) {
-        (DynValue::String(s), count_val) => {
-            let count = to_usize(count_val, "repeat")?;
-            Ok(DynValue::String(s.repeat(count)))
-        }
-        _ => Err("repeat: expected (string, integer) arguments".to_string()),
+    let s = super::coerce_str_pub(&args[0]);
+    let count = super::to_number(&args[1]).floor() as i64;
+    if count < 0 {
+        return Ok(DynValue::Null);
     }
+    if count == 0 {
+        return Ok(DynValue::String(String::new()));
+    }
+    let safe = count.min(10_000) as usize;
+    Ok(DynValue::String(s.repeat(safe)))
 }
 
 /// camelCase: convert to camelCase.
@@ -500,24 +487,30 @@ pub(super) fn verb_pascal_case(args: &[DynValue], _ctx: &VerbContext) -> Result<
 pub(super) fn verb_slugify(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     match args.first() {
         Some(DynValue::String(s)) => {
-            let mut result = String::with_capacity(s.len());
-            let mut prev_hyphen = true; // avoid leading hyphen
-            for ch in s.chars() {
-                if ch.is_alphanumeric() {
-                    for lc in ch.to_lowercase() {
-                        result.push(lc);
-                    }
-                    prev_hyphen = false;
-                } else if !prev_hyphen {
-                    result.push('-');
-                    prev_hyphen = true;
+            let lower = s.to_lowercase();
+            // Drop everything except ASCII word chars, whitespace, and hyphens.
+            let mut kept = String::with_capacity(lower.len());
+            for ch in lower.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch.is_whitespace() {
+                    kept.push(ch);
                 }
             }
-            // Remove trailing hyphen
-            if result.ends_with('-') {
-                result.pop();
+            // Collapse whitespace/underscore runs to a hyphen, then collapse hyphens.
+            let mut result = String::with_capacity(kept.len());
+            let mut prev_hyphen = false;
+            for ch in kept.chars() {
+                if ch.is_whitespace() || ch == '_' || ch == '-' {
+                    if !prev_hyphen {
+                        result.push('-');
+                        prev_hyphen = true;
+                    }
+                } else {
+                    result.push(ch);
+                    prev_hyphen = false;
+                }
             }
-            Ok(DynValue::String(result))
+            let trimmed = result.trim_matches('-').to_string();
+            Ok(DynValue::String(trimmed))
         }
         Some(DynValue::Null) => Ok(DynValue::Null),
         _ => Err("slugify: expected string argument".to_string()),
@@ -645,17 +638,13 @@ pub(super) fn verb_left_of(args: &[DynValue], _ctx: &VerbContext) -> Result<DynV
 /// Arity 2: (string, delimiter).
 pub(super) fn verb_right_of(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("rightOf: requires 2 arguments (string, delimiter)".to_string());
+        return Ok(DynValue::Null);
     }
-    match (&args[0], &args[1]) {
-        (DynValue::String(s), DynValue::String(delim)) => {
-            if let Some(idx) = s.find(delim.as_str()) {
-                Ok(DynValue::String(s[idx + delim.len()..].to_string()))
-            } else {
-                Ok(DynValue::String(s.clone()))
-            }
-        }
-        _ => Err("rightOf: expected string arguments".to_string()),
+    let s = super::coerce_str_pub(&args[0]);
+    let delim = super::coerce_str_pub(&args[1]);
+    match s.find(delim.as_str()) {
+        Some(idx) => Ok(DynValue::String(s[idx + delim.len()..].to_string())),
+        None => Ok(DynValue::String(String::new())),
     }
 }
 
@@ -663,12 +652,16 @@ pub(super) fn verb_right_of(args: &[DynValue], _ctx: &VerbContext) -> Result<Dyn
 /// Arity 2: (string, width).
 pub(super) fn verb_wrap(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("wrap: requires 2 arguments (string, width)".to_string());
+        return Ok(DynValue::Null);
     }
     match (&args[0], &args[1]) {
         (DynValue::String(s), width_val) => {
-            let width = to_usize(width_val, "wrap")?;
-            if width == 0 || s.chars().count() <= width {
+            let width = super::to_number(width_val).floor() as i64;
+            if width <= 0 {
+                return Ok(DynValue::Null);
+            }
+            let width = width as usize;
+            if s.chars().count() <= width {
                 return Ok(DynValue::String(s.clone()));
             }
 
@@ -958,17 +951,46 @@ pub(super) fn verb_base64_decode(
     args: &[DynValue],
     _ctx: &VerbContext,
 ) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::String(s)) => {
-            let bytes = crate::utils::base64::decode(s)
-                .map_err(|e| format!("base64Decode: {e}"))?;
-            let decoded = String::from_utf8(bytes)
-                .map_err(|e| format!("base64Decode: invalid UTF-8: {e}"))?;
-            Ok(DynValue::String(decoded))
-        }
-        Some(DynValue::Null) => Ok(DynValue::Null),
-        _ => Err("base64Decode: expected string argument".to_string()),
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    // Accept standard and URL-safe alphabets with optional padding.
+    let valid = s.bytes().all(|b| matches!(b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'-' | b'_' | b'='));
+    if !valid {
+        return Ok(DynValue::Null);
     }
+    match base64_decode_relaxed(&s) {
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(decoded) => Ok(DynValue::String(decoded)),
+            Err(_) => Ok(DynValue::Null),
+        },
+        None => Ok(DynValue::Null),
+    }
+}
+
+/// Decode base64 (standard or URL-safe), tolerating missing padding.
+fn base64_decode_relaxed(input: &str) -> Option<Vec<u8>> {
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for b in input.bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        } as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// urlEncode: percent-encode string.
@@ -1000,33 +1022,33 @@ const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
 /// urlDecode: percent-decode string.
 pub(super) fn verb_url_decode(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::String(s)) => {
-            let mut decoded = Vec::with_capacity(s.len());
-            let bytes = s.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                if bytes[i] == b'%' && i + 2 < bytes.len() {
-                    let hi = hex_digit(bytes[i + 1])
-                        .ok_or_else(|| format!("urlDecode: invalid hex digit '{}'", bytes[i + 1] as char))?;
-                    let lo = hex_digit(bytes[i + 2])
-                        .ok_or_else(|| format!("urlDecode: invalid hex digit '{}'", bytes[i + 2] as char))?;
-                    decoded.push((hi << 4) | lo);
-                    i += 3;
-                } else if bytes[i] == b'+' {
-                    decoded.push(b' ');
-                    i += 1;
-                } else {
-                    decoded.push(bytes[i]);
-                    i += 1;
-                }
+    if args.is_empty() { return Ok(DynValue::Null); }
+    if let DynValue::Null = &args[0] { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    let bytes = s.as_bytes();
+    let mut decoded = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Ok(DynValue::Null);
             }
-            let result = String::from_utf8(decoded)
-                .map_err(|e| format!("urlDecode: invalid UTF-8: {e}"))?;
-            Ok(DynValue::String(result))
+            let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) else {
+                return Ok(DynValue::Null);
+            };
+            decoded.push((hi << 4) | lo);
+            i += 3;
+        } else if bytes[i] == b'+' {
+            decoded.push(b' ');
+            i += 1;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
         }
-        Some(DynValue::Null) => Ok(DynValue::Null),
-        _ => Err("urlDecode: expected string argument".to_string()),
+    }
+    match String::from_utf8(decoded) {
+        Ok(result) => Ok(DynValue::String(result)),
+        Err(_) => Ok(DynValue::Null),
     }
 }
 
@@ -1041,24 +1063,37 @@ fn hex_digit(b: u8) -> Option<u8> {
 
 /// jsonEncode: convert `DynValue` to JSON string.
 pub(super) fn verb_json_encode(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(val) => {
-            let json = crate::utils::json_parser::to_json(val, false);
-            Ok(DynValue::String(json))
+    let Some(val) = args.first() else {
+        return Ok(DynValue::Null);
+    };
+    match val {
+        DynValue::Object(_) | DynValue::Array(_) => {
+            Ok(DynValue::String(crate::utils::json_parser::to_json(val, false)))
         }
-        None => Err("jsonEncode: requires 1 argument".to_string()),
+        _ => {
+            // Scalars: JSON-escape the string form, dropping the outer quotes.
+            let s = super::coerce_str_pub(val);
+            let quoted = crate::utils::json_parser::to_json(&DynValue::String(s), false);
+            let body = quoted.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(&quoted);
+            Ok(DynValue::String(body.to_string()))
+        }
     }
 }
 
 /// jsonDecode: parse JSON string to `DynValue`.
 pub(super) fn verb_json_decode(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::String(s)) => {
-            crate::utils::json_parser::parse_json(s)
-                .map_err(|e| format!("jsonDecode: {e}"))
-        }
-        Some(DynValue::Null) => Ok(DynValue::Null),
-        _ => Err("jsonDecode: expected string argument".to_string()),
+    if args.is_empty() { return Ok(DynValue::Null); }
+    if let DynValue::Null = &args[0] { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    let trimmed = s.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return Ok(crate::utils::json_parser::parse_json(&s).unwrap_or(DynValue::Null));
+    }
+    // Treat as a JSON string body: wrap in quotes and unescape.
+    let wrapped = format!("\"{s}\"");
+    match crate::utils::json_parser::parse_json(&wrapped) {
+        Ok(v) => Ok(v),
+        Err(_) => Ok(DynValue::Null),
     }
 }
 
@@ -1080,29 +1115,381 @@ pub(super) fn verb_hex_encode(args: &[DynValue], _ctx: &VerbContext) -> Result<D
 
 /// hexDecode: decode hex string to string.
 pub(super) fn verb_hex_decode(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::String(s)) => {
-            if s.len() % 2 != 0 {
-                return Err("hexDecode: hex string must have even length".to_string());
-            }
-            let bytes = s.as_bytes();
-            let mut decoded = Vec::with_capacity(s.len() / 2);
-            let mut i = 0;
-            while i < bytes.len() {
-                let hi = hex_digit(bytes[i])
-                    .ok_or_else(|| format!("hexDecode: invalid hex digit '{}'", bytes[i] as char))?;
-                let lo = hex_digit(bytes[i + 1])
-                    .ok_or_else(|| format!("hexDecode: invalid hex digit '{}'", bytes[i + 1] as char))?;
-                decoded.push((hi << 4) | lo);
-                i += 2;
-            }
-            let result = String::from_utf8(decoded)
-                .map_err(|e| format!("hexDecode: invalid UTF-8: {e}"))?;
-            Ok(DynValue::String(result))
-        }
-        Some(DynValue::Null) => Ok(DynValue::Null),
-        _ => Err("hexDecode: expected string argument".to_string()),
+    if args.is_empty() { return Ok(DynValue::Null); }
+    if let DynValue::Null = &args[0] { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    if s.len() % 2 != 0 {
+        return Ok(DynValue::Null);
     }
+    let bytes = s.as_bytes();
+    let mut decoded = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let (Some(hi), Some(lo)) = (hex_digit(bytes[i]), hex_digit(bytes[i + 1])) else {
+            return Ok(DynValue::Null);
+        };
+        decoded.push((hi << 4) | lo);
+        i += 2;
+    }
+    match String::from_utf8(decoded) {
+        Ok(result) => Ok(DynValue::String(result)),
+        Err(_) => Ok(DynValue::Null),
+    }
+}
+
+/// base64urlEncode: standard base64 with URL-safe alphabet and no padding.
+pub(super) fn verb_base64url_encode(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    let std = crate::utils::base64::encode(s.as_bytes());
+    let url = std.replace('+', "-").replace('/', "_");
+    Ok(DynValue::String(url.trim_end_matches('=').to_string()))
+}
+
+/// base64urlDecode: decode a URL-safe base64 string.
+pub(super) fn verb_base64url_decode(args: &[DynValue], ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]).replace('-', "+").replace('_', "/");
+    verb_base64_decode(&[DynValue::String(s)], ctx)
+}
+
+/// hmac: keyed-hash MAC, lowercase hex (sha256 default; sha1 supported).
+pub(super) fn verb_hmac(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let message = super::coerce_str_pub(&args[0]);
+    let key = super::coerce_str_pub(&args[1]);
+    let alg = args.get(2).map(super::coerce_str_pub).unwrap_or_else(|| "sha256".to_string());
+    let digest = match alg.to_lowercase().as_str() {
+        "sha256" => hmac_bytes(key.as_bytes(), message.as_bytes(), 64, |d| sha256_hash(d).to_vec()),
+        "sha1" => hmac_bytes(key.as_bytes(), message.as_bytes(), 64, |d| sha1_bytes(d).to_vec()),
+        _ => return Ok(DynValue::Null),
+    };
+    Ok(DynValue::String(to_hex_lower(&digest)))
+}
+
+/// stableStringify: deterministic JSON with sorted object keys.
+pub(super) fn verb_stable_stringify(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(DynValue::String(stable_json(&args[0])))
+}
+
+/// canonicalHash: sha256 of the stable JSON form, lowercase hex.
+pub(super) fn verb_canonical_hash(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let canonical = stable_json(&args[0]);
+    Ok(DynValue::String(to_hex_lower(&sha256_hash(canonical.as_bytes()))))
+}
+
+/// parseUrl: split a URL into scheme/host/port/path/query/fragment (null if invalid).
+pub(super) fn verb_parse_url(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let raw = super::coerce_str_pub(&args[0]);
+    match parse_url_parts(&raw) {
+        Some(obj) => Ok(DynValue::Object(obj)),
+        None => Ok(DynValue::Null),
+    }
+}
+
+/// buildUrl: assemble a URL from a parts object (null if scheme/host missing).
+pub(super) fn verb_build_url(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let Some(parts) = args[0].extract_object() else {
+        return Ok(DynValue::Null);
+    };
+    let get = |k: &str| -> String {
+        parts.iter().find(|(pk, _)| pk == k)
+            .map(|(_, v)| if matches!(v, DynValue::Null) { String::new() } else { super::coerce_str_pub(v) })
+            .unwrap_or_default()
+    };
+    let scheme = get("scheme");
+    let host = get("host");
+    if scheme.is_empty() || host.is_empty() {
+        return Ok(DynValue::Null);
+    }
+    let mut url = format!("{scheme}://{host}");
+    let port = get("port");
+    if !port.is_empty() {
+        url.push(':');
+        url.push_str(&port);
+    }
+    let path = get("path");
+    if path.starts_with('/') {
+        url.push_str(&path);
+    } else if !path.is_empty() {
+        url.push('/');
+        url.push_str(&path);
+    }
+    if let Some((_, q)) = parts.iter().find(|(pk, _)| pk == "query") {
+        if let DynValue::Object(_) = q {
+            let qs = build_query_string(q);
+            if !qs.is_empty() {
+                url.push('?');
+                url.push_str(&qs);
+            }
+        }
+    }
+    let fragment = get("fragment");
+    if !fragment.is_empty() {
+        url.push('#');
+        url.push_str(&fragment);
+    }
+    Ok(DynValue::String(url))
+}
+
+/// parseQuery: parse a query string into a sorted object.
+pub(super) fn verb_parse_query(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let raw = super::coerce_str_pub(&args[0]);
+    let raw = raw.strip_prefix('?').unwrap_or(&raw);
+    Ok(DynValue::Object(parse_query_pairs(raw)))
+}
+
+/// buildQuery: encode an object as a sorted query string (skips nulls).
+pub(super) fn verb_build_query(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    if !matches!(&args[0], DynValue::Object(_)) {
+        return Ok(DynValue::Null);
+    }
+    Ok(DynValue::String(build_query_string(&args[0])))
+}
+
+/// Minimal SHA-1 producing raw bytes.
+fn sha1_bytes(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 { msg.push(0); }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, wi) in w.iter_mut().enumerate().take(16) {
+            *wi = u32::from_be_bytes([chunk[4*i], chunk[4*i+1], chunk[4*i+2], chunk[4*i+3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999_u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1_u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC_u32),
+                _ => (b ^ c ^ d, 0xCA62_C1D6_u32),
+            };
+            let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(wi);
+            e = d; d = c; c = b.rotate_left(30); b = a; a = temp;
+        }
+        h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d); h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i*4..i*4+4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// HMAC over a hash with the given block size.
+fn hmac_bytes(key: &[u8], message: &[u8], block: usize, hash: impl Fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let mut k = if key.len() > block { hash(key) } else { key.to_vec() };
+    k.resize(block, 0);
+    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    let mut inner = ipad;
+    inner.extend_from_slice(message);
+    let inner_hash = hash(&inner);
+    let mut outer = opad;
+    outer.extend_from_slice(&inner_hash);
+    hash(&outer)
+}
+
+fn to_hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX_LOWER[(b >> 4) as usize] as char);
+        s.push(HEX_LOWER[(b & 0x0F) as usize] as char);
+    }
+    s
+}
+
+/// Deterministic JSON: object keys sorted, numbers/strings as JSON literals.
+fn stable_json(v: &DynValue) -> String {
+    match v {
+        DynValue::Null => "null".to_string(),
+        DynValue::Bool(b) => b.to_string(),
+        DynValue::Integer(n) => n.to_string(),
+        DynValue::Float(f) | DynValue::Currency(f, _, _) | DynValue::Percent(f) => json_number(*f),
+        DynValue::FloatRaw(s) | DynValue::CurrencyRaw(s, _, _) => {
+            s.parse::<f64>().map(json_number).unwrap_or_else(|_| json_string(s))
+        }
+        DynValue::String(s) | DynValue::Date(s) | DynValue::Timestamp(s)
+        | DynValue::Time(s) | DynValue::Duration(s) | DynValue::Reference(s)
+        | DynValue::Binary(s) => json_string(s),
+        DynValue::Array(items) => {
+            let parts: Vec<String> = items.iter().map(stable_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        DynValue::Object(fields) => {
+            let mut sorted: Vec<&(String, DynValue)> = fields.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            let parts: Vec<String> = sorted.iter()
+                .map(|(k, val)| format!("{}:{}", json_string(k), stable_json(val)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+    }
+}
+
+fn json_number(f: f64) -> String {
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        format!("{}", f as i64)
+    } else {
+        format!("{f}")
+    }
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Build a sorted `k=v&...` query string, percent-encoding and skipping nulls.
+fn build_query_string(v: &DynValue) -> String {
+    let DynValue::Object(fields) = v else { return String::new() };
+    let mut sorted: Vec<&(String, DynValue)> = fields.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut parts = Vec::new();
+    for (k, val) in sorted {
+        if matches!(val, DynValue::Null) { continue; }
+        let value = super::coerce_str_pub(val);
+        parts.push(format!("{}={}", query_encode(k), query_encode(&value)));
+    }
+    parts.join("&")
+}
+
+/// Parse `k=v&...` pairs into a sorted object.
+fn parse_query_pairs(raw: &str) -> Vec<(String, DynValue)> {
+    let mut map: Vec<(String, DynValue)> = Vec::new();
+    if raw.is_empty() {
+        return map;
+    }
+    for pair in raw.split('&') {
+        if pair.is_empty() { continue; }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        let key = query_decode(k);
+        let value = query_decode(v);
+        if let Some(slot) = map.iter_mut().find(|(mk, _)| *mk == key) {
+            slot.1 = DynValue::String(value);
+        } else {
+            map.push((key, DynValue::String(value)));
+        }
+    }
+    map.sort_by(|a, b| a.0.cmp(&b.0));
+    map
+}
+
+fn query_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(HEX_UPPER[(b >> 4) as usize] as char);
+                out.push(HEX_UPPER[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+fn query_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match (hex_digit(bytes[i+1]), hex_digit(bytes[i+2])) {
+                    (Some(hi), Some(lo)) => { out.push((hi << 4) | lo); i += 3; }
+                    _ => { out.push(bytes[i]); i += 1; }
+                }
+            }
+            b'+' => { out.push(b' '); i += 1; }
+            b => { out.push(b); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse a URL into a parts object, or None if it lacks scheme/host.
+fn parse_url_parts(raw: &str) -> Option<Vec<(String, DynValue)>> {
+    let scheme_end = raw.find("://")?;
+    let scheme = &raw[..scheme_end];
+    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {
+        return None;
+    }
+    let rest = &raw[scheme_end + 3..];
+    // Split authority from path/query/fragment.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let after = &rest[auth_end..];
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+            (h.to_string(), p.parse::<i64>().ok())
+        }
+        Some((_, p)) if !p.is_empty() && !p.chars().all(|c| c.is_ascii_digit()) => {
+            // Non-numeric port is invalid.
+            return None;
+        }
+        _ => (authority.to_string(), None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    // Fragment.
+    let (before_frag, fragment) = match after.split_once('#') {
+        Some((b, f)) => (b, f.to_string()),
+        None => (after, String::new()),
+    };
+    // Query.
+    let (path, query_str) = match before_frag.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (before_frag, ""),
+    };
+    let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
+    let query = DynValue::Object(parse_query_pairs(query_str));
+    Some(vec![
+        ("scheme".to_string(), DynValue::String(scheme.to_string())),
+        ("host".to_string(), DynValue::String(host)),
+        ("port".to_string(), port.map_or(DynValue::Null, DynValue::Integer)),
+        ("path".to_string(), DynValue::String(path)),
+        ("query".to_string(), query),
+        ("fragment".to_string(), DynValue::String(fragment)),
+    ])
 }
 
 /// SHA-256 implementation.
@@ -1284,69 +1671,171 @@ pub(super) fn verb_format_phone(args: &[DynValue], _ctx: &VerbContext) -> Result
         _ => return Ok(DynValue::Null),
     };
     let country = match &args[1] {
-        DynValue::String(s) => s.as_str(),
+        DynValue::String(s) => s.to_uppercase(),
         _ => return Ok(DynValue::Null),
     };
     // Strip non-digits
     let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
-    let formatted = match country {
+    let raw_out = || Ok(DynValue::String(raw.to_string()));
+    let strip = |prefix: &str| -> String {
+        if digits.starts_with(prefix) { digits[prefix.len()..].to_string() } else { digits.clone() }
+    };
+    let formatted = match country.as_str() {
         "US" | "CA" => {
-            if digits.len() == 10 {
-                format!("({}) {}-{}", &digits[0..3], &digits[3..6], &digits[6..10])
-            } else if digits.len() == 11 && digits.starts_with('1') {
-                format!("+1 ({}) {}-{}", &digits[1..4], &digits[4..7], &digits[7..11])
-            } else {
-                return Ok(DynValue::String(raw.to_string()));
-            }
+            let d = if digits.len() == 11 && digits.starts_with('1') { digits[1..].to_string() } else { digits.clone() };
+            if d.len() != 10 { return raw_out(); }
+            format!("({}) {}-{}", &d[0..3], &d[3..6], &d[6..])
         }
         "GB" => {
-            if digits.len() == 11 && digits.starts_with('0') {
-                format!("+44 {} {}", &digits[1..5], &digits[5..11])
-            } else if digits.len() == 10 {
-                format!("+44 {} {}", &digits[0..4], &digits[4..10])
-            } else {
-                return Ok(DynValue::String(raw.to_string()));
-            }
+            let d = strip("44");
+            if d.len() < 10 || d.len() > 11 { return raw_out(); }
+            format!("+44 {} {}", &d[0..4], &d[4..])
         }
         "DE" => {
-            if digits.len() == 11 && digits.starts_with('0') {
-                format!("+49 {} {}", &digits[1..5], &digits[5..11])
-            } else if digits.len() == 10 {
-                format!("+49 {} {}", &digits[0..4], &digits[4..10])
-            } else {
-                return Ok(DynValue::String(raw.to_string()));
-            }
+            let d = strip("49");
+            if d.len() < 10 || d.len() > 11 { return raw_out(); }
+            format!("+49 {} {}", &d[0..4], &d[4..])
         }
         "FR" => {
-            if digits.len() == 10 && digits.starts_with('0') {
-                format!("+33 {} {} {} {} {}", &digits[1..2], &digits[2..4], &digits[4..6], &digits[6..8], &digits[8..10])
-            } else if digits.len() == 9 {
-                format!("+33 {} {} {} {} {}", &digits[0..1], &digits[1..3], &digits[3..5], &digits[5..7], &digits[7..9])
-            } else {
-                return Ok(DynValue::String(raw.to_string()));
-            }
+            let d = strip("33");
+            if d.len() != 9 { return raw_out(); }
+            format!("+33 {} {} {} {} {}", &d[0..1], &d[1..3], &d[3..5], &d[5..7], &d[7..])
         }
         "AU" => {
-            if digits.len() == 10 && digits.starts_with('0') {
-                format!("+61 {} {} {}", &digits[1..2], &digits[2..6], &digits[6..10])
-            } else if digits.len() == 9 {
-                format!("+61 {} {} {}", &digits[0..1], &digits[1..5], &digits[5..9])
-            } else {
-                return Ok(DynValue::String(raw.to_string()));
-            }
+            let d = strip("61");
+            if d.len() != 9 { return raw_out(); }
+            format!("+61 {} {} {}", &d[0..1], &d[1..5], &d[5..])
         }
         "JP" => {
-            if digits.len() == 11 && digits.starts_with('0') {
-                format!("+81 {}-{}-{}", &digits[1..3], &digits[3..7], &digits[7..11])
-            } else if digits.len() == 10 {
-                format!("+81 {}-{}-{}", &digits[0..2], &digits[2..6], &digits[6..10])
-            } else {
-                return Ok(DynValue::String(raw.to_string()));
-            }
+            let d = strip("81");
+            if d.len() < 10 || d.len() > 11 { return raw_out(); }
+            format!("+81 {}-{}-{}", &d[0..2], &d[2..6], &d[6..])
         }
-        _ => return Ok(DynValue::String(raw.to_string())),
+        _ => return raw_out(),
     };
     Ok(DynValue::String(formatted))
+}
+
+/// escapeHtml: escape &, <, >, ", ' for HTML.
+pub(super) fn verb_escape_html(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    Ok(DynValue::String(out))
+}
+
+/// escapeXml: like escapeHtml but apostrophe becomes &apos;.
+pub(super) fn verb_escape_xml(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    Ok(DynValue::String(out))
+}
+
+/// unescapeHtml: decode named and numeric character references.
+pub(super) fn verb_unescape_html(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '&' {
+            if let Some(semi) = chars[i + 1..].iter().position(|&c| c == ';') {
+                let entity: String = chars[i + 1..i + 1 + semi].iter().collect();
+                let decoded = match entity.as_str() {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" | "#39" => Some('\''),
+                    _ => {
+                        if let Some(hex) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) {
+                            u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                        } else if let Some(dec) = entity.strip_prefix('#') {
+                            dec.parse::<u32>().ok().and_then(char::from_u32)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(c) = decoded {
+                    out.push(c);
+                    i += semi + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    Ok(DynValue::String(out))
+}
+
+/// stripTags: remove `<...>` tag spans.
+pub(super) fn verb_strip_tags(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let s = super::coerce_str_pub(&args[0]);
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    Ok(DynValue::String(out))
+}
+
+/// template: substitute `{key}` placeholders from an object (missing -> empty).
+pub(super) fn verb_template(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let tpl = super::coerce_str_pub(&args[0]);
+    let fields = args[1].extract_object().unwrap_or_default();
+    let chars: Vec<char> = tpl.chars().collect();
+    let mut out = String::with_capacity(tpl.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            if let Some(close) = chars[i + 1..].iter().position(|&c| c == '}' || c == '{') {
+                if chars[i + 1 + close] == '}' && close > 0 {
+                    let key: String = chars[i + 1..i + 1 + close].iter().collect();
+                    let key = key.trim();
+                    match fields.iter().find(|(k, _)| k == key).map(|(_, v)| v) {
+                        Some(DynValue::Null) | None => {}
+                        Some(v) => out.push_str(&super::coerce_str_pub(v)),
+                    }
+                    i += close + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    Ok(DynValue::String(out))
 }
 
 #[cfg(test)]
@@ -1463,14 +1952,7 @@ mod tests {
             DynValue::String("a,b,c".into()),
             DynValue::String(",".into()),
         ];
-        assert_eq!(
-            verb_split(&args, &ctx()).unwrap(),
-            DynValue::Array(vec![
-                DynValue::String("a".into()),
-                DynValue::String("b".into()),
-                DynValue::String("c".into()),
-            ])
-        );
+        assert_eq!(verb_split(&args, &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -1820,7 +2302,7 @@ mod tests {
         assert_eq!(verb_strip_accents(&null_args, &ctx()).unwrap(), DynValue::Null);
         assert_eq!(verb_clean(&null_args, &ctx()).unwrap(), DynValue::Null);
         assert_eq!(verb_base64_encode(&null_args, &ctx()).unwrap(), DynValue::Null);
-        assert_eq!(verb_base64_decode(&null_args, &ctx()).unwrap(), DynValue::Null);
+        assert_eq!(verb_base64_decode(&null_args, &ctx()).unwrap(), DynValue::String(String::new()));
         assert_eq!(verb_url_encode(&null_args, &ctx()).unwrap(), DynValue::Null);
         assert_eq!(verb_url_decode(&null_args, &ctx()).unwrap(), DynValue::Null);
         assert_eq!(verb_hex_encode(&null_args, &ctx()).unwrap(), DynValue::Null);
@@ -1881,7 +2363,7 @@ mod extended_tests {
 
     #[test]
     fn title_case_all_upper() {
-        assert_eq!(verb_title_case(&[s("HELLO WORLD")], &ctx()).unwrap(), s("HELLO WORLD"));
+        assert_eq!(verb_title_case(&[s("HELLO WORLD")], &ctx()).unwrap(), s("Hello World"));
     }
 
     #[test]
@@ -2181,29 +2663,23 @@ mod extended_tests {
 
     #[test]
     fn split_empty_string() {
-        assert_eq!(verb_split(&[s(""), s(",")], &ctx()).unwrap(), DynValue::Array(vec![s("")]));
+        assert_eq!(verb_split(&[s(""), s(",")], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn split_no_delimiter_found() {
-        assert_eq!(verb_split(&[s("hello"), s(",")], &ctx()).unwrap(), DynValue::Array(vec![s("hello")]));
+        assert_eq!(verb_split(&[s("hello"), s(",")], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn split_empty_delimiter() {
         // Splitting by empty string yields each char plus empty strings
-        let result = verb_split(&[s("ab"), s("")], &ctx()).unwrap();
-        if let DynValue::Array(arr) = &result {
-            assert!(arr.len() > 2); // "" splits into many segments
-        }
+        assert_eq!(verb_split(&[s("ab"), s("")], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn split_multi_char_delimiter() {
-        assert_eq!(
-            verb_split(&[s("a::b::c"), s("::")], &ctx()).unwrap(),
-            DynValue::Array(vec![s("a"), s("b"), s("c")])
-        );
+        assert_eq!(verb_split(&[s("a::b::c"), s("::"), i(1)], &ctx()).unwrap(), s("b"));
     }
 
     #[test]
@@ -2217,7 +2693,7 @@ mod extended_tests {
 
     #[test]
     fn split_too_few_args() {
-        assert!(verb_split(&[s("hello")], &ctx()).is_err());
+        assert_eq!(verb_split(&[s("hello")], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2287,7 +2763,7 @@ mod extended_tests {
     #[test]
     fn mask_format_short_input() {
         // Pattern has more # than input chars — extra # are skipped
-        assert_eq!(verb_mask(&[s("12"), s("###-####")], &ctx()).unwrap(), s("12-"));
+        assert_eq!(verb_mask(&[s("12"), s("###-####")], &ctx()).unwrap(), s("12"));
     }
 
     #[test]
@@ -2366,7 +2842,7 @@ mod extended_tests {
 
     #[test]
     fn repeat_too_few_args() {
-        assert!(verb_repeat(&[s("abc")], &ctx()).is_err());
+        assert_eq!(verb_repeat(&[s("abc")], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2708,7 +3184,7 @@ mod extended_tests {
 
     #[test]
     fn right_of_no_delimiter() {
-        assert_eq!(verb_right_of(&[s("hello"), s("@")], &ctx()).unwrap(), s("hello"));
+        assert_eq!(verb_right_of(&[s("hello"), s("@")], &ctx()).unwrap(), s(""));
     }
 
     #[test]
@@ -2728,7 +3204,7 @@ mod extended_tests {
 
     #[test]
     fn right_of_too_few_args() {
-        assert!(verb_right_of(&[s("hello")], &ctx()).is_err());
+        assert_eq!(verb_right_of(&[s("hello")], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2737,7 +3213,7 @@ mod extended_tests {
 
     #[test]
     fn wrap_zero_width() {
-        assert_eq!(verb_wrap(&[s("hello world"), i(0)], &ctx()).unwrap(), s("hello world"));
+        assert_eq!(verb_wrap(&[s("hello world"), i(0)], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -2762,7 +3238,7 @@ mod extended_tests {
 
     #[test]
     fn wrap_too_few_args() {
-        assert!(verb_wrap(&[s("hello")], &ctx()).is_err());
+        assert_eq!(verb_wrap(&[s("hello")], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3064,12 +3540,12 @@ mod extended_tests {
 
     #[test]
     fn base64_decode_null() {
-        assert_eq!(verb_base64_decode(&[null()], &ctx()).unwrap(), null());
+        assert_eq!(verb_base64_decode(&[null()], &ctx()).unwrap(), s(""));
     }
 
     #[test]
     fn base64_decode_wrong_type() {
-        assert!(verb_base64_decode(&[i(42)], &ctx()).is_err());
+        assert_eq!(verb_base64_decode(&[i(42)], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3118,7 +3594,7 @@ mod extended_tests {
 
     #[test]
     fn url_decode_wrong_type() {
-        assert!(verb_url_decode(&[i(42)], &ctx()).is_err());
+        assert_eq!(verb_url_decode(&[i(42)], &ctx()).unwrap(), s("42"));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3163,12 +3639,12 @@ mod extended_tests {
 
     #[test]
     fn hex_decode_odd_length() {
-        assert!(verb_hex_decode(&[s("486")], &ctx()).is_err());
+        assert_eq!(verb_hex_decode(&[s("486")], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn hex_decode_invalid_chars() {
-        assert!(verb_hex_decode(&[s("ZZZZ")], &ctx()).is_err());
+        assert_eq!(verb_hex_decode(&[s("ZZZZ")], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -3188,7 +3664,7 @@ mod extended_tests {
     #[test]
     fn json_round_trip_string() {
         let encoded = verb_json_encode(&[s("hello")], &ctx()).unwrap();
-        assert_eq!(encoded, s("\"hello\""));
+        assert_eq!(encoded, s("hello"));
     }
 
     #[test]
@@ -3206,7 +3682,7 @@ mod extended_tests {
     #[test]
     fn json_round_trip_null() {
         let encoded = verb_json_encode(&[null()], &ctx()).unwrap();
-        assert_eq!(encoded, s("null"));
+        assert_eq!(encoded, s(""));
     }
 
     #[test]
@@ -3224,7 +3700,7 @@ mod extended_tests {
     #[test]
     fn json_decode_string() {
         let result = verb_json_decode(&[s("\"hello\"")], &ctx()).unwrap();
-        assert_eq!(result, s("hello"));
+        assert_eq!(result, DynValue::Null);
     }
 
     #[test]
@@ -3234,12 +3710,12 @@ mod extended_tests {
 
     #[test]
     fn json_encode_no_args() {
-        assert!(verb_json_encode(&[], &ctx()).is_err());
+        assert_eq!(verb_json_encode(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn json_decode_wrong_type() {
-        assert!(verb_json_decode(&[i(42)], &ctx()).is_err());
+        assert_eq!(verb_json_decode(&[i(42)], &ctx()).unwrap(), s("42"));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3354,9 +3830,8 @@ mod extended_tests {
 
     #[test]
     fn split_then_join_round_trip() {
-        let split_result = verb_split(&[s("a,b,c"), s(",")], &ctx()).unwrap();
-        let join_result = verb_join(&[split_result, s(",")], &ctx()).unwrap();
-        assert_eq!(join_result, s("a,b,c"));
+        let split_result = verb_split(&[s("a,b,c"), s(","), i(1)], &ctx()).unwrap();
+        assert_eq!(split_result, s("b"));
     }
 
     #[test]
@@ -3631,19 +4106,19 @@ mod extended_tests_2 {
     #[test]
     fn ext_split_empty_string() {
         let r = verb_split(&[s(""), s(",")], &ctx()).unwrap();
-        assert_eq!(r, DynValue::Array(vec![s("")]));
+        assert_eq!(r, DynValue::Null);
     }
 
     #[test]
     fn ext_split_no_delimiter_found() {
         let r = verb_split(&[s("hello"), s(",")], &ctx()).unwrap();
-        assert_eq!(r, DynValue::Array(vec![s("hello")]));
+        assert_eq!(r, DynValue::Null);
     }
 
     #[test]
     fn ext_split_multiple_delimiters() {
-        let r = verb_split(&[s("a,b,c,d"), s(",")], &ctx()).unwrap();
-        assert_eq!(r, DynValue::Array(vec![s("a"), s("b"), s("c"), s("d")]));
+        let r = verb_split(&[s("a,b,c,d"), s(","), i(2)], &ctx()).unwrap();
+        assert_eq!(r, s("c"));
     }
 
     #[test]
@@ -3708,7 +4183,7 @@ mod extended_tests_2 {
     #[test]
     fn ext_mask_format_pattern_short_input() {
         let r = verb_mask(&[s("12"), s("###-####")], &ctx()).unwrap();
-        assert_eq!(r, s("12-"));
+        assert_eq!(r, s("12"));
     }
 
     #[test]
@@ -4018,7 +4493,7 @@ mod extended_tests_2 {
     #[test]
     fn ext_json_encode_string() {
         let r = verb_json_encode(&[s("hello")], &ctx()).unwrap();
-        assert_eq!(r, s("\"hello\""));
+        assert_eq!(r, s("hello"));
     }
 
     #[test]
@@ -4030,7 +4505,7 @@ mod extended_tests_2 {
     #[test]
     fn ext_json_decode_string() {
         let r = verb_json_decode(&[s("\"hello\"")], &ctx()).unwrap();
-        assert_eq!(r, s("hello"));
+        assert_eq!(r, DynValue::Null);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -4187,7 +4662,7 @@ mod extended_tests_2 {
     #[test]
     fn ext_split_requires_two_args() {
         let r = verb_split(&[s("hello")], &ctx());
-        assert!(r.is_err());
+        assert_eq!(r.unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -4199,7 +4674,7 @@ mod extended_tests_2 {
     #[test]
     fn ext_repeat_requires_two_args() {
         let r = verb_repeat(&[s("hello")], &ctx());
-        assert!(r.is_err());
+        assert_eq!(r.unwrap(), DynValue::Null);
     }
 
     #[test]

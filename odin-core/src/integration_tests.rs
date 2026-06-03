@@ -1655,13 +1655,11 @@ mod verb_expression_integration {
 
     #[test]
     fn verb_split() {
-        let out = run("{Output}\nParts = %split @.csv \",\"\n",
+        let out = run("{Output}\nParts = %split @.csv \",\" ##1\n",
             obj(vec![("csv", s("a,b,c"))]));
         let section = out.get("Output").unwrap();
         let parts = section.get("Parts").unwrap();
-        assert!(parts.as_array().is_some());
-        let arr = parts.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
+        assert_eq!(parts.as_str(), Some("b"));
     }
 
     #[test]

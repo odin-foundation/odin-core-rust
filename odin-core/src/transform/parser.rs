@@ -859,6 +859,12 @@ fn get_verb_arity(verb: &str) -> i32 {
         | "uuid" | "sequence" | "resetSequence"
         | "keys" | "values" | "entries"
         | "toRadians" | "toDegrees"
+        | "fromEntries" | "invert" | "compactObject"
+        | "base64urlEncode" | "base64urlDecode"
+        | "parseUrl" | "buildUrl" | "parseQuery" | "buildQuery"
+        | "stableStringify" | "canonicalHash"
+        | "factorial"
+        | "escapeHtml" | "unescapeHtml" | "escapeXml" | "stripTags"
         | "nextBusinessDay" | "formatDuration" => 1,
 
         // Arity 2
@@ -884,6 +890,11 @@ fn get_verb_arity(verb: &str) -> i32 {
         | "nanoid"
         | "has" | "merge" | "jsonPath"
         | "assert"
+        | "defaults" | "renameKeys"
+        | "intersection" | "union" | "difference" | "symmetricDifference"
+        | "countBy" | "keyBy" | "explode" | "window"
+        | "gcd" | "lcm"
+        | "template" | "expr"
         | "formatPhone" | "movingAvg" | "businessDays" => 2,
 
         // Arity 3
@@ -896,15 +907,18 @@ fn get_verb_arity(verb: &str) -> i32 {
         | "slice" | "range" | "shift" | "rank" | "lag" | "lead"
         | "sample" | "fillMissing"
         | "get"
+        | "hmac" | "xnpv" | "xirr"
         | "reduce" | "pivot" | "unpivot" | "convertUnit" => 3,
 
         // Arity 4
         "rate" | "nper"
         | "filter" | "every" | "some" | "find" | "findIndex" | "partition"
+        | "countIf"
         | "bearing" | "midpoint" => 4,
 
         // Arity 5
-        "distance" | "interpolate" => 5,
+        "sumIf" | "avgIf"
+        | "distance" | "interpolate" => 5,
 
         // Arity 6
         "inBoundingBox" => 6,
@@ -1009,6 +1023,11 @@ fn parse_verb_expression(raw: &str) -> (FieldExpression, usize) {
     };
     let (args, args_consumed) = parse_expression_args(args_str, arity);
 
+    if !is_custom && verb == "expr" {
+        let expr = compile_expr_args(&args);
+        return (expr, verb_end + args_consumed);
+    }
+
     let verb_call = VerbCall {
         verb: verb.to_string(),
         is_custom,
@@ -1016,6 +1035,33 @@ fn parse_verb_expression(raw: &str) -> (FieldExpression, usize) {
     };
 
     (FieldExpression::Transform(verb_call), verb_end + args_consumed)
+}
+
+/// Compile a `%expr` macro from its parsed args into a verb tree. The first arg
+/// is the formula string; an optional second arg supplies the bindings object.
+/// On a compile error the resulting expression evaluates to a `[T015] …` error.
+fn compile_expr_args(args: &[VerbArg]) -> FieldExpression {
+    let formula = match args.first() {
+        Some(VerbArg::Literal(v)) => odin_value_to_string(v),
+        _ => return FieldExpression::Literal(OdinValues::string("[T015] Invalid %expr formula: missing formula")),
+    };
+    let binding_path = match args.get(1) {
+        Some(VerbArg::Reference(path, _)) => Some(path.clone()),
+        _ => None,
+    };
+    match crate::transform::expr::compile_expr(&formula, binding_path.as_deref()) {
+        Ok(VerbArg::Verb(call)) => FieldExpression::Transform(call),
+        Ok(VerbArg::Reference(path, dirs)) => {
+            let _ = dirs;
+            FieldExpression::Copy(path)
+        }
+        Ok(VerbArg::Literal(v)) => FieldExpression::Literal(v),
+        Err(e) => FieldExpression::Transform(VerbCall {
+            verb: "__exprError".to_string(),
+            is_custom: false,
+            args: vec![VerbArg::Literal(OdinValues::string(e.to_string()))],
+        }),
+    }
 }
 
 /// Parse a verb expression as a `VerbArg` (for recursive use).
@@ -1158,6 +1204,12 @@ fn parse_expression_args(args_str: &str, limit: i32) -> (Vec<VerbArg>, usize) {
             // Null
             args.push(VerbArg::Literal(OdinValues::null()));
             pos += 1;
+        } else if args_str[pos..].starts_with("?true") && (pos + 5 >= bytes.len() || bytes[pos + 5].is_ascii_whitespace()) {
+            args.push(VerbArg::Literal(OdinValues::boolean(true)));
+            pos += 5;
+        } else if args_str[pos..].starts_with("?false") && (pos + 6 >= bytes.len() || bytes[pos + 6].is_ascii_whitespace()) {
+            args.push(VerbArg::Literal(OdinValues::boolean(false)));
+            pos += 6;
         } else if args_str[pos..].starts_with("true") && (pos + 4 >= bytes.len() || bytes[pos + 4].is_ascii_whitespace()) {
             args.push(VerbArg::Literal(OdinValues::boolean(true)));
             pos += 4;

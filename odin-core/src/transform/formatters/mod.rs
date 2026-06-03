@@ -1854,11 +1854,13 @@ fn write_odin_section_with_mods(
         output.push_str(key);
         output.push_str("}\n");
 
-        // Phase 1: Inline items (scalars and leaf chains)
+        // Phase 1: inline items (scalars, leaf chains, and arrays) in field order
         for (child_key, child_val) in entries {
             match child_val {
                 DynValue::Object(_) if !is_pure_leaf_chain(child_val) => {}
-                DynValue::Array(_) => {}
+                DynValue::Array(items) => {
+                    write_odin_array_subsection_with_parent(output, child_key, items, Some(key));
+                }
                 DynValue::Object(_) => {
                     let full_path = format!("{key}.{child_key}");
                     collect_leaf_paths_with_mods(output, child_key, child_val, &full_path, modifiers);
@@ -1869,13 +1871,7 @@ fn write_odin_section_with_mods(
                 }
             }
         }
-        // Phase 2: Array subsections first, then object subsections.
-        // Arrays appear before objects.
-        for (child_key, child_val) in entries {
-            if let DynValue::Array(items) = child_val {
-                write_odin_array_subsection_with_parent(output, child_key, items, Some(key));
-            }
-        }
+        // Phase 2: object subsections.
         // Each child is a direct child of this absolute section
         for (child_key, child_val) in entries {
             match child_val {
@@ -1926,14 +1922,17 @@ fn write_odin_subsection_with_mods_inner(
         this_is_relative = false;
     }
 
-    // Phase 1: Inline items
+    // Phase 1: inline items (scalars, leaf chains, and arrays) in field order
     for (child_key, child_val) in fields {
         match child_val {
             DynValue::Object(_) if is_pure_leaf_chain(child_val) => {
                 let child_full = format!("{full_path}.{child_key}");
                 collect_leaf_paths_with_mods(output, child_key, child_val, &child_full, modifiers);
             }
-            DynValue::Object(_) | DynValue::Array(_) => {}
+            DynValue::Array(items) => {
+                write_odin_array_subsection_with_parent(output, child_key, items, Some(full_path));
+            }
+            DynValue::Object(_) => {}
             _ => {
                 let child_full = format!("{full_path}.{child_key}");
                 write_odin_assignment_with_mods(output, child_key, child_val, &child_full, modifiers);
@@ -1941,12 +1940,7 @@ fn write_odin_subsection_with_mods_inner(
         }
     }
 
-    // Phase 2: Array subsections first, then object subsections
-    for (child_key, child_val) in fields {
-        if let DynValue::Array(items) = child_val {
-            write_odin_array_subsection_with_parent(output, child_key, items, Some(full_path));
-        }
-    }
+    // Phase 2: object subsections.
     // Each child is evaluated against this section's scope
     for (child_key, child_val) in fields {
         match child_val {
@@ -1988,26 +1982,10 @@ fn write_odin_nested(output: &mut String, prefix: &str, value: &DynValue) {
 /// Whether a section emits direct content under its own scope and therefore
 /// needs its `{name}` header. False only when every field renders as an
 /// absolute-path subsection (a single-element scalar array `{name.field[]}`).
-fn section_needs_header(fields: &[(String, DynValue)]) -> bool {
-    if fields.is_empty() {
-        return true;
-    }
-    for (_, val) in fields {
-        match val {
-            DynValue::Array(items) => {
-                let scalar_only = !items.iter()
-                    .any(|v| matches!(v, DynValue::Object(_) | DynValue::Array(_)));
-                let non_null = items.iter().filter(|v| !matches!(v, DynValue::Null)).count();
-                // A single non-null scalar element renders absolute (no header);
-                // anything else (empty, all-null, multi, or nested) is relative.
-                if !(scalar_only && non_null == 1) {
-                    return true;
-                }
-            }
-            _ => return true,
-        }
-    }
-    false
+fn section_needs_header(_fields: &[(String, DynValue)]) -> bool {
+    // Every field now renders under this section's scope (scalars inline, arrays
+    // and objects as relative subsections), so the `{name}` header is always needed.
+    true
 }
 
 /// Write a top-level ODIN section with proper sub-section handling.
@@ -2027,29 +2005,27 @@ fn write_odin_section(output: &mut String, name: &str, fields: &[(String, DynVal
     let mut path_buf = String::with_capacity(scope_path.len() + 32);
     path_buf.push_str(scope_path);
 
-    // Phase 1: Output inline items (scalars + leaf chains) in original field order
+    // Phase 1: inline items (scalars, leaf chains, and arrays) in field order
     for (key, val) in fields {
         match val {
             DynValue::Object(_) if is_pure_leaf_chain(val) => {
                 collect_leaf_paths_inner(output, key, val);
             }
-            DynValue::Object(_) | DynValue::Array(_) => {}
+            DynValue::Array(items) => {
+                write_odin_array_subsection_with_parent(output, key, items, Some(&path_buf));
+            }
+            DynValue::Object(_) => {}
             _ => write_odin_assignment(output, key, val),
         }
     }
 
-    // Phase 2: Array subsections first, then object subsections
-    for (key, val) in fields {
-        if let DynValue::Array(items) = val {
-            write_odin_array_subsection_with_parent(output, key, items, Some(&path_buf));
-        }
-    }
+    // Phase 2: object subsections.
     // Each child is a direct child of this absolute section, so each gets evaluated
     // against the section scope independently (inside_relative = false).
     let scope_len = path_buf.len();
     for (key, val) in fields {
         match val {
-            DynValue::Object(sub_fields) if !is_pure_leaf_chain(val) => {
+            DynValue::Object(sub_fields) if !sub_fields.is_empty() && !is_pure_leaf_chain(val) => {
                 path_buf.push('.');
                 path_buf.push_str(key);
                 write_odin_subsection_buf(output, &mut path_buf, key, sub_fields, scope_len, false);
@@ -2099,28 +2075,25 @@ fn write_odin_subsection_buf(
         this_is_relative = false;
     }
 
-    // Phase 1: scalars + leaf chains
+    // Phase 1: scalars, leaf chains, and arrays in field order
     for (key, val) in fields {
         match val {
             DynValue::Object(_) if is_pure_leaf_chain(val) => {
                 collect_leaf_paths_inner(output, key, val);
             }
-            DynValue::Object(_) | DynValue::Array(_) => {}
+            DynValue::Array(items) => {
+                write_odin_array_subsection_with_parent(output, key, items, Some(path_buf));
+            }
+            DynValue::Object(_) => {}
             _ => write_odin_assignment(output, key, val),
         }
     }
 
-    // Phase 2a: array subsections under this section's full_path
-    for (key, val) in fields {
-        if let DynValue::Array(items) = val {
-            write_odin_array_subsection_with_parent(output, key, items, Some(path_buf));
-        }
-    }
-    // Phase 2b: nested object subsections — each evaluated against this section's scope
+    // Phase 2: nested object subsections — each evaluated against this section's scope
     let new_scope_len = path_buf.len();
     for (key, val) in fields {
         match val {
-            DynValue::Object(sub_fields) if !is_pure_leaf_chain(val) => {
+            DynValue::Object(sub_fields) if !sub_fields.is_empty() && !is_pure_leaf_chain(val) => {
                 path_buf.push('.');
                 path_buf.push_str(key);
                 write_odin_subsection_buf(output, path_buf, key, sub_fields, new_scope_len, this_is_relative);
@@ -2372,12 +2345,14 @@ fn array_of_object_arrays_columns(items: &[DynValue]) -> Option<Vec<String>> {
     if items.is_empty() {
         return None;
     }
+    // Every item must be an array; collect the union of object-cell fields under
+    // an `[0].field` heading (a partition-style result flattens to one table).
     let mut columns: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut any_object = false;
     for item in items {
         let DynValue::Array(row) = item else { return None };
-        for (i, cell) in row.iter().enumerate() {
+        for cell in row {
             match cell {
                 DynValue::Object(fields) => {
                     any_object = true;
@@ -2385,7 +2360,7 @@ fn array_of_object_arrays_columns(items: &[DynValue]) -> Option<Vec<String>> {
                         if matches!(fv, DynValue::Object(_) | DynValue::Array(_)) {
                             return None;
                         }
-                        let col = format!("[{i}].{fk}");
+                        let col = format!("[0].{fk}");
                         if seen.insert(col.clone()) {
                             columns.push(col);
                         }
@@ -2393,7 +2368,7 @@ fn array_of_object_arrays_columns(items: &[DynValue]) -> Option<Vec<String>> {
                 }
                 DynValue::Array(_) => return None,
                 _ => {
-                    let col = format!("[{i}]");
+                    let col = "[0]".to_string();
                     if seen.insert(col.clone()) {
                         columns.push(col);
                     }
@@ -2404,31 +2379,32 @@ fn array_of_object_arrays_columns(items: &[DynValue]) -> Option<Vec<String>> {
     (any_object && !columns.is_empty()).then_some(columns)
 }
 
-/// Emit an array of object-bearing arrays as a table with `[i].field` columns.
+/// Emit an array of arrays as a flat table: each inner element is a row, columns
+/// are the object fields under an `[0].field` heading.
 fn write_object_array_table(output: &mut String, header_key: &str, items: &[DynValue], columns: &[String]) {
     let formatted = format_columns_with_relative(columns);
     let _ = writeln!(output, "{{{header_key} : {formatted}}}");
     for item in items {
         let DynValue::Array(row) = item else { continue };
-        let mut cells = Vec::with_capacity(columns.len());
-        for col in columns {
-            // Column form `[i]` or `[i].field`.
-            let close = col.find(']').unwrap();
-            let idx: usize = col[1..close].parse().unwrap_or(usize::MAX);
-            let field = col[close + 1..].strip_prefix('.');
-            let cell = row.get(idx).and_then(|c| match (c, field) {
-                (DynValue::Object(fields), Some(f)) => fields.iter().find(|(k, _)| k == f).map(|(_, v)| v),
-                (v, None) => Some(v),
-                _ => None,
-            });
-            match cell {
-                None => cells.push(String::new()),
-                Some(DynValue::Null) => cells.push("~".to_string()),
-                Some(v) => cells.push(odin_value_string(v)),
+        for cell in row {
+            let mut cells = Vec::with_capacity(columns.len());
+            for col in columns {
+                let close = col.find(']').unwrap();
+                let field = col[close + 1..].strip_prefix('.');
+                let value = match (cell, field) {
+                    (DynValue::Object(fields), Some(f)) => fields.iter().find(|(k, _)| k == f).map(|(_, v)| v),
+                    (v, None) => Some(v),
+                    _ => None,
+                };
+                match value {
+                    None => cells.push(String::new()),
+                    Some(DynValue::Null) => cells.push("~".to_string()),
+                    Some(v) => cells.push(odin_value_string(v)),
+                }
             }
+            output.push_str(&cells.join(", "));
+            output.push('\n');
         }
-        output.push_str(&cells.join(", "));
-        output.push('\n');
     }
 }
 
@@ -2468,18 +2444,12 @@ fn write_odin_array_subsection_with_parent(
     } else if let Some(cols) = array_of_object_arrays_columns(items) {
         write_object_array_table(output, &format!(".{key}[]"), items, &cols);
     } else {
-        // A single non-null-leaf array uses an absolute header
-        // (`{parent.key[]}`); empty, all-null, or multi-leaf arrays use the
-        // relative `{.key[]}` form (null elements are not leaves).
-        let non_null = items.iter().filter(|v| !matches!(v, DynValue::Null)).count();
-        if non_null == 1 {
-            if let Some(p) = parent_path.filter(|p| !p.is_empty()) {
-                let _ = writeln!(output, "{{{p}.{key}[] : ~}}");
-            } else {
-                let _ = writeln!(output, "{{{key}[] : ~}}");
-            }
-        } else {
+        // Nested under an open section: relative `{.key[]}`. At top level
+        // (no parent header): absolute `{key[]}`.
+        if parent_path.map_or(false, |p| !p.is_empty()) {
             let _ = writeln!(output, "{{.{key}[] : ~}}");
+        } else {
+            let _ = writeln!(output, "{{{key}[] : ~}}");
         }
         for item in items {
             write_odin_value(output, item);

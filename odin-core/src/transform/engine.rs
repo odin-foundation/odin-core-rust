@@ -205,6 +205,46 @@ fn is_known_output_format(format: &str) -> bool {
     KNOWN.iter().any(|k| format.eq_ignore_ascii_case(k))
 }
 
+/// Under strict types, verify a verb's arguments match the expected kinds.
+/// Returns a human message (without the T-code prefix) for the first mismatch.
+fn strict_type_error(verb: &str, args: &[DynValue]) -> Option<String> {
+    let kind = |v: &DynValue| -> &'static str {
+        match v {
+            DynValue::Null => "null",
+            DynValue::Bool(_) => "boolean",
+            DynValue::Integer(_) | DynValue::Float(_)
+            | DynValue::Currency(..) | DynValue::Percent(_)
+            | DynValue::CurrencyRaw(..) | DynValue::FloatRaw(_) => "number",
+            DynValue::String(_) => "string",
+            DynValue::Array(_) => "array",
+            DynValue::Object(_) => "object",
+            DynValue::Date(_) | DynValue::Timestamp(_)
+            | DynValue::Time(_) | DynValue::Duration(_) => "date",
+            DynValue::Reference(_) => "reference",
+            DynValue::Binary(_) => "binary",
+        }
+    };
+    let is_number = |v: &DynValue| matches!(v,
+        DynValue::Integer(_) | DynValue::Float(_)
+        | DynValue::Currency(..) | DynValue::Percent(_)
+        | DynValue::CurrencyRaw(..) | DynValue::FloatRaw(_));
+
+    // Single-argument numeric verbs.
+    const NUM1: &[&str] = &[
+        "abs", "round", "floor", "ceil", "negate", "sign", "trunc",
+        "sqrt", "ln", "log10", "exp", "factorial",
+        "formatInteger", "formatCurrency", "formatNumber",
+    ];
+    if NUM1.contains(&verb) {
+        if let Some(a0) = args.first() {
+            if !is_number(a0) {
+                return Some(format!("Type error in %{verb}: Arg 1: expected number, got {}", kind(a0)));
+            }
+        }
+    }
+    None
+}
+
 /// Policy applied when a `%lookup` reports a miss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissingPolicy {
@@ -1538,8 +1578,9 @@ fn process_mapping(
             } else {
                 val
             };
-            // Target "_" means discard (side-effect only, e.g., accumulate)
-            if mapping.target != "_" {
+            // Any `_`-prefixed target is a computation-only sink: it runs for
+            // side effects (e.g. accumulate) but is not emitted.
+            if !mapping.target.starts_with('_') {
                 set_path(output, &mapping.target, final_val);
             }
             // Record field modifiers for ODIN/XML formatter (using full path)
@@ -2064,6 +2105,61 @@ fn execute_verb_call(
         return Ok(DynValue::Null);
     }
 
+    // Lazy control-flow: evaluate the condition first, then only the selected
+    // branch — unselected branches must not run their side effects. Strict-types
+    // mode validates all args, so it falls through to eager evaluation.
+    if !ctx.strict_types {
+        let ev = |i: usize, ctx: &mut ExecContext| evaluate_verb_arg(&call.args[i], ctx, current_source, current_output);
+        match call.verb.as_str() {
+            "and" if call.args.len() >= 2 => {
+                if !is_truthy(&ev(0, ctx)?) {
+                    return Ok(DynValue::Bool(false));
+                }
+                return Ok(DynValue::Bool(is_truthy(&ev(1, ctx)?)));
+            }
+            "or" if call.args.len() >= 2 => {
+                if is_truthy(&ev(0, ctx)?) {
+                    return Ok(DynValue::Bool(true));
+                }
+                return Ok(DynValue::Bool(is_truthy(&ev(1, ctx)?)));
+            }
+            "ifNull" if call.args.len() >= 2 => {
+                let v0 = ev(0, ctx)?;
+                return if matches!(v0, DynValue::Null) { ev(1, ctx) } else { Ok(v0) };
+            }
+            "ifEmpty" if call.args.len() >= 2 => {
+                let v0 = ev(0, ctx)?;
+                let empty = matches!(&v0, DynValue::Null) || matches!(&v0, DynValue::String(s) if s.is_empty());
+                return if empty { ev(1, ctx) } else { Ok(v0) };
+            }
+            "coalesce" if !call.args.is_empty() => {
+                for i in 0..call.args.len() {
+                    let v = ev(i, ctx)?;
+                    if !matches!(v, DynValue::Null) {
+                        return Ok(v);
+                    }
+                }
+                return Ok(DynValue::Null);
+            }
+            "switch" if call.args.len() >= 2 => {
+                let subject = crate::transform::verbs::coerce_str_pub(&ev(0, ctx)?);
+                let mut i = 1;
+                while i + 1 < call.args.len() {
+                    if subject == crate::transform::verbs::coerce_str_pub(&ev(i, ctx)?) {
+                        return ev(i + 1, ctx);
+                    }
+                    i += 2;
+                }
+                return if (call.args.len() - 1) % 2 == 1 {
+                    ev(call.args.len() - 1, ctx)
+                } else {
+                    Ok(DynValue::Null)
+                };
+            }
+            _ => {}
+        }
+    }
+
     // Standard eager evaluation for all other verbs
     let mut evaluated_args = Vec::with_capacity(call.args.len());
     for arg in &call.args {
@@ -2120,6 +2216,13 @@ fn execute_verb_call(
         lookup_miss: std::cell::Cell::new(None),
         overflow: std::cell::Cell::new(None),
     };
+
+    // Under strict types, reject mistyped arguments before the verb coerces them.
+    if ctx.strict_types {
+        if let Some(msg) = strict_type_error(&call.verb, &evaluated_args) {
+            return Err(format!("[{}] {msg}", transform_error_codes::T002_INVALID_VERB_ARGS));
+        }
+    }
 
     let result = match verb_fn(&evaluated_args, &verb_ctx) {
         Ok(v) => v,
@@ -10526,7 +10629,7 @@ mod extended_tests {
 
     #[test]
     fn ext_strict_round_float() {
-        let t = mk_transform(vec![verb_field("Out", "round", vec![ref_arg("@.val")])]);
+        let t = mk_transform(vec![verb_field("Out", "round", vec![ref_arg("@.val"), lit_arg_int(0)])]);
         let result = execute(&t, &src_obj(vec![("val", f(3.7))]));
         assert!(result.success);
         let out = result.output.unwrap();
@@ -10536,7 +10639,7 @@ mod extended_tests {
 
     #[test]
     fn ext_strict_round_negative() {
-        let t = mk_transform(vec![verb_field("Out", "round", vec![ref_arg("@.val")])]);
+        let t = mk_transform(vec![verb_field("Out", "round", vec![ref_arg("@.val"), lit_arg_int(0)])]);
         let result = execute(&t, &src_obj(vec![("val", f(-2.3))]));
         assert!(result.success);
         let out = result.output.unwrap();
@@ -11346,13 +11449,12 @@ mod extended_tests {
     #[test]
     fn ext_verb_split() {
         let t = mk_transform(vec![verb_field("Out", "split", vec![
-            ref_arg("@.val"), lit_arg_str(","),
+            ref_arg("@.val"), lit_arg_str(","), lit_arg_int(1),
         ])]);
         let result = execute(&t, &src_obj(vec![("val", s("a,b,c"))]));
         assert!(result.success);
         let out = result.output.unwrap();
-        let arr = out.get("Out").unwrap().as_array().unwrap();
-        assert_eq!(arr.len(), 3);
+        assert_eq!(out.get("Out").unwrap().as_str(), Some("b"));
     }
 
     #[test]
@@ -13694,6 +13796,7 @@ mod extended_tests_2 {
         let t = minimal_transform(vec![
             verb_mapping("Val", "round", vec![
                 VerbArg::Reference("@.num".to_string(), Vec::new()),
+                VerbArg::Literal(crate::types::values::OdinValues::integer(0)),
             ]),
         ]);
         let r = execute(&t, &json_obj(vec![("num", f(3.7))]));

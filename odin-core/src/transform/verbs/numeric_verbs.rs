@@ -234,10 +234,80 @@ pub(super) fn format_number(args: &[DynValue], _ctx: &VerbContext) -> Result<Dyn
 }
 
 /// formatInteger: format as integer (truncate decimals).
+/// Parse a leading integer prefix in the given radix; sign optional. None if no
+/// valid digit follows the sign.
+fn parse_int_prefix(s: &str, radix: u32) -> Option<i64> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut neg = false;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        neg = bytes[i] == b'-';
+        i += 1;
+    }
+    let start = i;
+    let mut acc: i64 = 0;
+    while i < bytes.len() {
+        let d = (bytes[i] as char).to_digit(radix);
+        match d {
+            Some(v) => acc = acc.saturating_mul(radix as i64).saturating_add(v as i64),
+            None => break,
+        }
+        i += 1;
+    }
+    if i == start { return None; }
+    Some(if neg { -acc } else { acc })
+}
+
 pub(super) fn format_integer(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("formatInteger: requires 1 argument")?)
-        .ok_or("formatInteger: argument must be numeric")?;
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let val = super::to_number(&args[0]).floor();
     Ok(DynValue::String(format!("{}", val as i64)))
+}
+
+/// gcd: greatest common divisor of two integers.
+pub(super) fn gcd(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let mut a = super::to_number(&args[0]).trunc().abs();
+    let mut b = super::to_number(&args[1]).trunc().abs();
+    if !a.is_finite() || !b.is_finite() { return Ok(DynValue::Null); }
+    while b != 0.0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    Ok(DynValue::Integer(a as i64))
+}
+
+/// lcm: least common multiple of two integers.
+pub(super) fn lcm(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let a = super::to_number(&args[0]).trunc().abs();
+    let b = super::to_number(&args[1]).trunc().abs();
+    if !a.is_finite() || !b.is_finite() { return Ok(DynValue::Null); }
+    if a == 0.0 || b == 0.0 { return Ok(DynValue::Integer(0)); }
+    let (mut x, mut y) = (a, b);
+    while y != 0.0 {
+        let t = x % y;
+        x = y;
+        y = t;
+    }
+    let result = (a / x) * b;
+    if result.abs() > 9_007_199_254_740_991.0 { return Ok(DynValue::Null); }
+    Ok(DynValue::Integer(result as i64))
+}
+
+/// factorial: defined for integers 0..=18; otherwise null.
+pub(super) fn factorial(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let n = super::to_number(&args[0]);
+    if n.fract() != 0.0 || n < 0.0 || n > 18.0 { return Ok(DynValue::Null); }
+    let mut result: i64 = 1;
+    let mut i = 2i64;
+    while i <= n as i64 {
+        result *= i;
+        i += 1;
+    }
+    Ok(DynValue::Integer(result))
 }
 
 /// formatCurrency: format with 2 decimal places.
@@ -249,32 +319,20 @@ pub(super) fn format_currency(args: &[DynValue], _ctx: &VerbContext) -> Result<D
 
 /// floor: floor function.
 pub(super) fn floor(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("floor: requires 1 argument")?)
-        .ok_or("floor: argument must be numeric")?;
-    Ok(numeric_result(val.floor()))
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(DynValue::Integer(super::to_number(&args[0]).floor() as i64))
 }
 
 /// ceil: ceiling function.
 pub(super) fn ceil(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("ceil: requires 1 argument")?)
-        .ok_or("ceil: argument must be numeric")?;
-    Ok(numeric_result(val.ceil()))
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(DynValue::Integer(super::to_number(&args[0]).ceil() as i64))
 }
 
 /// negate: negate a number.
 pub(super) fn negate(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    match args.first() {
-        Some(DynValue::Integer(n)) => Ok(DynValue::Integer(-n)),
-        Some(DynValue::Float(n)) => Ok(numeric_result(-n)),
-        Some(DynValue::String(s)) => {
-            if let Ok(n) = s.parse::<f64>() {
-                Ok(numeric_result(-n))
-            } else {
-                Err("negate: cannot parse string as number".to_string())
-            }
-        }
-        _ => Err("negate: expected numeric argument".to_string()),
-    }
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(numeric_result(-super::to_number(&args[0])))
 }
 
 /// switch: first arg is value, then pairs of (match, result), optional last default.
@@ -406,16 +464,22 @@ pub(super) fn format_percent(args: &[DynValue], _ctx: &VerbContext) -> Result<Dy
 
 /// isFinite: check if number is finite.
 pub(super) fn is_finite(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("isFinite: requires 1 argument")?)
-        .ok_or("isFinite: argument must be numeric")?;
-    Ok(DynValue::Bool(val.is_finite()))
+    match args.first() {
+        Some(DynValue::Integer(_)) => Ok(DynValue::Bool(true)),
+        Some(DynValue::Float(f) | DynValue::Currency(f, _, _)) => Ok(DynValue::Bool(f.is_finite())),
+        Some(_) => Ok(DynValue::Bool(false)),
+        None => Ok(DynValue::Null),
+    }
 }
 
 /// isNaN: check if NaN.
 pub(super) fn is_nan(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("isNaN: requires 1 argument")?)
-        .ok_or("isNaN: argument must be numeric")?;
-    Ok(DynValue::Bool(val.is_nan()))
+    match args.first() {
+        Some(DynValue::Integer(_)) => Ok(DynValue::Bool(false)),
+        Some(DynValue::Float(f) | DynValue::Currency(f, _, _)) => Ok(DynValue::Bool(f.is_nan())),
+        Some(_) => Ok(DynValue::Bool(false)),
+        None => Ok(DynValue::Null),
+    }
 }
 
 /// parseInt: parse string as integer, optional radix.
@@ -426,14 +490,14 @@ pub(super) fn parse_int(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
         Some(DynValue::Float(n)) => return Ok(DynValue::Integer(*n as i64)),
         _ => return Err("parseInt: requires a string or numeric argument".to_string()),
     };
-    let radix = args.get(1).and_then(|v| to_f64(v)).unwrap_or(10.0) as u32;
+    let radix = args.get(1).map_or(10.0, |v| super::to_number(v).floor()) as i64;
     if !(2..=36).contains(&radix) {
-        return Err(format!("parseInt: radix must be between 2 and 36, got {radix}"));
+        return Ok(DynValue::Null);
     }
-    let trimmed = s.trim();
-    i64::from_str_radix(trimmed, radix)
-        .map(DynValue::Integer)
-        .map_err(|_| format!("parseInt: cannot parse '{trimmed}' with radix {radix}"))
+    match parse_int_prefix(s.trim(), radix as u32) {
+        Some(n) => Ok(DynValue::Integer(n)),
+        None => Ok(DynValue::Null),
+    }
 }
 
 /// safeDivide: divide, return default on division by zero.
@@ -455,22 +519,45 @@ pub(super) fn format_locale_number(args: &[DynValue], _ctx: &VerbContext) -> Res
     if args.is_empty() {
         return Err("formatLocaleNumber: requires at least 1 argument (number)".to_string());
     }
-    let val = to_f64(&args[0]).ok_or("formatLocaleNumber: first argument must be numeric")?;
-    // Locale-aware formatting. For en-US (and default), use comma thousands separators.
-    let _locale = args.get(1).and_then(|a| a.as_str()).unwrap_or("en-US");
+    let val = super::to_number(&args[0]);
+    if !val.is_finite() { return Ok(DynValue::Null); }
+    let locale = args.get(1).and_then(|a| a.as_str()).unwrap_or("");
+    // Locales using '.' for grouping and ',' for the decimal mark.
+    let comma_decimal = matches!(
+        locale.split(['-', '_']).next().unwrap_or(""),
+        "de" | "es" | "it" | "nl" | "da" | "tr" | "pt"
+    );
+    let (group, decimal) = if comma_decimal { ('.', ',') } else { (',', '.') };
 
-    // Check if value is an integer
-    if val.fract() == 0.0 && val.abs() < i64::MAX as f64 {
-        let int_val = val as i64;
-        Ok(DynValue::String(format_with_thousands(int_val, None)))
-    } else {
-        // Format with decimal places preserved
-        let s = format!("{val}");
-        let _decimal_places = s.find('.').map(|p| s.len() - p - 1);
-        let int_part = val.trunc() as i64;
-        let frac_part = &s[s.find('.').unwrap_or(s.len())..];
-        Ok(DynValue::String(format!("{}{}", format_with_thousands(int_part, None), frac_part)))
+    let negative = val < 0.0;
+    let abs = val.abs();
+    // Up to 3 fraction digits, trailing zeros trimmed (Intl default).
+    let rounded = (abs * 1000.0).round() / 1000.0;
+    let int_part = rounded.trunc() as i64;
+    let frac = rounded - int_part as f64;
+
+    let mut int_str = String::new();
+    let digits = int_part.to_string();
+    let chars: Vec<char> = digits.chars().collect();
+    for (i, ch) in chars.iter().enumerate() {
+        if i > 0 && (chars.len() - i) % 3 == 0 {
+            int_str.push(group);
+        }
+        int_str.push(*ch);
     }
+
+    let mut out = String::new();
+    if negative { out.push('-'); }
+    out.push_str(&int_str);
+    if frac > 0.0 {
+        let frac_str = format!("{:.3}", frac);
+        let trimmed = frac_str.trim_start_matches("0.").trim_end_matches('0');
+        if !trimmed.is_empty() {
+            out.push(decimal);
+            out.push_str(trimmed);
+        }
+    }
+    Ok(DynValue::String(out))
 }
 
 /// Format integer with thousands separators (commas for en-US).
@@ -512,12 +599,11 @@ pub(super) fn now_verb(_args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
 /// Supported patterns: YYYY, MM, DD, separated by any char.
 pub(super) fn format_date(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("formatDate: requires 2 arguments (date, pattern)".to_string());
+        return Ok(DynValue::Null);
     }
     let date_str = super::coerce_str(&args[0]);
     let pattern = super::coerce_str(&args[1]);
-    let (year, month, day) = parse_ymd(&date_str)
-        .ok_or_else(|| format!("formatDate: cannot parse date '{date_str}'"))?;
+    let Some((year, month, day)) = parse_ymd(&date_str) else { return Ok(DynValue::Null) };
     let result = pattern
         .replace("YYYY", &format!("{year:04}"))
         .replace("MM", &format!("{month:02}"))
@@ -663,12 +749,11 @@ pub(super) fn parse_timestamp_verb(args: &[DynValue], _ctx: &VerbContext) -> Res
 /// addDays: add N days to date.
 pub(super) fn add_days(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("addDays: requires 2 arguments (date, days)".to_string());
+        return Ok(DynValue::Null);
     }
-    let date_str = args[0].as_str().ok_or("addDays: first argument must be a date string")?;
-    let n = to_f64(&args[1]).ok_or("addDays: second argument must be numeric")? as i64;
-    let (year, month, day) = parse_ymd(date_str)
-        .ok_or_else(|| format!("addDays: cannot parse date '{date_str}'"))?;
+    let Some(date_str) = args[0].as_str() else { return Ok(DynValue::Null) };
+    let n = super::to_number(&args[1]) as i64;
+    let Some((year, month, day)) = parse_ymd(date_str) else { return Ok(DynValue::Null) };
     let total = days_from_civil(year, month, day) + n;
     let (ny, nm, nd) = civil_from_days(total);
     Ok(DynValue::String(format_ymd(ny, nm, nd)))
@@ -677,12 +762,11 @@ pub(super) fn add_days(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
 /// addMonths: add N months to date.
 pub(super) fn add_months(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("addMonths: requires 2 arguments (date, months)".to_string());
+        return Ok(DynValue::Null);
     }
-    let date_str = args[0].as_str().ok_or("addMonths: first argument must be a date string")?;
-    let n = to_f64(&args[1]).ok_or("addMonths: second argument must be numeric")? as i32;
-    let (year, month, day) = parse_ymd(date_str)
-        .ok_or_else(|| format!("addMonths: cannot parse date '{date_str}'"))?;
+    let Some(date_str) = args[0].as_str() else { return Ok(DynValue::Null) };
+    let n = super::to_number(&args[1]) as i32;
+    let Some((year, month, day)) = parse_ymd(date_str) else { return Ok(DynValue::Null) };
 
     let total_months = year * 12 + month as i32 - 1 + n;
     let new_year = total_months.div_euclid(12);
@@ -696,12 +780,11 @@ pub(super) fn add_months(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVal
 /// addYears: add N years to date.
 pub(super) fn add_years(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("addYears: requires 2 arguments (date, years)".to_string());
+        return Ok(DynValue::Null);
     }
-    let date_str = args[0].as_str().ok_or("addYears: first argument must be a date string")?;
-    let n = to_f64(&args[1]).ok_or("addYears: second argument must be numeric")? as i32;
-    let (year, month, day) = parse_ymd(date_str)
-        .ok_or_else(|| format!("addYears: cannot parse date '{date_str}'"))?;
+    let Some(date_str) = args[0].as_str() else { return Ok(DynValue::Null) };
+    let n = super::to_number(&args[1]) as i32;
+    let Some((year, month, day)) = parse_ymd(date_str) else { return Ok(DynValue::Null) };
 
     let new_year = year + n;
     let max_day = days_in_month(new_year, month);
@@ -808,11 +891,9 @@ pub(super) fn start_of_month(args: &[DynValue], _ctx: &VerbContext) -> Result<Dy
 
 /// endOfMonth: return last day of the month.
 pub(super) fn end_of_month(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let s = args.first().and_then(DynValue::as_str)
-        .ok_or("endOfMonth: requires a date string")?;
-    let (y, m, _) = parse_ymd(s)
-        .or_else(|| parse_timestamp(s).map(|(y, m, _, _, _, _)| (y, m, 1)))
-        .ok_or_else(|| format!("endOfMonth: cannot parse '{s}'"))?;
+    let Some(s) = args.first().and_then(DynValue::as_str) else { return Ok(DynValue::Null) };
+    let Some((y, m, _)) = parse_ymd(s).or_else(|| parse_timestamp(s).map(|(y, m, _, _, _, _)| (y, m, 1)))
+    else { return Ok(DynValue::Null) };
     let last = days_in_month(y, m);
     Ok(DynValue::String(format_ymd(y, m, last)))
 }
@@ -829,35 +910,35 @@ pub(super) fn start_of_year(args: &[DynValue], _ctx: &VerbContext) -> Result<Dyn
 
 /// endOfYear: return December 31st of the year.
 pub(super) fn end_of_year(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let s = args.first().and_then(DynValue::as_str)
-        .ok_or("endOfYear: requires a date string")?;
-    let (y, _, _) = parse_ymd(s)
-        .or_else(|| parse_timestamp(s).map(|(y, _, _, _, _, _)| (y, 1, 1)))
-        .ok_or_else(|| format!("endOfYear: cannot parse '{s}'"))?;
+    let Some(s) = args.first().and_then(DynValue::as_str) else { return Ok(DynValue::Null) };
+    let Some((y, _, _)) = parse_ymd(s).or_else(|| parse_timestamp(s).map(|(y, _, _, _, _, _)| (y, 1, 1)))
+    else { return Ok(DynValue::Null) };
     Ok(DynValue::String(format_ymd(y, 12, 31)))
 }
 
-/// dayOfWeek: returns 0-6 (Sunday=0).
+/// dayOfWeek: returns 1-7 (Monday=1, Sunday=7).
 pub(super) fn day_of_week(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let s = args.first().and_then(DynValue::as_str)
-        .ok_or("dayOfWeek: requires a date string")?;
-    let (y, m, d) = parse_ymd(s)
-        .or_else(|| parse_timestamp(s).map(|(y, m, d, _, _, _)| (y, m, d)))
-        .ok_or_else(|| format!("dayOfWeek: cannot parse '{s}'"))?;
-    Ok(DynValue::Integer(i64::from(day_of_week_from_civil(y, m, d))))
+    let Some(s) = args.first().and_then(DynValue::as_str) else { return Ok(DynValue::Null) };
+    let Some((y, m, d)) = parse_ymd(s).or_else(|| parse_timestamp(s).map(|(y, m, d, _, _, _)| (y, m, d)))
+    else { return Ok(DynValue::Null) };
+    // day_of_week_from_civil yields 0=Sunday..6=Saturday; remap to ISO 1..7.
+    let js = day_of_week_from_civil(y, m, d);
+    let iso = if js == 0 { 7 } else { js };
+    Ok(DynValue::Integer(i64::from(iso)))
 }
 
-/// weekOfYear: returns 1-53 (ISO-like week number).
+/// weekOfYear: ISO 8601 week number (1-53).
 pub(super) fn week_of_year(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let s = args.first().and_then(DynValue::as_str)
-        .ok_or("weekOfYear: requires a date string")?;
-    let (y, m, d) = parse_ymd(s)
-        .or_else(|| parse_timestamp(s).map(|(y, m, d, _, _, _)| (y, m, d)))
-        .ok_or_else(|| format!("weekOfYear: cannot parse '{s}'"))?;
-    let jan1 = days_from_civil(y, 1, 1);
-    let current = days_from_civil(y, m, d);
-    let day_of_year = current - jan1;
-    let week = (day_of_year / 7) + 1;
+    let Some(s) = args.first().and_then(DynValue::as_str) else { return Ok(DynValue::Null) };
+    let Some((y, m, d)) = parse_ymd(s).or_else(|| parse_timestamp(s).map(|(y, m, d, _, _, _)| (y, m, d)))
+    else { return Ok(DynValue::Null) };
+    // Shift to the Thursday of the current ISO week, then count weeks from Jan 1.
+    let js = day_of_week_from_civil(y, m, d);
+    let day_num = if js == 0 { 7 } else { js } as i64;
+    let thursday = days_from_civil(y, m, d) + 4 - day_num;
+    let (ty, _, _) = civil_from_days(thursday);
+    let year_start = days_from_civil(ty, 1, 1);
+    let week = (((thursday - year_start) as f64 + 1.0) / 7.0).ceil() as i64;
     Ok(DynValue::Integer(week))
 }
 
@@ -950,29 +1031,27 @@ pub(super) fn from_unix(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
     Ok(DynValue::String(format_timestamp(y, m, d, h, mi, s)))
 }
 
-/// daysBetweenDates: absolute days between two dates.
+/// daysBetweenDates: signed days from the first date to the second.
 pub(super) fn days_between_dates(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("daysBetweenDates: requires 2 arguments".to_string());
+        return Ok(DynValue::Null);
     }
-    let d1 = args[0].as_str().ok_or("daysBetweenDates: first argument must be a date string")?;
-    let d2 = args[1].as_str().ok_or("daysBetweenDates: second argument must be a date string")?;
-    let (y1, m1, day1) = parse_ymd(d1).ok_or_else(|| format!("daysBetweenDates: cannot parse '{d1}'"))?;
-    let (y2, m2, day2) = parse_ymd(d2).ok_or_else(|| format!("daysBetweenDates: cannot parse '{d2}'"))?;
-    let diff = (days_from_civil(y2, m2, day2) - days_from_civil(y1, m1, day1)).abs();
+    let Some(d1) = args[0].as_str() else { return Ok(DynValue::Null) };
+    let Some(d2) = args[1].as_str() else { return Ok(DynValue::Null) };
+    let Some((y1, m1, day1)) = parse_ymd(d1) else { return Ok(DynValue::Null) };
+    let Some((y2, m2, day2)) = parse_ymd(d2) else { return Ok(DynValue::Null) };
+    let diff = days_from_civil(y2, m2, day2) - days_from_civil(y1, m1, day1);
     Ok(DynValue::Integer(diff))
 }
 
 /// ageFromDate: calculate age in years from a birth date.
 pub(super) fn age_from_date(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let birth = args.first().and_then(DynValue::as_str)
-        .ok_or("ageFromDate: requires a birth date string")?;
-    let (by, bm, bd) = parse_ymd(birth)
-        .ok_or_else(|| format!("ageFromDate: cannot parse '{birth}'"))?;
+    let Some(birth) = args.first().and_then(DynValue::as_str) else { return Ok(DynValue::Null) };
+    let Some((by, bm, bd)) = parse_ymd(birth) else { return Ok(DynValue::Null) };
 
     // Reference date: either second arg or current UTC date
     let (ry, rm, rd) = if let Some(ref_date) = args.get(1).and_then(DynValue::as_str) {
-        parse_ymd(ref_date).ok_or_else(|| format!("ageFromDate: cannot parse ref date '{ref_date}'"))?
+        match parse_ymd(ref_date) { Some(r) => r, None => return Ok(DynValue::Null) }
     } else {
         let (y, m, d, _, _, _) = utc_now();
         (y, m, d)
@@ -994,15 +1073,12 @@ pub(super) fn age_from_date(args: &[DynValue], _ctx: &VerbContext) -> Result<Dyn
 
 /// log: natural log or log base N.
 pub(super) fn log_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("log: requires at least 1 argument")?)
-        .ok_or("log: argument must be numeric")?;
-    if val <= 0.0 {
-        return Err("log: argument must be positive".to_string());
-    }
-    if let Some(base) = args.get(1).and_then(|v| to_f64(v)) {
-        if base <= 0.0 || base == 1.0 {
-            return Err("log: base must be positive and not 1".to_string());
-        }
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let val = super::to_number(&args[0]);
+    if val <= 0.0 { return Ok(DynValue::Null); }
+    if let Some(base_arg) = args.get(1) {
+        let base = super::to_number(base_arg);
+        if base <= 0.0 || base == 1.0 { return Ok(DynValue::Null); }
         Ok(numeric_result(val.ln() / base.ln()))
     } else {
         Ok(numeric_result(val.ln()))
@@ -1011,49 +1087,40 @@ pub(super) fn log_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
 
 /// ln: natural log.
 pub(super) fn ln(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("ln: requires 1 argument")?)
-        .ok_or("ln: argument must be numeric")?;
-    if val <= 0.0 {
-        return Err("ln: argument must be positive".to_string());
-    }
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let val = super::to_number(&args[0]);
+    if val <= 0.0 { return Ok(DynValue::Null); }
     Ok(numeric_result(val.ln()))
 }
 
 /// log10: log base 10.
 pub(super) fn log10(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("log10: requires 1 argument")?)
-        .ok_or("log10: argument must be numeric")?;
-    if val <= 0.0 {
-        return Err("log10: argument must be positive".to_string());
-    }
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let val = super::to_number(&args[0]);
+    if val <= 0.0 { return Ok(DynValue::Null); }
     Ok(numeric_result(val.log10()))
 }
 
 /// exp: e^x.
 pub(super) fn exp_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("exp: requires 1 argument")?)
-        .ok_or("exp: argument must be numeric")?;
-    Ok(DynValue::Float(val.exp()))
+    if args.is_empty() { return Ok(DynValue::Null); }
+    Ok(numeric_result(super::to_number(&args[0]).exp()))
 }
 
 /// pow: x^y.
 pub(super) fn pow_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    if args.len() < 2 {
-        return Err("pow: requires 2 arguments (base, exponent)".to_string());
-    }
-    let base = to_f64(&args[0]).ok_or("pow: base must be numeric")?;
-    let exp = to_f64(&args[1]).ok_or("pow: exponent must be numeric")?;
-    Ok(DynValue::Float(base.powf(exp)))
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let base = super::to_number(&args[0]);
+    let exp = super::to_number(&args[1]);
+    Ok(numeric_result(base.powf(exp)))
 }
 
 /// sqrt: square root.
 pub(super) fn sqrt(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let val = to_f64(args.first().ok_or("sqrt: requires 1 argument")?)
-        .ok_or("sqrt: argument must be numeric")?;
-    if val < 0.0 {
-        return Err("sqrt: argument must be non-negative".to_string());
-    }
-    Ok(DynValue::Float(val.sqrt()))
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let val = super::to_number(&args[0]);
+    if val < 0.0 { return Ok(DynValue::Null); }
+    Ok(numeric_result(val.sqrt()))
 }
 
 /// compound: compound interest: principal * (1 + rate)^periods.
@@ -1113,15 +1180,19 @@ pub(super) fn fv(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Stri
 /// pv: present value of annuity: pmt * (1 - (1+r)^-n) / r.
 pub(super) fn pv(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 3 {
-        return Err("pv: requires 3 arguments (payment, rate, periods)".to_string());
+        return Ok(DynValue::Null);
     }
-    let payment = to_f64(&args[0]).ok_or("pv: payment must be numeric")?;
-    let r = to_f64(&args[1]).ok_or("pv: rate must be numeric")?;
-    let n = to_f64(&args[2]).ok_or("pv: periods must be numeric")?;
+    let payment = super::to_number(&args[0]);
+    let r = super::to_number(&args[1]);
+    let n = super::to_number(&args[2]);
     if r == 0.0 {
-        return Ok(DynValue::Float(payment * n));
+        return Ok(numeric_result(payment * n));
     }
-    Ok(DynValue::Float(payment * (1.0 - (1.0 + r).powf(-n)) / r))
+    let result = payment * (1.0 - (1.0 + r).powf(-n)) / r;
+    if !result.is_finite() {
+        return Ok(DynValue::Null);
+    }
+    Ok(numeric_result(result))
 }
 
 /// Helper: extract all numeric values from an array argument.
@@ -1134,28 +1205,84 @@ fn extract_array_numbers(arg: &DynValue) -> Result<Vec<f64>, String> {
     Ok(nums)
 }
 
+/// Coerce an array argument to numbers (None if not an array); each element via to_number.
+fn numbers_opt(arg: &DynValue) -> Option<Vec<f64>> {
+    arg.extract_array().map(|arr| arr.iter().map(super::to_number).collect())
+}
+
+/// Coerce an array argument to day numbers: dates become epoch days, numbers pass through.
+fn days_opt(arg: &DynValue) -> Option<Vec<f64>> {
+    arg.extract_array().map(|arr| arr.iter().map(|v| match v {
+        DynValue::Date(s) | DynValue::Timestamp(s) | DynValue::String(s) => {
+            parse_ymd(s).map_or_else(|| super::to_number(v), |(y, m, d)| days_from_civil(y, m, d) as f64)
+        }
+        _ => super::to_number(v),
+    }).collect())
+}
+
+/// xnpv: net present value for irregularly-spaced cash flows.
+pub(super) fn xnpv(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 3 { return Ok(DynValue::Null); }
+    let rate = super::to_number(&args[0]);
+    let (Some(amounts), Some(days)) = (numbers_opt(&args[1]), days_opt(&args[2])) else {
+        return Ok(DynValue::Null);
+    };
+    if amounts.is_empty() || amounts.len() != days.len() {
+        return Ok(DynValue::Null);
+    }
+    let d0 = days[0];
+    let mut total = 0.0;
+    for i in 0..amounts.len() {
+        total += amounts[i] / (1.0 + rate).powf((days[i] - d0) / 365.0);
+    }
+    if !total.is_finite() { return Ok(DynValue::Null); }
+    Ok(numeric_result(total))
+}
+
+/// xirr: internal rate of return for irregularly-spaced cash flows (Newton-Raphson).
+pub(super) fn xirr(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let (Some(amounts), Some(days)) = (numbers_opt(&args[0]), days_opt(&args[1])) else {
+        return Ok(DynValue::Null);
+    };
+    if amounts.len() < 2 || amounts.len() != days.len() {
+        return Ok(DynValue::Null);
+    }
+    let mut rate = args.get(2).map_or(0.1, super::to_number);
+    let d0 = days[0];
+    for _ in 0..100 {
+        let mut value = 0.0;
+        let mut derivative = 0.0;
+        for j in 0..amounts.len() {
+            let exp = (days[j] - d0) / 365.0;
+            value += amounts[j] / (1.0 + rate).powf(exp);
+            derivative -= exp * amounts[j] / (1.0 + rate).powf(exp + 1.0);
+        }
+        if value.abs() < 1e-7 { return Ok(numeric_result(rate)); }
+        if derivative.abs() < 1e-12 { return Ok(DynValue::Null); }
+        let next = rate - value / derivative;
+        if !next.is_finite() || next <= -1.0 { return Ok(DynValue::Null); }
+        rate = next;
+    }
+    Ok(DynValue::Null)
+}
+
 /// std: population standard deviation of array.
 pub(super) fn std_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let nums = extract_array_numbers(args.first().ok_or("std: requires 1 argument")?)
-        .map_err(|e| format!("std: {e}"))?;
-    if nums.is_empty() {
-        return Err("std: array must not be empty".to_string());
-    }
+    let Some(nums) = args.first().and_then(numbers_opt) else { return Ok(DynValue::Null) };
+    if nums.is_empty() { return Ok(DynValue::Null); }
     let mean = nums.iter().sum::<f64>() / nums.len() as f64;
     let variance = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nums.len() as f64;
-    Ok(DynValue::Float(variance.sqrt()))
+    Ok(numeric_result(variance.sqrt()))
 }
 
 /// variance: population variance of array.
 pub(super) fn variance_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let nums = extract_array_numbers(args.first().ok_or("variance: requires 1 argument")?)
-        .map_err(|e| format!("variance: {e}"))?;
-    if nums.is_empty() {
-        return Err("variance: array must not be empty".to_string());
-    }
+    let Some(nums) = args.first().and_then(numbers_opt) else { return Ok(DynValue::Null) };
+    if nums.is_empty() { return Ok(DynValue::Null); }
     let mean = nums.iter().sum::<f64>() / nums.len() as f64;
     let variance = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nums.len() as f64;
-    Ok(DynValue::Float(variance))
+    Ok(numeric_result(variance))
 }
 
 /// median: median of array.
@@ -1236,22 +1363,21 @@ pub(super) fn interpolate(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVa
 /// weightedAvg: weighted average. Args: values array, weights array.
 pub(super) fn weighted_avg(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("weightedAvg: requires 2 arguments (values, weights)".to_string());
+        return Ok(DynValue::Null);
     }
-    let values = extract_array_numbers(&args[0]).map_err(|e| format!("weightedAvg values: {e}"))?;
-    let weights = extract_array_numbers(&args[1]).map_err(|e| format!("weightedAvg weights: {e}"))?;
-    if values.len() != weights.len() {
-        return Err("weightedAvg: values and weights must have same length".to_string());
+    let (Some(values), Some(weights)) = (numbers_opt(&args[0]), numbers_opt(&args[1])) else {
+        return Ok(DynValue::Null);
+    };
+    if values.is_empty() || weights.is_empty() {
+        return Ok(DynValue::Null);
     }
-    if values.is_empty() {
-        return Err("weightedAvg: arrays must not be empty".to_string());
-    }
-    let total_weight: f64 = weights.iter().sum();
+    let n = values.len().min(weights.len());
+    let total_weight: f64 = weights[..n].iter().sum();
     if total_weight == 0.0 {
-        return Err("weightedAvg: total weight must not be zero".to_string());
+        return Ok(DynValue::Null);
     }
-    let weighted_sum: f64 = values.iter().zip(weights.iter()).map(|(v, w)| v * w).sum();
-    Ok(DynValue::Float(weighted_sum / total_weight))
+    let weighted_sum: f64 = (0..n).map(|i| values[i] * weights[i]).sum();
+    Ok(numeric_result(weighted_sum / total_weight))
 }
 
 /// npv: net present value. Args: rate, cash_flows array.
@@ -1309,47 +1435,44 @@ pub(super) fn mod_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
     if args.len() < 2 {
         return Err("mod: requires 2 arguments (value, divisor)".to_string());
     }
-    let val = to_f64(&args[0]).ok_or("mod: value must be numeric")?;
-    let divisor = to_f64(&args[1]).ok_or("mod: divisor must be numeric")?;
+    let val = super::to_number(&args[0]);
+    let divisor = super::to_number(&args[1]);
     if divisor == 0.0 {
         return Ok(DynValue::Null);
     }
-    let result = val % divisor;
-    Ok(numeric_result(result))
+    Ok(numeric_result(val % divisor))
 }
 
 /// stdSample: arity 1 — sample standard deviation (n-1 divisor).
 pub(super) fn std_sample(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let nums = extract_array_numbers(args.first().ok_or("stdSample: requires 1 argument")?)
-        .map_err(|e| format!("stdSample: {e}"))?;
+    let Some(nums) = args.first().and_then(numbers_opt) else { return Ok(DynValue::Null) };
     if nums.len() < 2 {
         return Ok(DynValue::Null);
     }
     let mean = nums.iter().sum::<f64>() / nums.len() as f64;
     let variance = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (nums.len() - 1) as f64;
-    Ok(DynValue::Float(variance.sqrt()))
+    Ok(numeric_result(variance.sqrt()))
 }
 
 /// varianceSample: arity 1 — sample variance (n-1 divisor / Bessel's correction).
 pub(super) fn variance_sample(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let nums = extract_array_numbers(args.first().ok_or("varianceSample: requires 1 argument")?)
-        .map_err(|e| format!("varianceSample: {e}"))?;
+    let Some(nums) = args.first().and_then(numbers_opt) else { return Ok(DynValue::Null) };
     if nums.len() < 2 {
         return Ok(DynValue::Null);
     }
     let mean = nums.iter().sum::<f64>() / nums.len() as f64;
     let variance = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (nums.len() - 1) as f64;
-    Ok(DynValue::Float(variance))
+    Ok(numeric_result(variance))
 }
 
 /// percentile: arity 2 — compute percentile (0-100) of array with linear interpolation.
 pub(super) fn percentile(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("percentile: requires 2 arguments (array, pct)".to_string());
+        return Ok(DynValue::Null);
     }
-    let mut nums = extract_array_numbers(&args[0]).map_err(|e| format!("percentile: {e}"))?;
-    let pct = to_f64(&args[1]).ok_or("percentile: percentile must be numeric")?;
-    if nums.is_empty() {
+    let Some(mut nums) = numbers_opt(&args[0]) else { return Ok(DynValue::Null) };
+    let pct = super::to_number(&args[1]);
+    if nums.is_empty() || pct < 0.0 || pct > 100.0 {
         return Ok(DynValue::Null);
     }
     nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1367,11 +1490,11 @@ pub(super) fn percentile(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVal
 /// quantile: arity 2 — compute quantile (0-1) of array.
 pub(super) fn quantile(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("quantile: requires 2 arguments (array, q)".to_string());
+        return Ok(DynValue::Null);
     }
-    let mut nums = extract_array_numbers(&args[0]).map_err(|e| format!("quantile: {e}"))?;
-    let q = to_f64(&args[1]).ok_or("quantile: quantile must be numeric")?;
-    if nums.is_empty() {
+    let Some(mut nums) = numbers_opt(&args[0]) else { return Ok(DynValue::Null) };
+    let q = super::to_number(&args[1]);
+    if nums.is_empty() || q < 0.0 || q > 1.0 {
         return Ok(DynValue::Null);
     }
     nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1389,10 +1512,11 @@ pub(super) fn quantile(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
 /// covariance: arity 2 — population covariance of two arrays.
 pub(super) fn covariance(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("covariance: requires 2 arguments (array1, array2)".to_string());
+        return Ok(DynValue::Null);
     }
-    let arr1 = extract_array_numbers(&args[0]).map_err(|e| format!("covariance: {e}"))?;
-    let arr2 = extract_array_numbers(&args[1]).map_err(|e| format!("covariance: {e}"))?;
+    let (Some(arr1), Some(arr2)) = (numbers_opt(&args[0]), numbers_opt(&args[1])) else {
+        return Ok(DynValue::Null);
+    };
     let n = arr1.len().min(arr2.len());
     if n == 0 {
         return Ok(DynValue::Null);
@@ -1400,7 +1524,7 @@ pub(super) fn covariance(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVal
     let mean1 = arr1[..n].iter().sum::<f64>() / n as f64;
     let mean2 = arr2[..n].iter().sum::<f64>() / n as f64;
     let cov: f64 = (0..n).map(|i| (arr1[i] - mean1) * (arr2[i] - mean2)).sum::<f64>() / n as f64;
-    Ok(DynValue::Float(cov))
+    Ok(numeric_result(cov))
 }
 
 /// correlation: arity 2 — Pearson correlation coefficient of two arrays.
@@ -1518,13 +1642,13 @@ pub(super) fn nper_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
 /// Args: cost, salvage, life.
 pub(super) fn depreciation_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 3 {
-        return Err("depreciation: requires 3 arguments (cost, salvage, life)".to_string());
+        return Ok(DynValue::Null);
     }
-    let cost = to_f64(&args[0]).ok_or("depreciation: cost must be numeric")?;
-    let salvage = to_f64(&args[1]).ok_or("depreciation: salvage must be numeric")?;
-    let life = to_f64(&args[2]).ok_or("depreciation: life must be numeric")?;
-    if life <= 0.0 {
-        return Err("depreciation: life must be positive".to_string());
+    let cost = super::to_number(&args[0]);
+    let salvage = super::to_number(&args[1]);
+    let life = super::to_number(&args[2]);
+    if life <= 0.0 || salvage > cost {
+        return Ok(DynValue::Null);
     }
     Ok(numeric_result((cost - salvage) / life))
 }
@@ -2430,13 +2554,13 @@ mod tests {
     #[test]
     fn test_add_days_error_on_invalid() {
         let args = vec![DynValue::Integer(42), DynValue::Integer(5)];
-        assert!(add_days(&args, &ctx()).is_err());
+        assert_eq!(add_days(&args, &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn test_add_days_needs_two_args() {
         let args = vec![DynValue::Date("2024-01-01".to_string())];
-        assert!(add_days(&args, &ctx()).is_err());
+        assert_eq!(add_days(&args, &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -3034,7 +3158,7 @@ mod extended_tests {
     #[test]
     fn format_integer_negative() {
         let r = format_integer(&[f(-2.3)], &ctx()).unwrap();
-        assert_eq!(r, s("-2"));
+        assert_eq!(r, s("-3"));
     }
 
     #[test]
@@ -3170,8 +3294,8 @@ mod extended_tests {
 
     #[test]
     fn parse_int_with_prefix_errors() {
-        // Rust parseInt uses from_str_radix which rejects non-numeric chars
-        assert!(parse_int(&[s("  123abc")], &ctx()).is_err());
+        // parseInt reads the leading integer prefix
+        assert_eq!(parse_int(&[s("  123abc")], &ctx()).unwrap(), i(123));
     }
 
     #[test]
@@ -3181,13 +3305,13 @@ mod extended_tests {
 
     #[test]
     fn parse_int_from_float_string_errors() {
-        // from_str_radix doesn't parse floats
-        assert!(parse_int(&[s("3.14")], &ctx()).is_err());
+        // parseInt reads the leading integer prefix
+        assert_eq!(parse_int(&[s("3.14")], &ctx()).unwrap(), i(3));
     }
 
     #[test]
     fn parse_int_non_numeric_errors() {
-        assert!(parse_int(&[s("abc")], &ctx()).is_err());
+        assert_eq!(parse_int(&[s("abc")], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3482,7 +3606,7 @@ mod extended_tests {
 
     #[test]
     fn pv_missing_args() {
-        assert!(pv(&[f(100.0)], &ctx()).is_err());
+        assert_eq!(pv(&[f(100.0)], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3636,12 +3760,12 @@ mod extended_tests {
 
     #[test]
     fn depreciation_zero_life() {
-        assert!(depreciation_verb(&[f(5000.0), f(0.0), f(0.0)], &ctx()).is_err());
+        assert_eq!(depreciation_verb(&[f(5000.0), f(0.0), f(0.0)], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn depreciation_missing_args() {
-        assert!(depreciation_verb(&[f(5000.0), f(0.0)], &ctx()).is_err());
+        assert_eq!(depreciation_verb(&[f(5000.0), f(0.0)], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4262,9 +4386,9 @@ mod extended_tests {
 
     #[test]
     fn day_of_week_known_sunday() {
-        // 2024-01-07 is a Sunday = 0
+        // 2024-01-07 is a Sunday = 7 (ISO)
         let r = day_of_week(&[s("2024-01-07")], &ctx()).unwrap();
-        assert_numeric(r, 0.0, 1e-10);
+        assert_numeric(r, 7.0, 1e-10);
     }
 
     #[test]
@@ -4284,8 +4408,8 @@ mod extended_tests {
     fn week_of_year_dec_31() {
         let r = week_of_year(&[s("2024-12-31")], &ctx()).unwrap();
         match r {
-            DynValue::Integer(v) => assert!(v >= 52 && v <= 53, "week={v}"),
-            DynValue::Float(v) => assert!(v >= 52.0 && v <= 53.0, "week={v}"),
+            DynValue::Integer(v) => assert!(v == 1 || (52..=53).contains(&v), "week={v}"),
+            DynValue::Float(v) => assert!(v == 1.0 || (52.0..=53.0).contains(&v), "week={v}"),
             _ => panic!("Expected numeric"),
         }
     }
@@ -4483,9 +4607,9 @@ mod extended_tests {
 
     #[test]
     fn days_between_reversed_order() {
-        // daysBetweenDates uses .abs(), so it's always positive
+        // daysBetweenDates is signed (start -> end)
         let r = days_between_dates(&[s("2024-06-16"), s("2024-06-15")], &ctx()).unwrap();
-        assert_numeric(r, 1.0, 1e-10);
+        assert_numeric(r, -1.0, 1e-10);
     }
 
     #[test]
@@ -4610,12 +4734,12 @@ mod extended_tests {
 
     #[test]
     fn floor_null_input() {
-        assert!(floor(&[null()], &ctx()).is_err());
+        assert_eq!(floor(&[null()], &ctx()).unwrap(), i(0));
     }
 
     #[test]
     fn ceil_null_input() {
-        assert!(ceil(&[null()], &ctx()).is_err());
+        assert_eq!(ceil(&[null()], &ctx()).unwrap(), i(0));
     }
 
     #[test]
@@ -4636,17 +4760,17 @@ mod extended_tests {
 
     #[test]
     fn add_months_invalid_date() {
-        assert!(add_months(&[s("not-a-date"), i(1)], &ctx()).is_err());
+        assert_eq!(add_months(&[s("not-a-date"), i(1)], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn add_years_invalid_date() {
-        assert!(add_years(&[s("not-a-date"), i(1)], &ctx()).is_err());
+        assert_eq!(add_years(&[s("not-a-date"), i(1)], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn day_of_week_invalid_date() {
-        assert!(day_of_week(&[s("invalid")], &ctx()).is_err());
+        assert_eq!(day_of_week(&[s("invalid")], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! 4. Produces output in the target format
 
 pub mod verbs;
+pub mod expr;
 pub mod formatters;
 pub mod source_parsers;
 pub mod parser;

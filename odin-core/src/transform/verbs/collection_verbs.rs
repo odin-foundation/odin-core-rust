@@ -243,12 +243,20 @@ pub(super) fn index_of(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
 }
 
 /// at: arity 2 — get element at index.
+/// Clamp a slice index JS-style: negatives count from the end, then clamp to [0, len].
+fn js_slice_index(idx: i64, len: i64) -> i64 {
+    let i = if idx < 0 { len + idx } else { idx };
+    i.clamp(0, len)
+}
+
 pub(super) fn at(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("at: requires 2 arguments (array, index)".to_string());
+        return Ok(DynValue::Null);
     }
-    let arr = extract_arr(&args[0]).ok_or("at: first argument must be an array")?;
-    let mut idx = args[1].as_i64().ok_or("at: second argument must be an integer")?;
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let mut idx = super::to_number(&args[1]).floor() as i64;
     // Negative indices count from the end.
     if idx < 0 {
         idx += arr.len() as i64;
@@ -261,14 +269,22 @@ pub(super) fn at(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, Stri
 
 /// slice: arity 3 — slice array from start to end index.
 pub(super) fn slice(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    if args.len() < 3 {
-        return Err("slice: requires 3 arguments (array, start, end)".to_string());
+    if args.len() < 2 {
+        return Ok(DynValue::Array(Vec::new()));
     }
-    let arr = extract_arr(&args[0]).ok_or("slice: first argument must be an array")?;
-    let start = args[1].as_i64().ok_or("slice: second argument must be an integer")? as usize;
-    let end = (args[2].as_i64().ok_or("slice: third argument must be an integer")? as usize).min(arr.len());
-    let start = start.min(end);
-    Ok(DynValue::Array(arr[start..end].to_vec()))
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Array(Vec::new()));
+    };
+    let len = arr.len() as i64;
+    let start = js_slice_index(super::to_number(&args[1]).floor() as i64, len);
+    let end = match args.get(2) {
+        Some(v) => js_slice_index(super::to_number(v).floor() as i64, len),
+        None => len,
+    };
+    if start >= end {
+        return Ok(DynValue::Array(Vec::new()));
+    }
+    Ok(DynValue::Array(arr[start as usize..end as usize].to_vec()))
 }
 
 /// reverse: arity 1 — reverse array.
@@ -283,11 +299,18 @@ pub(super) fn reverse(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue,
 /// every: arity 4 — like filter but returns boolean (all match).
 pub(super) fn every(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 4 {
-        return Err("every: requires 4 arguments (array, field, op, value)".to_string());
+        return Ok(DynValue::Null);
     }
-    let arr = extract_arr(&args[0]).ok_or("every: first argument must be an array")?;
-    let field = args[1].as_str().ok_or("every: second argument must be a string")?;
-    let op = args[2].as_str().ok_or("every: third argument must be a string")?;
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    if arr.is_empty() {
+        return Ok(DynValue::Bool(true));
+    }
+    let field = super::coerce_str_pub(&args[1]);
+    let field = field.as_str();
+    let op = super::coerce_str_pub(&args[2]);
+    let op = op.as_str();
     let value = &args[3];
     let result = arr.iter().all(|item| {
         get_field(item, field).is_some_and(|fv| compare_values(&fv, op, value))
@@ -353,22 +376,26 @@ pub(super) fn includes(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
 /// `concat_arrays`: arity 2 — concatenate two arrays.
 pub(super) fn concat_arrays(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("concatArrays: requires 2 arguments (array, array)".to_string());
+        return Ok(DynValue::Null);
     }
-    let a = extract_arr(&args[0]).ok_or("concatArrays: first argument must be an array")?;
-    let b = extract_arr(&args[1]).ok_or("concatArrays: second argument must be an array")?;
-    let mut result = a.clone();
-    result.extend(b.iter().cloned());
+    let a = extract_arr(&args[0]);
+    let b = extract_arr(&args[1]);
+    if a.is_none() && b.is_none() {
+        return Ok(DynValue::Null);
+    }
+    let mut result = a.unwrap_or_default();
+    result.extend(b.unwrap_or_default());
     Ok(DynValue::Array(result))
 }
 
 /// `zip_verb`: arity 2 — zip two arrays into array of pairs.
 pub(super) fn zip_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("zip: requires 2 arguments (array, array)".to_string());
+        return Ok(DynValue::Null);
     }
-    let a = extract_arr(&args[0]).ok_or("zip: first argument must be an array")?;
-    let b = extract_arr(&args[1]).ok_or("zip: second argument must be an array")?;
+    let (Some(a), Some(b)) = (extract_arr(&args[0]), extract_arr(&args[1])) else {
+        return Ok(DynValue::Null);
+    };
     let result: Vec<DynValue> = a.iter().zip(b.iter())
         .map(|(x, y)| DynValue::Array(vec![x.clone(), y.clone()]))
         .collect();
@@ -413,16 +440,21 @@ pub(super) fn group_by(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
 /// partition: arity 4 — split array into [matching, non-matching].
 pub(super) fn partition(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 4 {
-        return Err("partition: requires 4 arguments (array, field, op, value)".to_string());
+        return Ok(DynValue::Null);
     }
-    let arr = extract_arr(&args[0]).ok_or("partition: first argument must be an array")?;
-    let field = args[1].as_str().ok_or("partition: second argument must be a string")?;
-    let op = args[2].as_str().ok_or("partition: third argument must be a string")?;
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let field = super::coerce_str_pub(&args[1]);
+    let field = field.as_str();
+    let op = super::coerce_str_pub(&args[2]);
+    let op = op.as_str();
     let value = &args[3];
     let mut matching = Vec::new();
     let mut non_matching = Vec::new();
     for item in &arr {
-        if get_field(item, field).is_some_and(|fv| compare_values(&fv, op, value)) {
+        let fv = field_value(item, field).unwrap_or(DynValue::Null);
+        if matches_op(&fv, op, value) {
             matching.push(item.clone());
         } else {
             non_matching.push(item.clone());
@@ -437,34 +469,46 @@ pub(super) fn partition(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValu
 /// take: arity 2 — take first N elements.
 pub(super) fn take(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("take: requires 2 arguments (array, count)".to_string());
+        return Ok(DynValue::Null);
     }
-    let arr = extract_arr(&args[0]).ok_or("take: first argument must be an array")?;
-    let n = args[1].as_i64().ok_or("take: second argument must be an integer")? as usize;
-    let n = n.min(arr.len());
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let n = super::to_number(&args[1]).floor() as i64;
+    if n < 0 {
+        return Ok(DynValue::Null);
+    }
+    let n = (n as usize).min(arr.len());
     Ok(DynValue::Array(arr[..n].to_vec()))
 }
 
 /// drop: arity 2 — drop first N elements.
 pub(super) fn drop(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("drop: requires 2 arguments (array, count)".to_string());
+        return Ok(DynValue::Null);
     }
-    let arr = extract_arr(&args[0]).ok_or("drop: first argument must be an array")?;
-    let n = args[1].as_i64().ok_or("drop: second argument must be an integer")? as usize;
-    let n = n.min(arr.len());
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let n = super::to_number(&args[1]).floor() as i64;
+    if n < 0 {
+        return Ok(DynValue::Null);
+    }
+    let n = (n as usize).min(arr.len());
     Ok(DynValue::Array(arr[n..].to_vec()))
 }
 
 /// chunk: arity 2 — split array into chunks of size N.
 pub(super) fn chunk(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("chunk: requires 2 arguments (array, size)".to_string());
+        return Ok(DynValue::Null);
     }
-    let arr = extract_arr(&args[0]).ok_or("chunk: first argument must be an array")?;
-    let size = args[1].as_i64().ok_or("chunk: second argument must be an integer")?;
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let size = super::to_number(&args[1]).floor() as i64;
     if size <= 0 {
-        return Err("chunk: size must be positive".to_string());
+        return Ok(DynValue::Null);
     }
     let size = size as usize;
     let result: Vec<DynValue> = arr.chunks(size)
@@ -506,14 +550,264 @@ pub(super) fn range_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVal
 
 /// compact: arity 1 — remove null/empty values from array.
 pub(super) fn compact(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let arr = args.first()
-        .and_then(extract_arr)
-        .ok_or("compact: expected array argument")?;
+    let Some(arr) = args.first().and_then(extract_arr) else {
+        return Ok(DynValue::Null);
+    };
     let result: Vec<DynValue> = arr.iter()
         .filter(|item| !matches!(item, DynValue::Null) && !matches!(item, DynValue::String(s) if s.is_empty()))
         .cloned()
         .collect();
     Ok(DynValue::Array(result))
+}
+
+/// A stable identity string for set membership/equality.
+fn value_key(v: &DynValue) -> String {
+    match v {
+        DynValue::Null => "null".to_string(),
+        DynValue::Bool(b) => format!("b:{b}"),
+        DynValue::Integer(n) => format!("n:{}", *n as f64),
+        DynValue::Float(f) | DynValue::Currency(f, _, _) | DynValue::Percent(f) => format!("n:{f}"),
+        DynValue::String(s) => format!("s:{s}"),
+        other => format!("o:{}", super::coerce_str_pub(other)),
+    }
+}
+
+/// Read a field from an object element (string-encoded objects supported).
+fn field_value(item: &DynValue, field: &str) -> Option<DynValue> {
+    item.extract_object()
+        .and_then(|o| o.into_iter().find(|(k, _)| k == field).map(|(_, v)| v))
+}
+
+/// intersection: arity 2 — items in both arrays, deduped, in first-array order.
+pub(super) fn intersection(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Array(Vec::new())); }
+    let (Some(a), Some(b)) = (extract_arr(&args[0]), extract_arr(&args[1])) else {
+        return Ok(DynValue::Array(Vec::new()));
+    };
+    let b_keys: std::collections::HashSet<String> = b.iter().map(value_key).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for item in a {
+        let k = value_key(&item);
+        if b_keys.contains(&k) && seen.insert(k) {
+            result.push(item);
+        }
+    }
+    Ok(DynValue::Array(result))
+}
+
+/// union: arity 2 — items from both arrays, deduped, in order.
+pub(super) fn union(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Array(Vec::new())); }
+    let a = extract_arr(&args[0]).unwrap_or_default();
+    let b = extract_arr(&args[1]).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for item in a.into_iter().chain(b) {
+        if seen.insert(value_key(&item)) {
+            result.push(item);
+        }
+    }
+    Ok(DynValue::Array(result))
+}
+
+/// difference: arity 2 — items in first not in second, deduped.
+pub(super) fn difference(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Array(Vec::new())); }
+    let Some(a) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Array(Vec::new()));
+    };
+    let b_keys: std::collections::HashSet<String> =
+        extract_arr(&args[1]).unwrap_or_default().iter().map(value_key).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for item in a {
+        let k = value_key(&item);
+        if !b_keys.contains(&k) && seen.insert(k) {
+            result.push(item);
+        }
+    }
+    Ok(DynValue::Array(result))
+}
+
+/// symmetricDifference: arity 2 — items in exactly one array, deduped.
+pub(super) fn symmetric_difference(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Array(Vec::new())); }
+    let a = extract_arr(&args[0]).unwrap_or_default();
+    let b = extract_arr(&args[1]).unwrap_or_default();
+    let a_keys: std::collections::HashSet<String> = a.iter().map(value_key).collect();
+    let b_keys: std::collections::HashSet<String> = b.iter().map(value_key).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for item in &a {
+        let k = value_key(item);
+        if !b_keys.contains(&k) && seen.insert(k) {
+            result.push(item.clone());
+        }
+    }
+    for item in &b {
+        let k = value_key(item);
+        if !a_keys.contains(&k) && seen.insert(k) {
+            result.push(item.clone());
+        }
+    }
+    Ok(DynValue::Array(result))
+}
+
+/// countBy: arity 1-2 — count occurrences by field (or by value), keys sorted.
+pub(super) fn count_by(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.is_empty() { return Ok(DynValue::Null); }
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let field = args.get(1).map(super::coerce_str_pub);
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    for item in &arr {
+        let v = match &field {
+            Some(f) => field_value(item, f).unwrap_or(DynValue::Null),
+            None => item.clone(),
+        };
+        let key = super::coerce_str_pub(&v);
+        if let Some(slot) = counts.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 += 1;
+        } else {
+            counts.push((key, 1));
+        }
+    }
+    counts.sort_by(|a, b| a.0.cmp(&b.0));
+    let result: Vec<(String, DynValue)> = counts.into_iter()
+        .filter(|(k, _)| is_safe_key(k))
+        .map(|(k, c)| (k, DynValue::Integer(c)))
+        .collect();
+    Ok(DynValue::Object(result))
+}
+
+/// keyBy: arity 2 — index array of objects by field (last wins on collision).
+pub(super) fn key_by(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let field = super::coerce_str_pub(&args[1]);
+    let mut result: Vec<(String, DynValue)> = Vec::new();
+    for item in arr {
+        let key = super::coerce_str_pub(&field_value(&item, &field).unwrap_or(DynValue::Null));
+        if is_safe_key(&key) {
+            upsert(&mut result, key, item);
+        }
+    }
+    Ok(DynValue::Object(result))
+}
+
+/// explode: arity 2 — flatten each row's array field into one row per element.
+pub(super) fn explode(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Array(Vec::new())); }
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Array(Vec::new()));
+    };
+    let field = super::coerce_str_pub(&args[1]);
+    let mut result = Vec::new();
+    for item in arr {
+        let Some(base) = item.extract_object() else {
+            result.push(item);
+            continue;
+        };
+        let elements = field_value(&item, &field).and_then(|v| v.extract_array());
+        match elements {
+            Some(els) if !els.is_empty() => {
+                for el in els {
+                    let mut row = base.clone();
+                    upsert(&mut row, field.clone(), el);
+                    result.push(DynValue::Object(row));
+                }
+            }
+            _ => result.push(DynValue::Object(base)),
+        }
+    }
+    Ok(DynValue::Array(result))
+}
+
+/// window: arity 2 — sliding windows of size N as sub-arrays.
+pub(super) fn window(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Array(Vec::new())); }
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Array(Vec::new()));
+    };
+    let n = super::to_number(&args[1]).floor() as i64;
+    if n <= 0 || (arr.len() as i64) < n {
+        return Ok(DynValue::Array(Vec::new()));
+    }
+    let n = n as usize;
+    let result: Vec<DynValue> = arr.windows(n)
+        .map(|w| DynValue::Array(w.to_vec()))
+        .collect();
+    Ok(DynValue::Array(result))
+}
+
+/// Compare a field value against a target using a string operator (TS semantics).
+fn matches_op(item_val: &DynValue, op: &str, cmp: &DynValue) -> bool {
+    match op {
+        "=" | "==" | "eq" => super::coerce_str_pub(item_val) == super::coerce_str_pub(cmp),
+        "!=" | "<>" | "ne" => super::coerce_str_pub(item_val) != super::coerce_str_pub(cmp),
+        "<" | "lt" => super::to_number(item_val) < super::to_number(cmp),
+        "<=" | "lte" => super::to_number(item_val) <= super::to_number(cmp),
+        ">" | "gt" => super::to_number(item_val) > super::to_number(cmp),
+        ">=" | "gte" => super::to_number(item_val) >= super::to_number(cmp),
+        "contains" => super::coerce_str_pub(item_val).contains(&super::coerce_str_pub(cmp)),
+        "startsWith" => super::coerce_str_pub(item_val).starts_with(&super::coerce_str_pub(cmp)),
+        "endsWith" => super::coerce_str_pub(item_val).ends_with(&super::coerce_str_pub(cmp)),
+        _ => false,
+    }
+}
+
+/// countIf: arity 4 — count rows whose field matches the predicate.
+pub(super) fn count_if(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 4 { return Ok(DynValue::Integer(0)); }
+    let Some(arr) = extract_arr(&args[0]) else { return Ok(DynValue::Integer(0)) };
+    let field = super::coerce_str_pub(&args[1]);
+    let op = super::coerce_str_pub(&args[2]);
+    let cmp = &args[3];
+    let count = arr.iter()
+        .filter(|item| matches_op(&field_value(item, &field).unwrap_or(DynValue::Null), &op, cmp))
+        .count();
+    Ok(DynValue::Integer(count as i64))
+}
+
+/// sumIf: arity 4-5 — sum a field over rows matching the predicate.
+pub(super) fn sum_if(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 4 { return Ok(DynValue::Integer(0)); }
+    let Some(arr) = extract_arr(&args[0]) else { return Ok(DynValue::Integer(0)) };
+    let field = super::coerce_str_pub(&args[1]);
+    let op = super::coerce_str_pub(&args[2]);
+    let cmp = &args[3];
+    let sum_field = args.get(4).map(super::coerce_str_pub).unwrap_or_else(|| field.clone());
+    let mut total = 0.0;
+    for item in &arr {
+        if matches_op(&field_value(item, &field).unwrap_or(DynValue::Null), &op, cmp) {
+            total += super::to_number(&field_value(item, &sum_field).unwrap_or(DynValue::Null));
+        }
+    }
+    Ok(super::numeric_verbs::numeric_result(total))
+}
+
+/// avgIf: arity 4-5 — average a field over rows matching the predicate (null if none).
+pub(super) fn avg_if(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 4 { return Ok(DynValue::Null); }
+    let Some(arr) = extract_arr(&args[0]) else { return Ok(DynValue::Null) };
+    let field = super::coerce_str_pub(&args[1]);
+    let op = super::coerce_str_pub(&args[2]);
+    let cmp = &args[3];
+    let avg_field = args.get(4).map(super::coerce_str_pub).unwrap_or_else(|| field.clone());
+    let mut total = 0.0;
+    let mut count = 0;
+    for item in &arr {
+        if matches_op(&field_value(item, &field).unwrap_or(DynValue::Null), &op, cmp) {
+            total += super::to_number(&field_value(item, &avg_field).unwrap_or(DynValue::Null));
+            count += 1;
+        }
+    }
+    if count == 0 { return Ok(DynValue::Null); }
+    Ok(super::numeric_verbs::numeric_result(total / count as f64))
 }
 
 /// pluck: arity 2 — alias for map (extract field).
@@ -597,10 +891,13 @@ pub(super) fn limit(args: &[DynValue], ctx: &VerbContext) -> Result<DynValue, St
 /// dedupe: arity 2 — deduplicate array of objects by key field.
 pub(super) fn dedupe(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("dedupe: requires 2 arguments (array, keyField)".to_string());
+        return Ok(DynValue::Null);
     }
-    let arr = extract_arr(&args[0]).ok_or("dedupe: first argument must be an array")?;
-    let field = args[1].as_str().ok_or("dedupe: second argument must be a string (field name)")?;
+    let Some(arr) = extract_arr(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let field = super::coerce_str_pub(&args[1]);
+    let field = field.as_str();
     let mut seen_keys: Vec<DynValue> = Vec::new();
     let mut result = Vec::new();
     for item in &arr {
@@ -622,12 +919,18 @@ fn extract_obj(v: &DynValue) -> Option<Vec<(String, DynValue)>> {
     v.extract_object()
 }
 
+/// Reject keys that could pollute a prototype chain.
+fn is_safe_key(k: &str) -> bool {
+    !matches!(k.to_ascii_lowercase().as_str(), "__proto__" | "constructor" | "prototype")
+}
+
 /// keys: arity 1 — return array of object keys.
 pub(super) fn keys(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let obj = args.first()
-        .and_then(extract_obj)
-        .ok_or("keys: expected object argument")?;
+    let Some(obj) = args.first().and_then(extract_obj) else {
+        return Ok(DynValue::Null);
+    };
     let result: Vec<DynValue> = obj.iter()
+        .filter(|(k, _)| is_safe_key(k))
         .map(|(k, _)| DynValue::String(k.clone()))
         .collect();
     Ok(DynValue::Array(result))
@@ -635,10 +938,11 @@ pub(super) fn keys(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, St
 
 /// `values_verb`: arity 1 — return array of object values.
 pub(super) fn values_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let obj = args.first()
-        .and_then(extract_obj)
-        .ok_or("values: expected object argument")?;
+    let Some(obj) = args.first().and_then(extract_obj) else {
+        return Ok(DynValue::Null);
+    };
     let result: Vec<DynValue> = obj.iter()
+        .filter(|(k, _)| is_safe_key(k))
         .map(|(_, v)| v.clone())
         .collect();
     Ok(DynValue::Array(result))
@@ -646,24 +950,40 @@ pub(super) fn values_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVa
 
 /// entries: arity 1 — return array of [key, value] pairs.
 pub(super) fn entries(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
-    let obj = args.first()
-        .and_then(extract_obj)
-        .ok_or("entries: expected object argument")?;
+    let Some(obj) = args.first().and_then(extract_obj) else {
+        return Ok(DynValue::Null);
+    };
     let result: Vec<DynValue> = obj.iter()
+        .filter(|(k, _)| is_safe_key(k))
         .map(|(k, v)| DynValue::Array(vec![DynValue::String(k.clone()), v.clone()]))
         .collect();
     Ok(DynValue::Array(result))
 }
 
-/// has: arity 2 — check if object has key.
+/// has: arity 2 — check if object has key (dot-path aware).
 pub(super) fn has(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("has: requires 2 arguments (object, key)".to_string());
+        return Ok(DynValue::Null);
     }
-    let obj = extract_obj(&args[0]).ok_or("has: first argument must be an object")?;
-    let key = args[1].as_str().ok_or("has: second argument must be a string")?;
-    let found = obj.iter().any(|(k, _)| k == key);
-    Ok(DynValue::Bool(found))
+    let Some(obj) = extract_obj(&args[0]) else {
+        return Ok(DynValue::Bool(false));
+    };
+    let key_path = super::coerce_str_pub(&args[1]);
+    let mut current = DynValue::Object(obj);
+    for part in key_path.split('.') {
+        if !is_safe_key(part) {
+            return Ok(DynValue::Bool(false));
+        }
+        let next = match &current {
+            DynValue::Object(o) => o.iter().find(|(k, _)| k == part).map(|(_, v)| v.clone()),
+            _ => None,
+        };
+        match next {
+            Some(v) => current = v,
+            None => return Ok(DynValue::Bool(false)),
+        }
+    }
+    Ok(DynValue::Bool(true))
 }
 
 /// `get_verb`: arity 2-3 — get value from object by path, with optional default.
@@ -712,10 +1032,14 @@ pub(super) fn get_verb(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue
 /// merge: arity 2 — merge two objects (second wins on conflicts).
 pub(super) fn merge(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 2 {
-        return Err("merge: requires 2 arguments (object, object)".to_string());
+        return Ok(DynValue::Null);
     }
-    let a = extract_obj(&args[0]).ok_or("merge: first argument must be an object")?;
-    let b = extract_obj(&args[1]).ok_or("merge: second argument must be an object")?;
+    let (a, b) = match (extract_obj(&args[0]), extract_obj(&args[1])) {
+        (Some(a), Some(b)) => (a, b),
+        (Some(a), None) => return Ok(DynValue::Object(a)),
+        (None, Some(b)) => return Ok(DynValue::Object(b)),
+        (None, None) => return Ok(DynValue::Null),
+    };
     let mut result = a;
     for (key, value) in &b {
         if let Some(existing) = result.iter_mut().find(|(k, _)| k == key) {
@@ -725,6 +1049,153 @@ pub(super) fn merge(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, S
         }
     }
     Ok(DynValue::Object(result))
+}
+
+/// pick: arity variadic — new object keeping only the named keys (argument order).
+pub(super) fn pick(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    let Some(src) = args.first().and_then(extract_obj) else {
+        return Ok(DynValue::Null);
+    };
+    let mut result: Vec<(String, DynValue)> = Vec::new();
+    for key_arg in &args[1..] {
+        let key = super::coerce_str_pub(key_arg);
+        if is_safe_key(&key) {
+            if let Some((_, v)) = src.iter().find(|(k, _)| *k == key) {
+                result.push((key, v.clone()));
+            }
+        }
+    }
+    Ok(DynValue::Object(result))
+}
+
+/// omit: arity variadic — new object without the named keys (source order).
+pub(super) fn omit(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    let Some(src) = args.first().and_then(extract_obj) else {
+        return Ok(DynValue::Null);
+    };
+    let drop: std::collections::HashSet<String> =
+        args[1..].iter().map(super::coerce_str_pub).collect();
+    let result: Vec<(String, DynValue)> = src.into_iter()
+        .filter(|(k, _)| is_safe_key(k) && !drop.contains(k))
+        .collect();
+    Ok(DynValue::Object(result))
+}
+
+/// fromEntries: arity 1 — build an object from [key, value] pairs (pair order).
+pub(super) fn from_entries(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    let Some(DynValue::Array(pairs)) = args.first().map(unwrap_array) else {
+        return Ok(DynValue::Null);
+    };
+    let mut result: Vec<(String, DynValue)> = Vec::new();
+    for entry in &pairs {
+        let pair = match entry {
+            DynValue::Array(items) => items.clone(),
+            _ => continue,
+        };
+        if pair.len() < 2 { continue; }
+        let key = super::coerce_str_pub(&pair[0]);
+        if is_safe_key(&key) {
+            upsert(&mut result, key, pair[1].clone());
+        }
+    }
+    Ok(DynValue::Object(result))
+}
+
+/// invert: arity 1 — swap keys and values (last wins on collision).
+pub(super) fn invert(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    let Some(src) = args.first().and_then(extract_obj) else {
+        return Ok(DynValue::Null);
+    };
+    let mut result: Vec<(String, DynValue)> = Vec::new();
+    for (k, v) in &src {
+        if !is_safe_key(k) { continue; }
+        let new_key = super::coerce_str_pub(v);
+        if is_safe_key(&new_key) {
+            upsert(&mut result, new_key, DynValue::String(k.clone()));
+        }
+    }
+    Ok(DynValue::Object(result))
+}
+
+/// defaults: arity 2 — fill keys missing from object using defaults (object wins).
+pub(super) fn defaults(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let src = extract_obj(&args[0]);
+    let def = extract_obj(&args[1]);
+    let (src, def) = match (src, def) {
+        (Some(s), Some(d)) => (s, d),
+        (None, Some(d)) => return Ok(DynValue::Object(d)),
+        (Some(s), None) => return Ok(DynValue::Object(s)),
+        (None, None) => return Ok(DynValue::Null),
+    };
+    let mut result = src;
+    for (k, v) in def {
+        if is_safe_key(&k) && !result.iter().any(|(rk, _)| *rk == k) {
+            result.push((k, v));
+        }
+    }
+    Ok(DynValue::Object(result))
+}
+
+/// renameKeys: arity 2 — rename keys per a mapping (old -> new), keeping position.
+pub(super) fn rename_keys(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    if args.len() < 2 { return Ok(DynValue::Null); }
+    let Some(src) = extract_obj(&args[0]) else {
+        return Ok(DynValue::Null);
+    };
+    let Some(rename) = extract_obj(&args[1]) else {
+        return Ok(DynValue::Object(src));
+    };
+    let mut result: Vec<(String, DynValue)> = Vec::new();
+    for (k, v) in src {
+        let new_key = match rename.iter().find(|(rk, _)| *rk == k) {
+            Some((_, nv)) => super::coerce_str_pub(nv),
+            None => k.clone(),
+        };
+        if is_safe_key(&new_key) {
+            result.push((new_key, v));
+        }
+    }
+    Ok(DynValue::Object(result))
+}
+
+/// compactObject: arity 1 — drop null / empty-string / empty-array / empty-object entries.
+pub(super) fn compact_object(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
+    let Some(src) = args.first().and_then(extract_obj) else {
+        return Ok(DynValue::Null);
+    };
+    let result: Vec<(String, DynValue)> = src.into_iter()
+        .filter(|(k, v)| is_safe_key(k) && !is_empty_value(v))
+        .collect();
+    Ok(DynValue::Object(result))
+}
+
+/// Insert or overwrite (last wins) a key in an ordered map.
+fn upsert(map: &mut Vec<(String, DynValue)>, key: String, value: DynValue) {
+    if let Some(slot) = map.iter_mut().find(|(k, _)| *k == key) {
+        slot.1 = value;
+    } else {
+        map.push((key, value));
+    }
+}
+
+/// True for null, empty string, empty array, or empty object.
+fn is_empty_value(v: &DynValue) -> bool {
+    match v {
+        DynValue::Null => true,
+        DynValue::String(s) => s.is_empty(),
+        DynValue::Array(a) => a.is_empty(),
+        DynValue::Object(o) => o.is_empty(),
+        _ => false,
+    }
+}
+
+/// Unwrap a string-encoded array into a `DynValue::Array`, else clone as-is.
+fn unwrap_array(v: &DynValue) -> DynValue {
+    match v {
+        DynValue::Array(_) => v.clone(),
+        _ => v.extract_array().map(DynValue::Array).unwrap_or_else(|| v.clone()),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1088,20 +1559,27 @@ pub(super) fn in_bounding_box(args: &[DynValue], _ctx: &VerbContext) -> Result<D
 /// Args: (lat1, lon1, lat2, lon2). Returns bearing in degrees [0, 360).
 pub(super) fn bearing(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 4 {
-        return Err("bearing: requires 4 arguments (lat1, lon1, lat2, lon2)".to_string());
+        return Ok(DynValue::Null);
     }
-    let lat1 = to_f64(&args[0]).ok_or("bearing: lat1 must be numeric")?.to_radians();
-    let lon1 = to_f64(&args[1]).ok_or("bearing: lon1 must be numeric")?.to_radians();
-    let lat2 = to_f64(&args[2]).ok_or("bearing: lat2 must be numeric")?.to_radians();
-    let lon2 = to_f64(&args[3]).ok_or("bearing: lon2 must be numeric")?.to_radians();
-
-    let dlon = lon2 - lon1;
+    let lat1d = super::to_number(&args[0]);
+    let lon1d = super::to_number(&args[1]);
+    let lat2d = super::to_number(&args[2]);
+    let lon2d = super::to_number(&args[3]);
+    if !valid_coord(lat1d, lon1d) || !valid_coord(lat2d, lon2d) {
+        return Ok(DynValue::Null);
+    }
+    let lat1 = lat1d.to_radians();
+    let lat2 = lat2d.to_radians();
+    let dlon = (lon2d - lon1d).to_radians();
     let x = dlon.sin() * lat2.cos();
     let y = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
-    let bearing_rad = x.atan2(y);
-    let bearing_deg = bearing_rad.to_degrees();
-    // Normalize to [0, 360)
+    let bearing_deg = x.atan2(y).to_degrees();
     Ok(DynValue::Float((bearing_deg + 360.0) % 360.0))
+}
+
+/// Latitude within [-90, 90], longitude within [-180, 180].
+fn valid_coord(lat: f64, lon: f64) -> bool {
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1207,7 +1685,7 @@ pub(super) fn pct_change(args: &[DynValue], _ctx: &VerbContext) -> Result<DynVal
             match (to_f64(&arr[i]), to_f64(&arr[i - periods])) {
                 (Some(current), Some(previous)) if previous != 0.0 => {
                     let pct = (current - previous) / previous;
-                    result.push(DynValue::Float(pct));
+                    result.push(super::numeric_verbs::numeric_result(pct));
                 }
                 _ => result.push(DynValue::Null),
             }
@@ -1457,14 +1935,19 @@ pub(super) fn fill_missing(args: &[DynValue], _ctx: &VerbContext) -> Result<DynV
 /// Args: (lat1, lon1, lat2, lon2). Returns object with lat and lon fields.
 pub(super) fn midpoint(args: &[DynValue], _ctx: &VerbContext) -> Result<DynValue, String> {
     if args.len() < 4 {
-        return Err("midpoint: requires 4 arguments (lat1, lon1, lat2, lon2)".to_string());
+        return Ok(DynValue::Null);
     }
-    let lat1 = to_f64(&args[0]).ok_or("midpoint: lat1 must be numeric")?.to_radians();
-    let lon1 = to_f64(&args[1]).ok_or("midpoint: lon1 must be numeric")?.to_radians();
-    let lat2 = to_f64(&args[2]).ok_or("midpoint: lat2 must be numeric")?.to_radians();
-    let lon2 = to_f64(&args[3]).ok_or("midpoint: lon2 must be numeric")?.to_radians();
-
-    let dlon = lon2 - lon1;
+    let lat1d = super::to_number(&args[0]);
+    let lon1d = super::to_number(&args[1]);
+    let lat2d = super::to_number(&args[2]);
+    let lon2d = super::to_number(&args[3]);
+    if !valid_coord(lat1d, lon1d) || !valid_coord(lat2d, lon2d) {
+        return Ok(DynValue::Null);
+    }
+    let lat1 = lat1d.to_radians();
+    let lon1 = lon1d.to_radians();
+    let lat2 = lat2d.to_radians();
+    let dlon = (lon2d - lon1d).to_radians();
     let bx = lat2.cos() * dlon.cos();
     let by = lat2.cos() * dlon.sin();
 
@@ -2064,12 +2547,12 @@ mod tests {
 
     #[test]
     fn chunk_zero_size_err() {
-        assert!(chunk(&[arr(vec![i(1)]), i(0)], &ctx()).is_err());
+        assert_eq!(chunk(&[arr(vec![i(1)]), i(0)], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn chunk_negative_size_err() {
-        assert!(chunk(&[arr(vec![i(1)]), i(-1)], &ctx()).is_err());
+        assert_eq!(chunk(&[arr(vec![i(1)]), i(-1)], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ── range_verb ──────────────────────────────────────────────────────────
@@ -2136,7 +2619,7 @@ mod tests {
 
     #[test]
     fn keys_non_object_err() {
-        assert!(keys(&[i(42)], &ctx()).is_err());
+        assert_eq!(keys(&[i(42)], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ── values_verb ─────────────────────────────────────────────────────────
@@ -2149,7 +2632,7 @@ mod tests {
 
     #[test]
     fn values_non_object_err() {
-        assert!(values_verb(&[s("hi")], &ctx()).is_err());
+        assert_eq!(values_verb(&[s("hi")], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ── entries ─────────────────────────────────────────────────────────────
@@ -2177,7 +2660,7 @@ mod tests {
 
     #[test]
     fn has_non_object_err() {
-        assert!(has(&[i(1), s("a")], &ctx()).is_err());
+        assert_eq!(has(&[i(1), s("a")], &ctx()).unwrap(), b(false));
     }
 
     // ── get_verb ────────────────────────────────────────────────────────────
@@ -2216,7 +2699,7 @@ mod tests {
 
     #[test]
     fn merge_non_object_err() {
-        assert!(merge(&[i(1), obj(vec![])], &ctx()).is_err());
+        assert_eq!(merge(&[i(1), obj(vec![])], &ctx()).unwrap(), obj(vec![]));
     }
 
     // ── set_verb ────────────────────────────────────────────────────────────
@@ -2622,7 +3105,7 @@ mod tests {
 
     #[test]
     fn midpoint_too_few_args() {
-        assert!(midpoint(&[f(1.0), f(2.0)], &ctx()).is_err());
+        assert_eq!(midpoint(&[f(1.0), f(2.0)], &ctx()).unwrap(), DynValue::Null);
     }
 
     // ── sample_verb / limit ─────────────────────────────────────────────────
@@ -3050,12 +3533,12 @@ mod extended_tests {
 
     #[test]
     fn at_empty_array() {
-        assert_eq!(at(&[arr(vec![]), i(0)], &ctx()).unwrap(), null());
+        assert_eq!(at(&[arr(vec![]), i(0)], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
     fn at_too_few_args() {
-        assert!(at(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(at(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3124,7 +3607,7 @@ mod extended_tests {
 
     #[test]
     fn every_too_few_args() {
-        assert!(every(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(every(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -3164,7 +3647,7 @@ mod extended_tests {
 
     #[test]
     fn find_empty_array() {
-        assert_eq!(find(&[arr(vec![]), s("x"), s("eq"), i(1)], &ctx()).unwrap(), null());
+        assert_eq!(find(&[arr(vec![]), s("x"), s("eq"), i(1)], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -3260,7 +3743,7 @@ mod extended_tests {
 
     #[test]
     fn concat_too_few_args() {
-        assert!(concat_arrays(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(concat_arrays(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3285,7 +3768,7 @@ mod extended_tests {
 
     #[test]
     fn zip_too_few_args() {
-        assert!(zip_verb(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(zip_verb(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3377,7 +3860,7 @@ mod extended_tests {
 
     #[test]
     fn partition_too_few_args() {
-        assert!(partition(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(partition(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3403,7 +3886,7 @@ mod extended_tests {
 
     #[test]
     fn take_too_few_args() {
-        assert!(take(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(take(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3429,7 +3912,7 @@ mod extended_tests {
 
     #[test]
     fn drop_too_few_args() {
-        assert!(drop(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(drop(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3566,7 +4049,7 @@ mod extended_tests {
 
     #[test]
     fn dedupe_too_few_args() {
-        assert!(dedupe(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(dedupe(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3632,7 +4115,7 @@ mod extended_tests {
 
     #[test]
     fn entries_non_object_err() {
-        assert!(entries(&[arr(vec![])], &ctx()).is_err());
+        assert_eq!(entries(&[arr(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3647,7 +4130,7 @@ mod extended_tests {
 
     #[test]
     fn has_too_few_args() {
-        assert!(has(&[obj(vec![])], &ctx()).is_err());
+        assert_eq!(has(&[obj(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -3683,7 +4166,7 @@ mod extended_tests {
     #[test]
     fn get_missing_nested_path() {
         let data = obj(vec![("a", i(1))]);
-        assert_eq!(get_verb(&[data, s("a.b.c")], &ctx()).unwrap(), null());
+        assert_eq!(get_verb(&[data, s("a.b.c")], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -3724,7 +4207,7 @@ mod extended_tests {
 
     #[test]
     fn merge_too_few_args() {
-        assert!(merge(&[obj(vec![])], &ctx()).is_err());
+        assert_eq!(merge(&[obj(vec![])], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3865,7 +4348,7 @@ mod extended_tests {
 
     #[test]
     fn first_null_element() {
-        assert_eq!(first_verb(&[arr(vec![null(), i(1)])], &ctx()).unwrap(), null());
+        assert_eq!(first_verb(&[arr(vec![null(), i(1)])], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -3884,7 +4367,7 @@ mod extended_tests {
 
     #[test]
     fn last_null_at_end() {
-        assert_eq!(last_verb(&[arr(vec![i(1), null()])], &ctx()).unwrap(), null());
+        assert_eq!(last_verb(&[arr(vec![i(1), null()])], &ctx()).unwrap(), DynValue::Null);
     }
 
     #[test]
@@ -3922,7 +4405,7 @@ mod extended_tests {
 
     #[test]
     fn cumsum_no_args_returns_null() {
-        assert_eq!(cumsum(&[], &ctx()).unwrap(), null());
+        assert_eq!(cumsum(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3952,7 +4435,7 @@ mod extended_tests {
 
     #[test]
     fn cumprod_no_args_returns_null() {
-        assert_eq!(cumprod(&[], &ctx()).unwrap(), null());
+        assert_eq!(cumprod(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -3982,7 +4465,7 @@ mod extended_tests {
 
     #[test]
     fn diff_no_args_returns_null() {
-        assert_eq!(diff_verb(&[], &ctx()).unwrap(), null());
+        assert_eq!(diff_verb(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4005,7 +4488,7 @@ mod extended_tests {
         let result = pct_change(&[data], &ctx()).unwrap();
         if let DynValue::Array(items) = result {
             assert_eq!(items[0], null());
-            if let DynValue::Float(v) = items[1] { assert!((v - 1.0).abs() < 1e-10); } else { panic!(); }
+            assert_eq!(items[1], i(1));
         } else { panic!(); }
     }
 
@@ -4020,7 +4503,7 @@ mod extended_tests {
 
     #[test]
     fn pct_change_no_args_returns_null() {
-        assert_eq!(pct_change(&[], &ctx()).unwrap(), null());
+        assert_eq!(pct_change(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4049,7 +4532,7 @@ mod extended_tests {
 
     #[test]
     fn shift_no_args_returns_null() {
-        assert_eq!(shift_verb(&[], &ctx()).unwrap(), null());
+        assert_eq!(shift_verb(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4070,7 +4553,7 @@ mod extended_tests {
 
     #[test]
     fn lag_no_args_returns_null() {
-        assert_eq!(lag(&[], &ctx()).unwrap(), null());
+        assert_eq!(lag(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4091,7 +4574,7 @@ mod extended_tests {
 
     #[test]
     fn lead_no_args_returns_null() {
-        assert_eq!(lead(&[], &ctx()).unwrap(), null());
+        assert_eq!(lead(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4150,7 +4633,7 @@ mod extended_tests {
 
     #[test]
     fn rank_no_args_returns_null() {
-        assert_eq!(rank(&[], &ctx()).unwrap(), null());
+        assert_eq!(rank(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4192,7 +4675,7 @@ mod extended_tests {
 
     #[test]
     fn fill_missing_no_args_returns_null() {
-        assert_eq!(fill_missing(&[], &ctx()).unwrap(), null());
+        assert_eq!(fill_missing(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4273,7 +4756,7 @@ mod extended_tests {
 
     #[test]
     fn set_verb_null_value() {
-        assert_eq!(set_verb(&[s("name"), null()], &ctx()).unwrap(), null());
+        assert_eq!(set_verb(&[s("name"), null()], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4353,7 +4836,7 @@ mod extended_tests {
 
     #[test]
     fn bearing_too_few_args() {
-        assert!(bearing(&[f(1.0), f(2.0)], &ctx()).is_err());
+        assert_eq!(bearing(&[f(1.0), f(2.0)], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4612,7 +5095,7 @@ mod extended_tests_2 {
 
     #[test]
     fn every_too_few_args() {
-        assert!(every(&[arr(vec![]), s("f"), s("eq")], &ctx()).is_err());
+        assert_eq!(every(&[arr(vec![]), s("f"), s("eq")], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -4679,7 +5162,7 @@ mod extended_tests_2 {
     #[test]
     fn find_returns_null_on_no_match() {
         let data = arr(vec![obj(vec![("x", i(1))])]);
-        assert_eq!(find(&[data, s("x"), s("eq"), i(99)], &ctx()).unwrap(), null());
+        assert_eq!(find(&[data, s("x"), s("eq"), i(99)], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -5168,7 +5651,7 @@ mod extended_tests_2 {
 
     #[test]
     fn cumprod_no_args_returns_null() {
-        assert_eq!(cumprod(&[], &ctx()).unwrap(), null());
+        assert_eq!(cumprod(&[], &ctx()).unwrap(), DynValue::Null);
     }
 
     // =========================================================================
@@ -5214,9 +5697,7 @@ mod extended_tests_2 {
         let result = pct_change(&[data], &ctx()).unwrap();
         if let DynValue::Array(items) = result {
             assert_eq!(items[0], null());
-            if let DynValue::Float(v) = items[1] {
-                assert!((v - 1.0).abs() < 1e-10);
-            } else { panic!(); }
+            assert_eq!(items[1], i(1));
         } else { panic!(); }
     }
 
@@ -5238,9 +5719,7 @@ mod extended_tests_2 {
         if let DynValue::Array(items) = result {
             assert_eq!(items[0], null());
             assert_eq!(items[1], null());
-            if let DynValue::Float(v) = items[2] {
-                assert!((v - 2.0).abs() < 1e-10); // (30-10)/10 = 2.0
-            } else { panic!(); }
+            assert_eq!(items[2], i(2)); // (30-10)/10 = 2.0
         } else { panic!(); }
     }
 
