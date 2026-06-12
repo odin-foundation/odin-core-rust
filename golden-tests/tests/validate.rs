@@ -323,3 +323,8 @@ fn golden_validate_conditional_binary_decimal() {
 fn golden_validate_schema_definition() {
     run_conformance_suite("conformance/schema-definition.json");
 }
+
+#[test]
+fn golden_validate_array_of_type_required() {
+    run_conformance_suite("conformance/array-of-type-required.json");
+}

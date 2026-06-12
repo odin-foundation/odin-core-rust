@@ -968,6 +968,15 @@ fn parse_string_expression_with_directives(raw: &str) -> (FieldExpression, Vec<c
     }
 }
 
+/// Field-modifier directives. These attach to the mapping (value/assignment
+/// level), never to a verb argument, so they bubble up here as flag directives.
+fn is_field_modifier_directive(name: &str) -> bool {
+    matches!(
+        name,
+        "attr" | "required" | "confidential" | "deprecated" | "redacted" | "critical"
+    )
+}
+
 /// Parse remaining directives from a string (e.g., `:pos 31 :len 3 :leftPad "0"`).
 fn parse_remaining_directives(s: &str) -> Vec<crate::types::values::OdinDirective> {
     let mut dirs = Vec::new();
@@ -984,6 +993,18 @@ fn parse_remaining_directives(s: &str) -> Vec<crate::types::values::OdinDirectiv
         }
         if pos >= bytes.len() || bytes[pos] != b':' {
             break;
+        }
+        // Field modifiers (`:attr`, `:required`, ...) belong to the mapping, not
+        // the verb expression, so collect them here as flag directives.
+        let name_start = pos + 1;
+        let name_end = trimmed[name_start..]
+            .find(|c: char| c.is_whitespace() || c == ':')
+            .map_or(trimmed.len(), |p| p + name_start);
+        let name = &trimmed[name_start..name_end];
+        if is_field_modifier_directive(name) {
+            dirs.push(crate::types::values::OdinDirective { name: name.to_string(), value: None });
+            pos = name_end;
+            continue;
         }
         let (dir, consumed) = parse_extraction_directive(&trimmed[pos..]);
         if let Some(d) = dir {
@@ -2013,6 +2034,48 @@ mod tests {
                 assert_eq!(vc.verb, "myns.transform");
                 assert!(vc.is_custom);
             }
+            other => panic!("Expected Transform, got {:?}", other),
+        }
+    }
+
+    // A trailing field modifier after a verb-valued mapping attaches to the
+    // mapping, not the verb's last argument.
+    fn bare_verb(expr: &str) -> OdinValue {
+        OdinValue::Verb {
+            verb: expr.to_string(),
+            is_custom: false,
+            args: vec![],
+            modifiers: None,
+            directives: vec![],
+        }
+    }
+
+    #[test]
+    fn verb_mapping_field_modifier_attaches() {
+        let m = build_field_mapping("x".to_string(), bare_verb("%upper @.code :attr"), None);
+        assert!(m.modifiers.as_ref().map(|mo| mo.attr).unwrap_or(false));
+        assert!(matches!(m.expression, FieldExpression::Transform(_)));
+    }
+
+    #[test]
+    fn verb_mapping_required_modifier_attaches() {
+        let m = build_field_mapping("x".to_string(), bare_verb("%trim @.name :required"), None);
+        assert!(m.modifiers.as_ref().map(|mo| mo.required).unwrap_or(false));
+    }
+
+    // Argument-level directives still attach to the verb argument, not the mapping.
+    #[test]
+    fn verb_arg_directives_stay_on_argument() {
+        let m = build_field_mapping("x".to_string(), bare_verb("%upper @_line :pos 3 :len 8"), None);
+        assert!(m.modifiers.as_ref().map(|mo| mo.attr).unwrap_or(false) == false);
+        match &m.expression {
+            FieldExpression::Transform(vc) => match &vc.args[0] {
+                VerbArg::Reference(_, dirs) => {
+                    assert!(dirs.iter().any(|d| d.name == "pos"));
+                    assert!(dirs.iter().any(|d| d.name == "len"));
+                }
+                other => panic!("Expected reference arg, got {:?}", other),
+            },
             other => panic!("Expected Transform, got {:?}", other),
         }
     }

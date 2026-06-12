@@ -90,6 +90,11 @@ pub struct SchemaType {
     pub parents: Vec<String>,
     /// Base type names this type overrides (from `= @base :override`).
     pub override_bases: Vec<String>,
+    /// Array-of-object entries declared inside the type, keyed by array name
+    /// (e.g. `producers` for `producers[] = @t` or `producers[].field`). Mirrors
+    /// the top-level array machinery so per-element required markers are enforced
+    /// when the type is reached through a reference.
+    pub arrays: HashMap<String, SchemaArray>,
 }
 
 /// A field definition in a schema.
@@ -290,6 +295,9 @@ pub struct SchemaArray {
     pub columns: Vec<String>,
     /// Per-item field definitions, keyed by item field name.
     pub item_fields: HashMap<String, SchemaField>,
+    /// For an `arr[] = @type` declaration, the referenced type name whose fields
+    /// supply the entries. Resolved at validation time; `item_fields` is empty.
+    pub item_type_ref: Option<String>,
 }
 
 /// An object-level constraint.

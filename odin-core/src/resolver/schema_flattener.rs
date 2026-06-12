@@ -279,6 +279,7 @@ impl SchemaFlattener {
             fields: updated_fields,
             parents: schema_type.parents.clone(),
             override_bases: schema_type.override_bases.clone(),
+            arrays: schema_type.arrays.clone(),
         });
     }
 
@@ -332,6 +333,7 @@ impl SchemaFlattener {
         // Collect fields from all parent types
         let mut merged_fields: Vec<SchemaField> = Vec::new();
         let mut merged_field_names: HashSet<String> = HashSet::new();
+        let mut merged_arrays = HashMap::new();
 
         for parent_name in &schema_type.parents {
             let qualified_parent = self.resolve_type_name(parent_name);
@@ -348,7 +350,15 @@ impl SchemaFlattener {
                         merged_fields.push(field.clone());
                     }
                 }
+                for (k, v) in &expanded_parent.arrays {
+                    merged_arrays.entry(k.clone()).or_insert_with(|| v.clone());
+                }
             }
+        }
+
+        // Local arrays override parent arrays of the same name.
+        for (k, v) in &schema_type.arrays {
+            merged_arrays.insert(k.clone(), v.clone());
         }
 
         // Add/override with local fields
@@ -373,6 +383,7 @@ impl SchemaFlattener {
             fields: merged_fields,
             parents: schema_type.parents.clone(),
             override_bases: schema_type.override_bases.clone(),
+            arrays: merged_arrays,
         }
     }
 
@@ -991,7 +1002,7 @@ mod tests {
             description: None,
             fields,
             parents: vec![],
-            override_bases: vec![],
+            override_bases: vec![], arrays: HashMap::new(),
         }
     }
 
@@ -1978,7 +1989,7 @@ mod tests {
                 max_items: Some(10),
                 unique: false,
                 columns: Vec::new(),
-                item_fields: std::collections::HashMap::new(),
+                item_fields: std::collections::HashMap::new(), item_type_ref: None,
             },
         );
 
@@ -2406,7 +2417,7 @@ mod tests {
                 max_items: Some(50),
                 unique: true,
                 columns: Vec::new(),
-                item_fields: std::collections::HashMap::new(),
+                item_fields: std::collections::HashMap::new(), item_type_ref: None,
             },
         );
 

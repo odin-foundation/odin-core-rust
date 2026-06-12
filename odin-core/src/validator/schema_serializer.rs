@@ -313,7 +313,7 @@ mod tests {
                         },
                     ],
                     parents: vec![],
-                    override_bases: vec![],
+                    override_bases: vec![], arrays: HashMap::new(),
                 });
                 types
             },

@@ -632,7 +632,7 @@ mod tests {
             description: None,
             fields: vec![],
             parents: vec![],
-            override_bases: vec![],
+            override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&types, None);
         assert!(registry.lookup("Address").is_some());
@@ -647,7 +647,7 @@ mod tests {
             description: None,
             fields: vec![],
             parents: vec![],
-            override_bases: vec![],
+            override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&types, Some("types"));
         assert!(registry.lookup("types.Address").is_some());
@@ -985,13 +985,13 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut local = HashMap::new();
         local.insert("Person".to_string(), SchemaType {
-            name: "Person".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![],
+            name: "Person".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&local, None);
 
         let mut ns_types = HashMap::new();
         ns_types.insert("Address".to_string(), SchemaType {
-            name: "Address".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![],
+            name: "Address".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&ns_types, Some("types"));
 
@@ -1006,13 +1006,13 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut types1 = HashMap::new();
         types1.insert("X".to_string(), SchemaType {
-            name: "X".to_string(), description: Some("first".to_string()), fields: vec![], parents: vec![], override_bases: vec![],
+            name: "X".to_string(), description: Some("first".to_string()), fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&types1, None);
 
         let mut types2 = HashMap::new();
         types2.insert("X".to_string(), SchemaType {
-            name: "X".to_string(), description: Some("second".to_string()), fields: vec![], parents: vec![], override_bases: vec![],
+            name: "X".to_string(), description: Some("second".to_string()), fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&types2, None);
 
@@ -1024,7 +1024,7 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut types = HashMap::new();
         types.insert("Unique".to_string(), SchemaType {
-            name: "Unique".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![],
+            name: "Unique".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&types, Some("ns1"));
         assert!(registry.lookup("Unique").is_some());
@@ -1035,7 +1035,7 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut types = HashMap::new();
         types.insert("Foo".to_string(), SchemaType {
-            name: "Foo".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![],
+            name: "Foo".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&types, Some("ns1"));
         assert!(registry.lookup("ns2.Foo").is_none());
@@ -1047,7 +1047,7 @@ mod tests {
         for (ns, desc) in &[("a", "from_a"), ("b", "from_b")] {
             let mut types = HashMap::new();
             types.insert("Type1".to_string(), SchemaType {
-                name: "Type1".to_string(), description: Some(desc.to_string()), fields: vec![], parents: vec![], override_bases: vec![],
+                name: "Type1".to_string(), description: Some(desc.to_string()), fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
             });
             registry.register_all(&types, Some(ns));
         }
@@ -1077,7 +1077,7 @@ mod tests {
         let mut types = HashMap::new();
         for name in &["Alpha", "Beta", "Gamma"] {
             types.insert(name.to_string(), SchemaType {
-                name: name.to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![],
+                name: name.to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
             });
         }
         registry.register_all(&types, None);
@@ -1090,7 +1090,7 @@ mod tests {
         for ns in &["ns1", "ns2", "ns3"] {
             let mut types = HashMap::new();
             types.insert("Shared".to_string(), SchemaType {
-                name: "Shared".to_string(), description: Some(format!("from_{ns}")), fields: vec![], parents: vec![], override_bases: vec![],
+                name: "Shared".to_string(), description: Some(format!("from_{ns}")), fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
             });
             registry.register_all(&types, Some(ns));
         }
@@ -1104,13 +1104,13 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut t1 = HashMap::new();
         t1.insert("T".to_string(), SchemaType {
-            name: "T".to_string(), description: Some("v1".to_string()), fields: vec![], parents: vec![], override_bases: vec![],
+            name: "T".to_string(), description: Some("v1".to_string()), fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&t1, Some("ns"));
 
         let mut t2 = HashMap::new();
         t2.insert("T".to_string(), SchemaType {
-            name: "T".to_string(), description: Some("v2".to_string()), fields: vec![], parents: vec![], override_bases: vec![],
+            name: "T".to_string(), description: Some("v2".to_string()), fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&t2, Some("ns"));
 
@@ -1122,13 +1122,13 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut ns_types = HashMap::new();
         ns_types.insert("Clash".to_string(), SchemaType {
-            name: "Clash".to_string(), description: Some("namespaced".to_string()), fields: vec![], parents: vec![], override_bases: vec![],
+            name: "Clash".to_string(), description: Some("namespaced".to_string()), fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&ns_types, Some("ns"));
 
         let mut local = HashMap::new();
         local.insert("Clash".to_string(), SchemaType {
-            name: "Clash".to_string(), description: Some("local".to_string()), fields: vec![], parents: vec![], override_bases: vec![],
+            name: "Clash".to_string(), description: Some("local".to_string()), fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&local, None);
 
@@ -1149,7 +1149,7 @@ mod tests {
                 description: None, constraints: vec![], default_value: None, conditionals: vec![],
             }],
             parents: vec![],
-            override_bases: vec![],
+            override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&types, None);
         assert_eq!(registry.lookup("WithFields").unwrap().fields.len(), 1);
@@ -1160,7 +1160,7 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut types = HashMap::new();
         types.insert("X".to_string(), SchemaType {
-            name: "X".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![],
+            name: "X".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         registry.register_all(&types, Some("pkg"));
         let names = registry.all_type_names();

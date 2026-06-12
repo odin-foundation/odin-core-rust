@@ -134,8 +134,10 @@ impl SchemaParserState {
     fn flush_current_context(&mut self) {
         if self.current_context == ParserContext::TypeDef && !self.current_type_name.is_empty() {
             let name = std::mem::take(&mut self.current_type_name);
-            let fields = std::mem::take(&mut self.current_type_fields);
+            let mut fields = std::mem::take(&mut self.current_type_fields);
             let override_bases = std::mem::take(&mut self.current_type_override_bases);
+            // Pull `arr[]` / `arr[].field` entries out of the flat field list.
+            let arrays = extract_type_arrays(&mut fields);
 
             // Merge into existing type if present (for multi-line `= ...` defs)
             if let Some(existing) = self.types.get_mut(&name) {
@@ -147,6 +149,9 @@ impl SchemaParserState {
                         existing.override_bases.push(b);
                     }
                 }
+                for (k, v) in arrays {
+                    existing.arrays.insert(k, v);
+                }
             } else {
                 self.types.insert(name.clone(), SchemaType {
                     name,
@@ -154,6 +159,7 @@ impl SchemaParserState {
                     fields,
                     parents: std::mem::take(&mut self.current_type_parents),
                     override_bases,
+                    arrays,
                 });
             }
         }
@@ -243,6 +249,7 @@ impl SchemaParserState {
                 unique: false,
                 columns: Vec::new(),
                 item_fields: HashMap::new(),
+                item_type_ref: None,
             }).columns = columns;
             self.current_context = ParserContext::ArrayDef;
             self.current_section_path = path.clone();
@@ -413,8 +420,14 @@ impl SchemaParserState {
                 }
             }
             ParserContext::TypeDef => {
-                // Check for array field: items[] = @Type
-                let clean_key = key.strip_suffix("[]").map(str::trim).unwrap_or(key);
+                // Keep `arr[]` / `arr[].field` keys intact so array-of-object
+                // entries can be pulled into a type-level arrays map at finalize.
+                let is_array_entry = key.ends_with("[]") || key.contains("[].");
+                let clean_key = if is_array_entry {
+                    key
+                } else {
+                    key.strip_suffix("[]").map(str::trim).unwrap_or(key)
+                };
                 // Prefix the field name when inside a relative sub-block (e.g. term.effective).
                 let field_name = if self.current_type_sub_path.is_empty() {
                     clean_key.to_string()
@@ -467,6 +480,82 @@ impl SchemaParserState {
             validation_memo: Default::default(),
         }
     }
+}
+
+/// Pull array-of-object entries out of a type's flat field list. A field named
+/// `arr[]` (a type reference) becomes an array with an item type ref; fields
+/// named `arr[].entry` become an array whose item fields are those entries.
+/// Matching fields are removed from `fields`.
+fn extract_type_arrays(fields: &mut Vec<SchemaField>) -> HashMap<String, SchemaArray> {
+    struct Builder {
+        item_fields: HashMap<String, SchemaField>,
+        item_type_ref: Option<String>,
+    }
+    let mut builders: HashMap<String, Builder> = HashMap::new();
+    let mut kept: Vec<SchemaField> = Vec::with_capacity(fields.len());
+
+    for field in std::mem::take(fields) {
+        let Some((arr_name, item_path)) = split_array_entry(&field.name) else {
+            kept.push(field);
+            continue;
+        };
+        let b = builders.entry(arr_name).or_insert_with(|| Builder {
+            item_fields: HashMap::new(),
+            item_type_ref: None,
+        });
+        match item_path {
+            None => {
+                // arr[] = @type — item fields come from the referenced type.
+                if let SchemaFieldType::TypeRef(ref name) = field.field_type {
+                    b.item_type_ref = Some(name.clone());
+                } else if let SchemaFieldType::Reference(ref target) = field.field_type {
+                    b.item_type_ref = Some(target.clone());
+                }
+            }
+            Some(item) => {
+                let mut f = field;
+                f.name = item.clone();
+                b.item_fields.insert(item, f);
+            }
+        }
+    }
+
+    *fields = kept;
+
+    let mut arrays = HashMap::new();
+    for (name, b) in builders {
+        arrays.insert(name.clone(), SchemaArray {
+            name,
+            item_type: SchemaFieldType::String,
+            min_items: None,
+            max_items: None,
+            unique: false,
+            columns: Vec::new(),
+            item_fields: b.item_fields,
+            item_type_ref: b.item_type_ref,
+        });
+    }
+    arrays
+}
+
+/// Split a type field name into `(arr_name, item)`: `arr[]` -> `(arr, None)`,
+/// `arr[].field` -> `(arr, Some(field))`. Returns `None` for non-array fields.
+fn split_array_entry(name: &str) -> Option<(String, Option<String>)> {
+    if let Some(arr) = name.strip_suffix("[]") {
+        if !arr.is_empty() && !arr.contains('[') {
+            return Some((arr.to_string(), None));
+        }
+    }
+    if let Some(idx) = name.find("[].") {
+        let arr = &name[..idx];
+        if !arr.is_empty() && !arr.contains('[') {
+            let item = &name[idx + 3..];
+            if !item.is_empty() {
+                return Some((arr.to_string(), Some(item.to_string())));
+            }
+        }
+    }
+    None
 }
 
 /// Parse a field definition from schema text.
@@ -1975,5 +2064,32 @@ dep = -"old"
         ).unwrap();
         let f = &s.fields["customer._composition"];
         assert!(matches!(&f.field_type, SchemaFieldType::TypeRef(n) if n == "hasName&hasAge"));
+    }
+
+    // `arr[] = @type` inside a type becomes a type-level array with an item ref.
+    #[test]
+    fn type_array_reference_form() {
+        let s = parse_schema(
+            "{@producer}\ncarrier_id = !\ncode = !\n\n{@agency}\nid = !\nproducers[] = @producer",
+        ).unwrap();
+        let t = &s.types["agency"];
+        assert!(t.fields.iter().all(|f| !f.name.contains("[]")));
+        let arr = t.arrays.get("producers").expect("producers array");
+        assert_eq!(arr.item_type_ref.as_deref(), Some("producer"));
+        assert!(arr.item_fields.is_empty());
+    }
+
+    // `arr[].field` inside a type becomes a type-level array with inline items.
+    #[test]
+    fn type_array_inline_form() {
+        let s = parse_schema(
+            "{@agency}\nid = !\nproducers[].carrier_id = !\nproducers[].code = !",
+        ).unwrap();
+        let t = &s.types["agency"];
+        assert!(t.fields.iter().all(|f| !f.name.contains("[]")));
+        let arr = t.arrays.get("producers").expect("producers array");
+        assert!(arr.item_type_ref.is_none());
+        assert!(arr.item_fields.get("carrier_id").map(|f| f.required).unwrap_or(false));
+        assert!(arr.item_fields.get("code").map(|f| f.required).unwrap_or(false));
     }
 }

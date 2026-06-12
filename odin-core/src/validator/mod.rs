@@ -1151,10 +1151,63 @@ fn augment_typeref_fields(
                 let full = format!("{path}.{}", tf.name);
                 result.entry(full.clone()).or_insert_with(|| rename_field(tf, &full));
             }
+            // Expand the type's array-of-object entries under each present index
+            // so entry-level required markers fire only when an entry is present.
+            for (arr_name, arr) in &type_def.arrays {
+                let array_path = format!("{path}.{arr_name}");
+                let item_fields = resolve_array_item_fields(schema, registry, arr);
+                if item_fields.is_empty() {
+                    continue;
+                }
+                for idx in present_array_indices(doc, &array_path) {
+                    for tf in &item_fields {
+                        if tf.name == "_composition" {
+                            continue;
+                        }
+                        let full = format!("{array_path}[{idx}].{}", tf.name);
+                        result.entry(full.clone()).or_insert_with(|| rename_field(tf, &full));
+                    }
+                }
+            }
         }
     }
 
     result.into_iter().collect()
+}
+
+/// Resolve an array's entry fields: the inline item fields, or the fields of the
+/// type named by `item_type_ref` (for the `arr[] = @type` form).
+fn resolve_array_item_fields<'a>(
+    schema: &'a OdinSchemaDefinition,
+    registry: Option<&'a TypeRegistry>,
+    arr: &'a crate::types::schema::SchemaArray,
+) -> Vec<&'a SchemaField> {
+    if !arr.item_fields.is_empty() {
+        return arr.item_fields.values().collect();
+    }
+    if let Some(ref type_ref) = arr.item_type_ref {
+        if let Some(t) = lookup_type(schema, registry, type_ref) {
+            return t.fields.iter().collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Distinct array indices present in the document under the given array path.
+fn present_array_indices(doc: &OdinDocument, array_path: &str) -> Vec<usize> {
+    let prefix = format!("{array_path}[");
+    let mut seen: Vec<usize> = Vec::new();
+    for p in doc.assignments.keys() {
+        let Some(rest) = p.strip_prefix(&prefix) else { continue };
+        let Some(close) = rest.find(']') else { continue };
+        if let Ok(idx) = rest[..close].parse::<usize>() {
+            if !seen.contains(&idx) {
+                seen.push(idx);
+            }
+        }
+    }
+    seen.sort_unstable();
+    seen
 }
 
 /// Clone a field, replacing its `name` with `name` (the synthesized full path's
@@ -1616,7 +1669,7 @@ mod tests {
                 },
             ],
             parents: vec![],
-            override_bases: vec![],
+            override_bases: vec![], arrays: HashMap::new(),
         });
 
         schema.types.insert("Child".to_string(), SchemaType {
@@ -1638,7 +1691,7 @@ mod tests {
                 },
             ],
             parents: vec!["@Parent".to_string()],
-            override_bases: vec![],
+            override_bases: vec![], arrays: HashMap::new(),
         });
 
         let expanded = expand_type_composition(&schema);
@@ -2543,7 +2596,7 @@ mod tests {
             .build().unwrap();
         let mut schema = make_empty_schema();
         schema.types.insert("SomeType".to_string(), SchemaType {
-            name: "SomeType".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![],
+            name: "SomeType".to_string(), description: None, fields: vec![], parents: vec![], override_bases: vec![], arrays: HashMap::new(),
         });
         schema.fields.insert("val".to_string(), make_field("val", SchemaFieldType::TypeRef("SomeType".to_string()), false));
         let result = validate(&doc, &schema, None);
@@ -2716,6 +2769,55 @@ mod tests {
         assert!(!r.valid);
         assert!(r.errors.iter().any(|e|
             e.error_code == ValidationErrorCode::RequiredFieldMissing && e.path == "customer.age"));
+    }
+
+    // Array-of-type required entry fields: enforced per present index, skipped
+    // when the array is absent.
+    const ARRAY_REF_SCHEMA: &str = "{@uw_producer}\ncarrier_id = !\ncode = !\n\n{@uw_agency}\nid = !\nname =\nproducers[] = @uw_producer\n\n{}\nagency = @uw_agency";
+
+    #[test]
+    fn array_of_type_ref_entry_missing_required() {
+        let r = validate_text(ARRAY_REF_SCHEMA, "{agency}\nid = \"A1\"\n\n{agency.producers[0]}\ncarrier_id = \"bravo\"");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e|
+            e.error_code == ValidationErrorCode::RequiredFieldMissing && e.path == "agency.producers[0].code"));
+    }
+
+    #[test]
+    fn array_of_type_ref_entry_complete_valid() {
+        let r = validate_text(ARRAY_REF_SCHEMA, "{agency}\nid = \"A1\"\n\n{agency.producers[0]}\ncarrier_id = \"bravo\"\ncode = \"B2\"");
+        assert!(r.valid, "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn array_of_type_ref_array_absent_valid() {
+        let r = validate_text(ARRAY_REF_SCHEMA, "{agency}\nid = \"A1\"");
+        assert!(r.valid, "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn array_of_type_ref_per_index() {
+        let input = "{agency}\nid = \"A1\"\n\n{agency.producers[0]}\ncarrier_id = \"b\"\ncode = \"c\"\n\n{agency.producers[1]}\ncarrier_id = \"d\"";
+        let r = validate_text(ARRAY_REF_SCHEMA, input);
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e| e.path == "agency.producers[1].code"));
+        assert!(!r.errors.iter().any(|e| e.path == "agency.producers[0].code"));
+    }
+
+    const ARRAY_INLINE_SCHEMA: &str = "{@uw_agency}\nid = !\nproducers[].carrier_id = !\nproducers[].code = !\n\n{}\nagency = @uw_agency";
+
+    #[test]
+    fn array_of_type_inline_complete_valid() {
+        let r = validate_text(ARRAY_INLINE_SCHEMA, "{agency}\nid = \"A1\"\n\n{agency.producers[0]}\ncarrier_id = \"bravo\"\ncode = \"B2\"");
+        assert!(r.valid, "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn array_of_type_inline_missing_required() {
+        let r = validate_text(ARRAY_INLINE_SCHEMA, "{agency}\nid = \"A1\"\n\n{agency.producers[0]}\ncarrier_id = \"bravo\"");
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|e|
+            e.error_code == ValidationErrorCode::RequiredFieldMissing && e.path == "agency.producers[0].code"));
     }
 
     #[test]
